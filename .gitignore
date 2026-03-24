@@ -1,0 +1,9 @@
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+bin/
+config.json
+.env
+*.exe
+*.log

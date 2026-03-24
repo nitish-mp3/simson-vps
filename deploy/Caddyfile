@@ -1,0 +1,23 @@
+{
+	simson-vps.niti.life {
+		# WebSocket endpoint — proxy to Go server
+		handle /ws {
+			reverse_proxy localhost:8080
+		}
+
+		# Admin API
+		handle /admin/* {
+			reverse_proxy localhost:8080
+		}
+
+		# Metrics (restrict to internal)
+		handle /metrics {
+			reverse_proxy localhost:8080
+		}
+
+		# Default — reject
+		handle {
+			respond "Not found" 404
+		}
+	}
+}

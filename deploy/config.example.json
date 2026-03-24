@@ -1,0 +1,12 @@
+{
+  "listen": ":8080",
+  "db_path": "/opt/simson/simson.db",
+  "log_level": "info",
+  "heartbeat_sec": 30,
+  "call_timeout_sec": 60,
+  "max_nodes_per_account": 10,
+  "max_concurrent_calls": 5,
+  "rate_limit_per_sec": 20,
+  "max_payload_bytes": 65536,
+  "admin_token": ""
+}

@@ -1,0 +1,35 @@
+[Unit]
+Description=Simson Control Plane Server
+After=network.target
+Documentation=https://github.com/wirsy/simson
+
+[Service]
+Type=simple
+User=simson
+Group=simson
+WorkingDirectory=/opt/simson
+ExecStart=/opt/simson/simson-server /opt/simson/config.json
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Environment — admin token via env (never in config file)
+EnvironmentFile=-/opt/simson/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/simson
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=simson
+
+[Install]
+WantedBy=multi-user.target
