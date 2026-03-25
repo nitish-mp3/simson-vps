@@ -1,4 +1,4 @@
-# release.ps1 — Build a Linux binary locally and upload it to GitHub Releases.
+# release.ps1 - Build a Linux binary locally and upload it to GitHub Releases.
 #
 # Run this on your Windows machine BEFORE deploying to the VPS.
 # The deploy.sh script will then download this binary instead of compiling on the server.
@@ -25,6 +25,18 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Run a native command, capture all output (stdout+stderr merged), return exit code.
+# Temporarily suspends Stop preference so stderr doesn't throw.
+function Invoke-Native {
+    param([scriptblock]$Cmd)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $out = & $Cmd 2>&1
+    $ec  = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    return [PSCustomObject]@{ Out = ($out -join "`n"); ExitCode = $ec }
+}
 
 $VpsDir   = $PSScriptRoot | Split-Path -Parent
 $OutBin   = Join-Path $VpsDir $BinaryName
@@ -56,8 +68,12 @@ Write-Host "  Built: $BinaryName ($([math]::Round($size,1)) MB)" -ForegroundColo
 
 # Tag the commit
 Write-Host "[2/3] Creating git tag $Tag..." -ForegroundColor Yellow
-git -C $VpsDir tag $Tag 2>&1 | Out-Null
-git -C $VpsDir push origin $Tag 2>&1
+$r = Invoke-Native { git -C $VpsDir tag $Tag }
+if ($r.ExitCode -ne 0 -and $r.Out -notmatch "already exists") { throw "git tag failed: $($r.Out)" }
+if ($r.Out -match "already exists") { Write-Warning "Tag $Tag already exists locally, re-using it." }
+
+$r = Invoke-Native { git -C $VpsDir push origin $Tag }
+if ($r.ExitCode -ne 0 -and $r.Out -notmatch "already exists") { throw "git push tag failed: $($r.Out)" }
 
 # Create GitHub Release and upload the binary
 Write-Host "[3/3] Creating GitHub Release $Tag and uploading binary..." -ForegroundColor Yellow
@@ -79,4 +95,4 @@ Write-Host ""
 Write-Host "Deploy to VPS:" -ForegroundColor Cyan
 Write-Host "  ./deploy.sh simson-vps.niti.life `"`" https://github.com/$Repo.git $Tag"
 Write-Host ""
-Write-Host "The deploy script will download the binary directly — no compilation on VPS."
+Write-Host "The deploy script will download the binary directly - no compilation on VPS."
