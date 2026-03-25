@@ -84,6 +84,49 @@ apt-get install -y -qq curl sqlite3 git ufw
 
 # Open ports required by Caddy.
 # SSH (22) is explicitly allowed first so you can't lock yourself out.
+
+# --- iptables (Oracle Cloud / raw iptables images) ---
+# Oracle Cloud Ubuntu images have a default REJECT-all iptables rule that blocks
+# inbound traffic on everything except SSH, even when UFW and the cloud Security
+# List both allow it.  We insert ACCEPT rules for 80/443 before any REJECT/DROP.
+_fix_iptables() {
+    if ! command -v iptables &>/dev/null; then return; fi
+
+    # Find the first REJECT or DROP rule number in the INPUT chain.
+    local reject_line
+    reject_line=$(iptables -L INPUT --line-numbers -n 2>/dev/null \
+        | grep -iE 'REJECT|DROP' | head -1 | awk '{print $1}')
+
+    if [ -z "$reject_line" ]; then
+        echo "  iptables: no REJECT/DROP rule found — nothing to patch."
+        return
+    fi
+
+    echo "  iptables: REJECT/DROP rule found at line $reject_line — inserting ACCEPT rules before it."
+    for port in 80 443; do
+        if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+            iptables -I INPUT "$reject_line" -p tcp --dport "$port" -j ACCEPT
+            reject_line=$((reject_line + 1))
+            echo "    Allowed TCP $port"
+        fi
+    done
+    if ! iptables -C INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null; then
+        iptables -I INPUT "$reject_line" -p udp --dport 443 -j ACCEPT
+        echo "    Allowed UDP 443 (HTTP/3)"
+    fi
+
+    # Persist rules across reboots.
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save 2>/dev/null || true
+    elif [ -d /etc/iptables ]; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+    echo "  iptables rules saved."
+}
+echo "  Fixing iptables (Oracle Cloud / raw iptables)..."
+_fix_iptables
+
+# --- UFW (general-purpose) ---
 echo "  Configuring UFW firewall..."
 ufw allow 22/tcp  comment 'SSH'             2>/dev/null || true
 ufw allow 80/tcp  comment 'HTTP (ACME TLS)' 2>/dev/null || true
@@ -96,8 +139,7 @@ else
     ufw reload 2>/dev/null || true
     echo "  UFW already active — rules updated."
 fi
-echo "  NOTE: If your cloud provider has a separate firewall (DigitalOcean, AWS, Hetzner etc.),"
-echo "        also open TCP ports 80 and 443 in its control panel."
+echo "  NOTE: Also open TCP 80 + 443 in your cloud provider's firewall panel (Security List, Security Group, etc.)."
 
 # --- Install Caddy ---
 echo "[2/8] Installing Caddy..."
