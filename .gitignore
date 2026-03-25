@@ -7,3 +7,6 @@ config.json
 .env
 *.exe
 *.log
+# built binaries — delivered via GitHub Releases, not committed to git
+simson-server
+simson-server-linux-amd64

@@ -168,6 +168,10 @@ if [ "$BUILD_FROM_SOURCE" = "1" ]; then
     echo "  Binary built from source."
 elif _try_download_release; then
     : # success — binary already placed by _try_download_release
+elif [ -f "$INSTALL_DIR/$BINARY_NAME" ]; then
+    echo "  Found pre-built binary in repo directory, using it."
+    cp "$INSTALL_DIR/$BINARY_NAME" "$INSTALL_DIR/simson-server"
+    chmod +x "$INSTALL_DIR/simson-server"
 else
     echo "  No release binary available. Building from source..."
     echo "  WARNING: modernc.org/sqlite compilation takes 10-20 minutes on first build."
