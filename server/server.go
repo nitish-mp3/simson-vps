@@ -11,13 +11,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
-	"github.com/wirsy/simson-vps/calls"
-	"github.com/wirsy/simson-vps/config"
-	"github.com/wirsy/simson-vps/hub"
-	"github.com/wirsy/simson-vps/logging"
-	"github.com/wirsy/simson-vps/protocol"
-	"github.com/wirsy/simson-vps/ratelimit"
-	"github.com/wirsy/simson-vps/store"
+	"github.com/nitish-mp3/simson-vps/calls"
+	"github.com/nitish-mp3/simson-vps/config"
+	"github.com/nitish-mp3/simson-vps/hub"
+	"github.com/nitish-mp3/simson-vps/logging"
+	"github.com/nitish-mp3/simson-vps/protocol"
+	"github.com/nitish-mp3/simson-vps/ratelimit"
+	"github.com/nitish-mp3/simson-vps/store"
 )
 
 // Server is the main control-plane process.

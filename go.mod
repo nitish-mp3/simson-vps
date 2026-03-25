@@ -1,4 +1,4 @@
-module github.com/wirsy/simson-vps
+module github.com/nitish-mp3/simson-vps
 
 go 1.22
 

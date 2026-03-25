@@ -10,11 +10,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wirsy/simson-vps/admin"
-	"github.com/wirsy/simson-vps/config"
-	"github.com/wirsy/simson-vps/logging"
-	"github.com/wirsy/simson-vps/server"
-	"github.com/wirsy/simson-vps/store"
+	"github.com/nitish-mp3/simson-vps/admin"
+	"github.com/nitish-mp3/simson-vps/config"
+	"github.com/nitish-mp3/simson-vps/logging"
+	"github.com/nitish-mp3/simson-vps/server"
+	"github.com/nitish-mp3/simson-vps/store"
 )
 
 func main() {

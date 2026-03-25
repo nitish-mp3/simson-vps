@@ -141,7 +141,10 @@ fi
 
 # --- Binary: try release download first, build from source as fallback ---
 echo "[6/8] Getting simson-server binary..."
-if [ "$BUILD_FROM_SOURCE" = "1" ]; then
+if [ "$BUILD_FROM_SOURCE" != "1" ] && [ -x "$INSTALL_DIR/simson-server" ]; then
+    echo "  simson-server already present, skipping download/build."
+    echo "  (Set SIMSON_BUILD_FROM_SOURCE=1 to force rebuild.)"
+elif [ "$BUILD_FROM_SOURCE" = "1" ]; then
     echo "  SIMSON_BUILD_FROM_SOURCE=1 set — building from source."
     echo "  WARNING: modernc.org/sqlite compilation takes 10-20 minutes on first build."
     _install_go() {

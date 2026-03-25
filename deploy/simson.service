@@ -1,7 +1,7 @@
 [Unit]
 Description=Simson Control Plane Server
 After=network.target
-Documentation=https://github.com/wirsy/simson
+Documentation=https://github.com/nitish-mp3/simson
 
 [Service]
 Type=simple
