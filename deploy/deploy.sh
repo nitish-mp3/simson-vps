@@ -80,7 +80,24 @@ _try_download_release() {
 # --- System packages ---
 echo "[1/8] Installing system packages..."
 apt-get update -qq
-apt-get install -y -qq curl sqlite3 git
+apt-get install -y -qq curl sqlite3 git ufw
+
+# Open ports required by Caddy.
+# SSH (22) is explicitly allowed first so you can't lock yourself out.
+echo "  Configuring UFW firewall..."
+ufw allow 22/tcp  comment 'SSH'             2>/dev/null || true
+ufw allow 80/tcp  comment 'HTTP (ACME TLS)' 2>/dev/null || true
+ufw allow 443/tcp comment 'HTTPS'           2>/dev/null || true
+ufw allow 443/udp comment 'HTTP/3'          2>/dev/null || true
+if ! ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw --force enable
+    echo "  UFW enabled with ports 22/80/443 open."
+else
+    ufw reload 2>/dev/null || true
+    echo "  UFW already active — rules updated."
+fi
+echo "  NOTE: If your cloud provider has a separate firewall (DigitalOcean, AWS, Hetzner etc.),"
+echo "        also open TCP ports 80 and 443 in its control panel."
 
 # --- Install Caddy ---
 echo "[2/8] Installing Caddy..."
