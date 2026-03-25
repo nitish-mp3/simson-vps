@@ -275,12 +275,22 @@ systemctl enable simson
 systemctl restart simson
 
 # Start/reload Caddy with the new Caddyfile.
+# First, stop anything hogging port 80 (apache2, nginx, etc.)
+for svc in apache2 nginx lighttpd; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        echo "  Stopping $svc (it uses port 80, Caddy needs it)..."
+        systemctl stop "$svc"
+        systemctl disable "$svc" 2>/dev/null || true
+    fi
+done
+
 if systemctl is-active --quiet caddy; then
     systemctl reload caddy
 else
     systemctl start caddy || {
-        echo "  WARNING: Caddy failed to start. Check DNS propagation and firewall (ports 80, 443)."
-        echo "  Run: journalctl -u caddy --no-pager -n 30"
+        echo "  WARNING: Caddy failed to start. Something is still using port 80."
+        echo "  Run: ss -tlnp | grep ':80' to find it, then stop it."
+        echo "  Then: systemctl start caddy"
     }
 fi
 
