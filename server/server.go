@@ -241,6 +241,8 @@ func (s *Server) readLoop(sess *hub.Session) {
 			s.handleCallReject(sess, env)
 		case protocol.TypeCallEnd:
 			s.handleCallEnd(sess, env)
+		case protocol.TypeWebRTCSignal:
+			s.handleWebRTCSignal(sess, env)
 		default:
 			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "unknown message type: "+env.Type)
 		}
@@ -486,6 +488,53 @@ func (s *Server) handleCallEnd(sess *hub.Session, env *protocol.Envelope) {
 	s.log.Info("call ended", map[string]any{"call_id": payload.CallID, "reason": reason})
 
 	s.notifyCallStatus(c)
+}
+
+// --- WebRTC Signal Relay ---
+
+func (s *Server) handleWebRTCSignal(sess *hub.Session, env *protocol.Envelope) {
+	payload, err := protocol.DecodePayload[protocol.WebRTCSignalPayload](env)
+	if err != nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "invalid webrtc.signal payload")
+		return
+	}
+
+	// Validate sender.
+	if payload.FromNodeID != sess.NodeID {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "from_node_id mismatch")
+		return
+	}
+
+	// Verify target is in the same account.
+	targetSess := s.hub.Get(payload.ToNodeID)
+	if targetSess == nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNodeOffline, "target node not online")
+		return
+	}
+	if targetSess.AccountID != sess.AccountID {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "target node belongs to a different account")
+		return
+	}
+
+	// Verify the call exists and both parties are participants.
+	c := s.calls.Get(payload.CallID)
+	if c == nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found")
+		return
+	}
+
+	// Forward the signal as-is to the target node.
+	fwd := protocol.NewEnvelope(protocol.TypeWebRTCSignal, protocol.WebRTCSignalPayload{
+		CallID:     payload.CallID,
+		FromNodeID: payload.FromNodeID,
+		ToNodeID:   payload.ToNodeID,
+		SignalType: payload.SignalType,
+		Data:       payload.Data,
+	})
+	data, _ := fwd.Encode()
+	if err := targetSess.Send(data); err != nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "failed to relay signal")
+	}
 }
 
 // --- Helpers ---

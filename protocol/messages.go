@@ -96,6 +96,16 @@ type ErrorPayload struct {
 	Ref     string `json:"ref,omitempty"` // message ID this error relates to
 }
 
+// --- WebRTC signaling ---
+
+type WebRTCSignalPayload struct {
+	CallID       string `json:"call_id"`
+	FromNodeID   string `json:"from_node_id"`
+	ToNodeID     string `json:"to_node_id"`
+	SignalType   string `json:"signal_type"` // "offer", "answer", "ice-candidate"
+	Data         any    `json:"data"`        // SDP or ICE candidate object
+}
+
 // --- Message types ---
 
 const (
@@ -110,6 +120,8 @@ const (
 	TypeCallReject  = "call.reject"
 	TypeCallEnd     = "call.end"
 	TypeCallStatus  = "call.status"
+
+	TypeWebRTCSignal = "webrtc.signal"
 
 	TypeError = "error"
 )
