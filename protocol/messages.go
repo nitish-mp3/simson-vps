@@ -106,6 +106,28 @@ type WebRTCSignalPayload struct {
 	Data         any    `json:"data"`        // SDP or ICE candidate object
 }
 
+// --- User presence ---
+
+type UserPresenceEntry struct {
+	UserID   string `json:"user_id"`
+	UserName string `json:"user_name"`
+}
+
+type UsersUpdatePayload struct {
+	NodeID string               `json:"node_id"`
+	Users  []UserPresenceEntry  `json:"users"`
+}
+
+type UsersQueryPayload struct {
+	TargetNodeID string `json:"target_node_id"`
+}
+
+type UsersListPayload struct {
+	NodeID string               `json:"node_id"`
+	Users  []UserPresenceEntry  `json:"users"`
+	Ref    string               `json:"ref,omitempty"` // message ID this responds to
+}
+
 // --- Message types ---
 
 const (
@@ -122,6 +144,10 @@ const (
 	TypeCallStatus  = "call.status"
 
 	TypeWebRTCSignal = "webrtc.signal"
+
+	TypeUsersUpdate = "users.update"
+	TypeUsersQuery  = "users.query"
+	TypeUsersList   = "users.list"
 
 	TypeError = "error"
 )

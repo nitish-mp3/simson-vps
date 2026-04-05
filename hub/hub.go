@@ -7,6 +7,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// UserPresence represents a logged-in user on a node.
+type UserPresence struct {
+	UserID   string    `json:"user_id"`
+	UserName string    `json:"user_name"`
+	LastSeen time.Time `json:"last_seen"`
+}
+
 // Session represents a single connected node.
 type Session struct {
 	mu           sync.Mutex
@@ -18,6 +25,7 @@ type Session struct {
 	RemoteIP     string
 	ConnectedAt  time.Time
 	LastSeen     time.Time
+	Users        []UserPresence // currently logged-in HA users
 }
 
 // Send writes a message to the WebSocket. Thread-safe.
@@ -33,6 +41,22 @@ func (s *Session) Touch() {
 	s.mu.Lock()
 	s.LastSeen = time.Now().UTC()
 	s.mu.Unlock()
+}
+
+// SetUsers replaces the user presence list for this session.
+func (s *Session) SetUsers(users []UserPresence) {
+	s.mu.Lock()
+	s.Users = users
+	s.mu.Unlock()
+}
+
+// GetUsers returns a copy of the current user presence list.
+func (s *Session) GetUsers() []UserPresence {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]UserPresence, len(s.Users))
+	copy(out, s.Users)
+	return out
 }
 
 // Hub maintains live node sessions.

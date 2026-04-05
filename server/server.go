@@ -243,6 +243,10 @@ func (s *Server) readLoop(sess *hub.Session) {
 			s.handleCallEnd(sess, env)
 		case protocol.TypeWebRTCSignal:
 			s.handleWebRTCSignal(sess, env)
+		case protocol.TypeUsersUpdate:
+			s.handleUsersUpdate(sess, env)
+		case protocol.TypeUsersQuery:
+			s.handleUsersQuery(sess, env)
 		default:
 			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "unknown message type: "+env.Type)
 		}
@@ -535,6 +539,83 @@ func (s *Server) handleWebRTCSignal(sess *hub.Session, env *protocol.Envelope) {
 	if err := targetSess.Send(data); err != nil {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "failed to relay signal")
 	}
+}
+
+// --- Users Update ---
+
+func (s *Server) handleUsersUpdate(sess *hub.Session, env *protocol.Envelope) {
+	payload, err := protocol.DecodePayload[protocol.UsersUpdatePayload](env)
+	if err != nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "invalid users.update payload")
+		return
+	}
+
+	// Validate sender.
+	if payload.NodeID != sess.NodeID {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "node_id mismatch")
+		return
+	}
+
+	// Convert to hub.UserPresence and store in session.
+	users := make([]hub.UserPresence, 0, len(payload.Users))
+	for _, u := range payload.Users {
+		users = append(users, hub.UserPresence{
+			UserID:   u.UserID,
+			UserName: u.UserName,
+			LastSeen: time.Now().UTC(),
+		})
+	}
+	sess.SetUsers(users)
+
+	s.log.Debug("users updated", map[string]any{
+		"node_id": sess.NodeID, "user_count": len(users),
+	})
+}
+
+// --- Users Query ---
+
+func (s *Server) handleUsersQuery(sess *hub.Session, env *protocol.Envelope) {
+	payload, err := protocol.DecodePayload[protocol.UsersQueryPayload](env)
+	if err != nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "invalid users.query payload")
+		return
+	}
+
+	// Verify target node belongs to same account.
+	targetSess := s.hub.Get(payload.TargetNodeID)
+	if targetSess == nil {
+		// Node offline — return empty list (not an error).
+		resp := protocol.NewEnvelope(protocol.TypeUsersList, protocol.UsersListPayload{
+			NodeID: payload.TargetNodeID,
+			Users:  []protocol.UserPresenceEntry{},
+			Ref:    env.ID,
+		})
+		data, _ := resp.Encode()
+		sess.Send(data)
+		return
+	}
+	if targetSess.AccountID != sess.AccountID {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "target node belongs to a different account")
+		return
+	}
+
+	// Get users from target session.
+	hubUsers := targetSess.GetUsers()
+	users := make([]protocol.UserPresenceEntry, 0, len(hubUsers))
+	for _, u := range hubUsers {
+		users = append(users, protocol.UserPresenceEntry{
+			UserID:   u.UserID,
+			UserName: u.UserName,
+		})
+	}
+
+	resp := protocol.NewEnvelope(protocol.TypeUsersList, protocol.UsersListPayload{
+		NodeID: payload.TargetNodeID,
+		Users:  users,
+		Ref:    env.ID,
+	})
+	data, _ := resp.Encode()
+	sess.Send(data)
 }
 
 // --- Helpers ---
