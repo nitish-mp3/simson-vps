@@ -1,6 +1,6 @@
 {
 	simson-vps.niti.life {
-		# WebSocket endpoint — proxy to Go server
+		# Simson control-plane WebSocket
 		handle /ws {
 			reverse_proxy localhost:8080
 		}
@@ -10,9 +10,16 @@
 			reverse_proxy localhost:8080
 		}
 
-		# Metrics (restrict to internal)
+		# Metrics
 		handle /metrics {
 			reverse_proxy localhost:8080
+		}
+
+		# Asterisk SIP-over-WebSocket for browser SIP.js clients.
+		# Caddy provides valid TLS; Asterisk listens plain WS on port 8088.
+		# Browsers connect to wss://simson-vps.niti.life/sip/ws
+		handle /sip/ws {
+			reverse_proxy localhost:8088
 		}
 
 		# Default — reject

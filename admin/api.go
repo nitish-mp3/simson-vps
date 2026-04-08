@@ -75,6 +75,10 @@ func (a *API) Router() http.Handler {
 	mux.HandleFunc("POST /admin/asterisk/reload-sip", a.auth(a.handleAsteriskReloadSIP))
 	mux.HandleFunc("POST /admin/asterisk/reload-dialplan", a.auth(a.handleAsteriskReloadDialplan))
 
+	// WebRTC config (ICE/TURN + SIP credentials for browser clients)
+	mux.HandleFunc("GET /admin/webrtc-config", a.auth(a.handleGetWebRTCConfig))
+	mux.HandleFunc("PUT /admin/webrtc-config", a.auth(a.handlePutWebRTCConfig))
+
 	return mux
 }
 
@@ -100,7 +104,7 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":          "ok",
-		"server_version":  "1.1.0",
+		"server_version":  "1.2.0",
 		"protocol_version": "1.0.0",
 	})
 }
@@ -569,6 +573,84 @@ func (a *API) handleAsteriskReloadDialplan(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// --- WebRTC config ---
+
+// handleGetWebRTCConfig returns the ICE server list and SIP-over-WebSocket credentials
+// that browser clients (cards) need to establish audio connections.
+func (a *API) handleGetWebRTCConfig(w http.ResponseWriter, r *http.Request) {
+	// Build ICE server list.
+	iceServers := []map[string]any{}
+	for _, s := range a.cfg.ICE.STUNServers {
+		iceServers = append(iceServers, map[string]any{"urls": s})
+	}
+	if a.cfg.ICE.TURNEnabled && len(a.cfg.ICE.TURNURLs) > 0 {
+		entry := map[string]any{
+			"urls":       a.cfg.ICE.TURNURLs,
+			"username":   a.cfg.ICE.TURNUsername,
+			"credential": a.cfg.ICE.TURNSecret,
+		}
+		iceServers = append(iceServers, entry)
+	}
+
+	// Build SIP config.
+	sipConfig := map[string]any{
+		"enabled":  a.cfg.Asterisk.SIPWebRTC.Enabled,
+		"username": a.cfg.Asterisk.SIPWebRTC.Username,
+		"password": a.cfg.Asterisk.SIPWebRTC.Password,
+		"domain":   a.cfg.Asterisk.SIPDomain,
+		"ws_path":  a.cfg.Asterisk.SIPWebRTC.WSPath,
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ice_servers": iceServers,
+		"sip":         sipConfig,
+	})
+}
+
+// handlePutWebRTCConfig updates TURN and SIP-over-WS credentials at runtime
+// (changes take effect immediately on the next client request; no server restart needed).
+func (a *API) handlePutWebRTCConfig(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		TURNEnabled  *bool     `json:"turn_enabled"`
+		TURNURLs     []string  `json:"turn_urls"`
+		TURNUsername *string   `json:"turn_username"`
+		TURNSecret   *string   `json:"turn_secret"`
+		SIPEnabled   *bool     `json:"sip_enabled"`
+		SIPUsername  *string   `json:"sip_username"`
+		SIPPassword  *string   `json:"sip_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+		return
+	}
+	if body.TURNEnabled != nil {
+		a.cfg.ICE.TURNEnabled = *body.TURNEnabled
+	}
+	if len(body.TURNURLs) > 0 {
+		a.cfg.ICE.TURNURLs = body.TURNURLs
+	}
+	if body.TURNUsername != nil {
+		a.cfg.ICE.TURNUsername = *body.TURNUsername
+	}
+	if body.TURNSecret != nil {
+		a.cfg.ICE.TURNSecret = *body.TURNSecret
+	}
+	if body.SIPEnabled != nil {
+		a.cfg.Asterisk.SIPWebRTC.Enabled = *body.SIPEnabled
+	}
+	if body.SIPUsername != nil {
+		a.cfg.Asterisk.SIPWebRTC.Username = *body.SIPUsername
+	}
+	if body.SIPPassword != nil {
+		a.cfg.Asterisk.SIPWebRTC.Password = *body.SIPPassword
+	}
+	a.log.Info("webrtc-config updated", map[string]any{
+		"turn_enabled": a.cfg.ICE.TURNEnabled,
+		"sip_enabled":  a.cfg.Asterisk.SIPWebRTC.Enabled,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

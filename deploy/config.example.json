@@ -17,8 +17,26 @@
     "user": "simson",
     "secret": "changeme",
     "auto_configure": true,
-    "sip_domain": "sip.example.com",
+    "sip_domain": "simson-vps.niti.life",
+    "external_ip": "",
     "in_context": "from-simson-sip",
-    "node_context": "from-simson-node"
+    "node_context": "from-simson-node",
+    "sip_webrtc": {
+      "enabled": false,
+      "username": "webrtc-pool",
+      "password": "",
+      "ws_path": "/sip/ws"
+    }
+  },
+
+  "ice": {
+    "stun_servers": [
+      "stun:stun.l.google.com:19302",
+      "stun:stun1.l.google.com:19302"
+    ],
+    "turn_enabled": false,
+    "turn_urls": ["turn:simson-vps.niti.life:3478"],
+    "turn_username": "simson",
+    "turn_secret": ""
   }
 }

@@ -84,8 +84,11 @@ func main() {
 				AmiUser:     cfg.Asterisk.User,
 				AmiSecret:   cfg.Asterisk.Secret,
 				SIPDomain:   cfg.Asterisk.SIPDomain,
-				InContext:    cfg.Asterisk.InContext,
+				ExternalIP:  cfg.Asterisk.ExternalIP,
+				InContext:   cfg.Asterisk.InContext,
 				NodeContext: cfg.Asterisk.NodeContext,
+				WebRTCUser:  cfg.Asterisk.SIPWebRTC.Username,
+				WebRTCPass:  cfg.Asterisk.SIPWebRTC.Password,
 			}
 			if err := asterisk.Setup(scfg, defs, log); err != nil {
 				log.Warn("asterisk auto-configure failed (continuing)", map[string]any{"err": err.Error()})
