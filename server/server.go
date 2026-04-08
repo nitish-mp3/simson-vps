@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/nitish-mp3/simson-vps/asterisk"
 	"github.com/nitish-mp3/simson-vps/calls"
 	"github.com/nitish-mp3/simson-vps/config"
 	"github.com/nitish-mp3/simson-vps/hub"
@@ -22,18 +23,19 @@ import (
 
 // Server is the main control-plane process.
 type Server struct {
-	cfg       *config.Config
-	store     *store.Store
-	hub       *hub.Hub
-	calls     *calls.Manager
-	limiter   *ratelimit.Limiter
-	log       *logging.Logger
-	upgrader  websocket.Upgrader
+	cfg      *config.Config
+	store    *store.Store
+	hub      *hub.Hub
+	calls    *calls.Manager
+	limiter  *ratelimit.Limiter
+	log      *logging.Logger
+	upgrader websocket.Upgrader
+	asterisk *asterisk.Router // nil when Asterisk integration is disabled
 }
 
 // New constructs a Server.
 func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
-	return &Server{
+	s := &Server{
 		cfg:     cfg,
 		store:   st,
 		hub:     hub.New(),
@@ -46,6 +48,23 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 			CheckOrigin:     func(r *http.Request) bool { return true }, // Caddy handles origin
 		},
 	}
+
+	if cfg.Asterisk.Enabled {
+		ami := asterisk.NewAMIClient(
+			cfg.Asterisk.Host,
+			cfg.Asterisk.Port,
+			cfg.Asterisk.User,
+			cfg.Asterisk.Secret,
+			log,
+		)
+		router := asterisk.NewRouter(ami, log)
+		router.OnIncomingCall = s.handleSIPIncomingCall
+		router.OnChannelHangup = s.handleSIPChannelHangup
+		router.OnOriginateResult = s.handleSIPOriginateResult
+		s.asterisk = router
+	}
+
+	return s
 }
 
 // Hub returns the live session hub (for admin API).
@@ -56,6 +75,9 @@ func (s *Server) Calls() *calls.Manager { return s.calls }
 
 // Store returns the persistent store (for admin API).
 func (s *Server) Store() *store.Store { return s.store }
+
+// Asterisk returns the AMI router, or nil if Asterisk is disabled.
+func (s *Server) Asterisk() *asterisk.Router { return s.asterisk }
 
 // HandleWS is the HTTP handler for WebSocket upgrades at /ws.
 func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
@@ -275,6 +297,14 @@ func (s *Server) handleCallRequest(sess *hub.Session, env *protocol.Envelope) {
 	// Validate: from_node_id must match session.
 	if req.FromNodeID != sess.NodeID {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "from_node_id mismatch")
+		return
+	}
+
+	// ── SIP extension target: "sip:EXTENSION" ─────────────────────────────────
+	// When a node wants to call an IP phone managed by the central VPS Asterisk,
+	// it sets to_node_id = "sip:1001".  Route via AMI instead of WebSocket.
+	if strings.HasPrefix(req.ToNodeID, "sip:") {
+		s.handleSIPCallRequest(sess, env, req)
 		return
 	}
 
@@ -637,6 +667,224 @@ func (s *Server) notifyCallStatus(c *calls.Call) {
 	}
 }
 
+// ---- Central VPS Asterisk (SIP) handlers ------------------------------------
+
+// handleSIPCallRequest handles call.request when to_node_id = "sip:EXTENSION".
+// It looks up the SIP endpoint in the DB and originates a call via Asterisk AMI.
+func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope, req *protocol.CallRequestPayload) {
+	if s.asterisk == nil || !s.asterisk.Connected() {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal,
+			"central Asterisk AMI is not connected; set asterisk.enabled=true in server config")
+		return
+	}
+
+	ext := strings.TrimPrefix(req.ToNodeID, "sip:")
+	if ext == "" {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "empty SIP extension in to_node_id")
+		return
+	}
+
+	ep, err := s.store.GetSIPEndpointByExtension(ext)
+	if err != nil {
+		s.log.Error("db error looking up SIP endpoint", map[string]any{"err": err.Error()})
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "internal error")
+		return
+	}
+	if ep == nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "SIP extension not registered: "+ext)
+		return
+	}
+	if ep.AccountID != sess.AccountID {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "SIP extension belongs to a different account")
+		return
+	}
+	if !ep.Enabled {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "SIP extension is disabled")
+		return
+	}
+
+	// Check account call limits.
+	acct, _ := s.store.GetAccount(sess.AccountID)
+	if acct != nil {
+		if s.calls.CountActiveByAccount(sess.AccountID) >= acct.MaxCalls {
+			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeLimitExceeded, "concurrent call limit reached")
+			return
+		}
+	}
+
+	callID := req.CallID
+	if callID == "" {
+		callID = "call_" + uuid.NewString()
+	}
+
+	c := &calls.Call{
+		ID:        callID,
+		FromNode:  sess.NodeID,
+		ToNode:    "sip:" + ext, // virtual node ID for the SIP side
+		AccountID: sess.AccountID,
+		CallType:  "sip",
+	}
+	if !s.calls.Create(c) {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "duplicate call ID")
+		return
+	}
+
+	// Caller label shown on the phone display.
+	callerID := req.Metadata["caller_id"]
+	if callerID == "" {
+		if node, _ := s.store.GetNode(sess.NodeID); node != nil && node.Label != "" {
+			callerID = node.Label
+		} else {
+			callerID = sess.NodeID
+		}
+	}
+
+	// Originate the call via AMI.
+	_, err = s.asterisk.OriginateToExtension(
+		ext,
+		s.cfg.Asterisk.InContext,
+		callerID,
+		callID,
+		sess.NodeID,
+		s.cfg.CallTimeoutSec,
+	)
+	if err != nil {
+		s.calls.End(callID, "originate_failed")
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "AMI originate failed: "+err.Error())
+		return
+	}
+
+	s.store.WriteAudit(sess.AccountID, sess.NodeID, "sip_call_request",
+		fmt.Sprintf("call=%s ext=%s", callID, ext), sess.RemoteIP)
+	s.log.Info("SIP call originated", map[string]any{
+		"call_id": callID, "ext": ext, "from": sess.NodeID,
+	})
+
+	// Tell the calling node the phone is ringing.
+	status := protocol.NewEnvelope(protocol.TypeCallStatus, protocol.CallStatusPayload{
+		CallID: callID, Status: string(calls.StateRinging),
+	})
+	sd, _ := status.Encode()
+	sess.Send(sd)
+}
+
+// handleSIPIncomingCall is the AMI callback for an incoming SIP call.
+// It routes the call to the correct Simson node based on the dialled extension.
+func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
+	ep, err := s.store.GetSIPEndpointByExtension(in.Extension)
+	if err != nil || ep == nil {
+		s.log.Warn("no SIP endpoint for extension — hanging up",
+			map[string]any{"extension": in.Extension, "channel": in.Channel})
+		if s.asterisk != nil {
+			_ = s.asterisk.HangupChannel(in.Channel)
+		}
+		return
+	}
+
+	targetNodeID := ep.RouteTo
+	if targetNodeID == "" {
+		// Broadcast: ring any online node in this account.
+		for _, sess := range s.hub.ListByAccount(ep.AccountID) {
+			targetNodeID = sess.NodeID
+			break
+		}
+	}
+
+	if targetNodeID == "" || !s.hub.IsOnline(targetNodeID) {
+		s.log.Warn("no online target node for SIP call — hanging up",
+			map[string]any{"extension": in.Extension})
+		if s.asterisk != nil {
+			_ = s.asterisk.HangupChannel(in.Channel)
+		}
+		return
+	}
+
+	callID := "call_" + uuid.NewString()
+	c := &calls.Call{
+		ID:        callID,
+		FromNode:  "sip:" + in.Extension,
+		ToNode:    targetNodeID,
+		AccountID: ep.AccountID,
+		CallType:  "sip",
+	}
+	if !s.calls.Create(c) {
+		return
+	}
+
+	// Track channel before doing anything else.
+	s.asterisk.TrackCall(callID, in.Channel)
+
+	targetSess := s.hub.Get(targetNodeID)
+	if targetSess == nil {
+		s.calls.End(callID, "target_disappeared")
+		s.asterisk.UntrackCall(callID)
+		return
+	}
+
+	invite := protocol.NewEnvelope(protocol.TypeCallInvite, protocol.CallInvitePayload{
+		CallID:     callID,
+		FromNodeID: "sip:" + in.Extension,
+		FromLabel:  in.CallerID,
+		CallType:   "sip",
+		Metadata: map[string]string{
+			"sip_channel":   in.Channel,
+			"sip_bridge_id": in.BridgeID,
+			"sip_caller_id": in.CallerID,
+			"sip_extension": in.Extension,
+			"sip_unique_id": in.UniqueID,
+		},
+	})
+	inviteData, _ := invite.Encode()
+	targetSess.Send(inviteData)
+
+	s.store.WriteAudit(ep.AccountID, targetNodeID, "sip_incoming_call",
+		fmt.Sprintf("call=%s ext=%s ch=%s", callID, in.Extension, in.Channel), "")
+	s.log.Info("SIP invite dispatched", map[string]any{
+		"call_id": callID, "extension": in.Extension, "to_node": targetNodeID,
+	})
+}
+
+// handleSIPChannelHangup cleans up a call when the SIP channel hangs up.
+func (s *Server) handleSIPChannelHangup(channel string) {
+	if s.asterisk == nil {
+		return
+	}
+	callID, ok := s.asterisk.CallIDForChannel(channel)
+	if !ok {
+		return
+	}
+	c, ok := s.calls.End(callID, "sip_hangup")
+	if !ok {
+		return
+	}
+	s.asterisk.UntrackCall(callID)
+	s.log.Info("SIP call ended by channel hangup", map[string]any{"call_id": callID, "channel": channel})
+	s.notifyCallStatus(c)
+}
+
+// handleSIPOriginateResult is the AMI callback when an async Originate
+// (outbound call to an IP phone) either connects or fails.
+func (s *Server) handleSIPOriginateResult(callID string, ok bool) {
+	if ok {
+		// Phone answered — transition call to active.
+		c, accepted := s.calls.Accept(callID)
+		if accepted {
+			s.notifyCallStatus(c)
+			s.log.Info("SIP outbound call answered", map[string]any{"call_id": callID})
+		}
+	} else {
+		// Phone rejected / no answer.
+		c, ended := s.calls.End(callID, "no_answer")
+		if ended {
+			s.notifyCallStatus(c)
+			if s.asterisk != nil {
+				s.asterisk.UntrackCall(callID)
+			}
+			s.log.Info("SIP outbound call not answered", map[string]any{"call_id": callID})
+		}
+	}
+}
+
 func (s *Server) sendError(conn *websocket.Conn, refID string, code int, message string) {
 	env := protocol.NewEnvelope(protocol.TypeError, protocol.ErrorPayload{
 		Code:    code,
@@ -649,6 +897,25 @@ func (s *Server) sendError(conn *websocket.Conn, refID string, code int, message
 	}
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	conn.WriteMessage(websocket.TextMessage, data)
+}
+
+// asteriskConnectLoop keeps the AMI connection alive, reconnecting on failure.
+func (s *Server) asteriskConnectLoop() {
+	for {
+		s.log.Info("connecting to Asterisk AMI", map[string]any{
+			"host": s.cfg.Asterisk.Host,
+			"port": s.cfg.Asterisk.Port,
+		})
+		// Run() connects and blocks until the connection drops.
+		if err := s.asterisk.Run(); err != nil {
+			s.log.Warn("Asterisk AMI connect failed — retrying in 15s",
+				map[string]any{"err": err.Error()})
+		} else {
+			s.log.Warn("Asterisk AMI connection dropped — reconnecting in 15s", nil)
+		}
+		s.asterisk.Disconnect() // ensure clean state before reconnect
+		time.Sleep(15 * time.Second)
+	}
 }
 
 // sendErrorSafe sends an error through the session's mutex-protected Send method.
@@ -683,6 +950,11 @@ func extractIP(r *http.Request) string {
 
 // StartBackgroundTasks launches periodic maintenance goroutines.
 func (s *Server) StartBackgroundTasks() {
+	// ── Central VPS Asterisk ─────────────────────────────────────────────────
+	if s.asterisk != nil {
+		go s.asteriskConnectLoop()
+	}
+
 	// Heartbeat sweep.
 	go func() {
 		ticker := time.NewTicker(time.Duration(s.cfg.HeartbeatSec) * time.Second)

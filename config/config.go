@@ -7,21 +7,35 @@ import (
 	"time"
 )
 
+// AsteriskConfig holds settings for the optional central VPS Asterisk integration.
+type AsteriskConfig struct {
+	Enabled       bool   `json:"enabled"`          // false → AMI disabled
+	Host          string `json:"host"`             // AMI host (default: 127.0.0.1)
+	Port          int    `json:"port"`             // AMI port  (default: 5038)
+	User          string `json:"user"`             // AMI user name
+	Secret        string `json:"secret"`           // AMI password
+	AutoConfigure bool   `json:"auto_configure"`   // write pjsip/manager/dialplan conf on start
+	SIPDomain     string `json:"sip_domain"`       // hostname phones register to
+	InContext     string `json:"in_context"`       // incoming-SIP dialplan context
+	NodeContext   string `json:"node_context"`     // node-callback dialplan context
+}
+
 // Config holds all server configuration.
 type Config struct {
-	Listen          string        `json:"listen"`            // e.g. ":8443"
-	DBPath          string        `json:"db_path"`           // SQLite file
-	LogLevel        string        `json:"log_level"`         // "debug","info","warn","error"
-	HeartbeatSec    int           `json:"heartbeat_sec"`     // expected heartbeat interval
-	HeartbeatTimeout time.Duration `json:"-"`                // computed
-	CallTimeoutSec  int           `json:"call_timeout_sec"`  // ring timeout
-	MaxNodesPerAcct int           `json:"max_nodes_per_account"`
-	MaxConcurrentCalls int        `json:"max_concurrent_calls"`
-	RateLimitPerSec int           `json:"rate_limit_per_sec"`
-	MaxPayloadBytes int           `json:"max_payload_bytes"`
-	AdminToken      string        `json:"admin_token"`       // bearer token for admin API
-	TLSCert         string        `json:"tls_cert,omitempty"`
-	TLSKey          string        `json:"tls_key,omitempty"`
+	Listen             string        `json:"listen"`               // e.g. ":8443"
+	DBPath             string        `json:"db_path"`              // SQLite file
+	LogLevel           string        `json:"log_level"`            // "debug","info","warn","error"
+	HeartbeatSec       int           `json:"heartbeat_sec"`        // expected heartbeat interval
+	HeartbeatTimeout   time.Duration `json:"-"`                    // computed
+	CallTimeoutSec     int           `json:"call_timeout_sec"`     // ring timeout
+	MaxNodesPerAcct    int           `json:"max_nodes_per_account"`
+	MaxConcurrentCalls int           `json:"max_concurrent_calls"`
+	RateLimitPerSec    int           `json:"rate_limit_per_sec"`
+	MaxPayloadBytes    int           `json:"max_payload_bytes"`
+	AdminToken         string        `json:"admin_token"`          // bearer token for admin API
+	TLSCert            string        `json:"tls_cert,omitempty"`
+	TLSKey             string        `json:"tls_key,omitempty"`
+	Asterisk           AsteriskConfig `json:"asterisk"`            // optional central PBX
 }
 
 // DefaultConfig returns production defaults.
@@ -37,6 +51,13 @@ func DefaultConfig() *Config {
 		RateLimitPerSec:    20,
 		MaxPayloadBytes:    65536,
 		AdminToken:         "",
+		Asterisk: AsteriskConfig{
+			Enabled:     false,
+			Host:        "127.0.0.1",
+			Port:        5038,
+			InContext:  "from-simson-sip",
+			NodeContext: "from-simson-node",
+		},
 	}
 }
 

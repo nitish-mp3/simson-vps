@@ -50,6 +50,22 @@ type AuditEntry struct {
 	IP        string
 }
 
+// SIPEndpoint is a PJSIP endpoint (IP phone) registered to the central VPS Asterisk.
+// Each endpoint gets its own section in pjsip.conf; its Extension determines the
+// number dialled in and is used to map incoming calls to a Simson node.
+type SIPEndpoint struct {
+	ID          string
+	AccountID   string
+	Extension   string // e.g. "1001"
+	Username    string // SIP auth username (unique)
+	Password    string // SIP auth password (stored in clear for pjsip.conf)
+	Description string
+	RouteTo     string // Simson node_id to ring; "" = ring all nodes in the account
+	Enabled     bool
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
 // Open creates or opens the SQLite database and runs migrations.
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
@@ -107,6 +123,21 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_account ON audit_log(account_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_nodes_auth_token ON nodes(auth_token)`,
+		`CREATE TABLE IF NOT EXISTS sip_endpoints (
+			id          TEXT PRIMARY KEY,
+			account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+			extension   TEXT NOT NULL,
+			username    TEXT NOT NULL UNIQUE,
+			password    TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			route_to    TEXT NOT NULL DEFAULT '',
+			enabled     INTEGER NOT NULL DEFAULT 1,
+			created_at  DATETIME NOT NULL DEFAULT (datetime('now')),
+			updated_at  DATETIME NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sip_account   ON sip_endpoints(account_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_sip_extension ON sip_endpoints(extension)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sip_username ON sip_endpoints(username)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -290,4 +321,135 @@ func generateToken() (string, error) {
 		return "", err
 	}
 	return "stk_" + hex.EncodeToString(b), nil
+}
+
+// --- SIP Endpoints ---
+
+// CreateSIPEndpoint inserts a new PJSIP endpoint record.
+func (s *Store) CreateSIPEndpoint(ep SIPEndpoint) error {
+	_, err := s.db.Exec(
+		`INSERT INTO sip_endpoints (id, account_id, extension, username, password, description, route_to, enabled)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		ep.ID, ep.AccountID, ep.Extension, ep.Username, ep.Password,
+		ep.Description, ep.RouteTo, boolInt(ep.Enabled),
+	)
+	return err
+}
+
+// GetSIPEndpoint returns a single endpoint by ID, or nil.
+func (s *Store) GetSIPEndpoint(id string) (*SIPEndpoint, error) {
+	row := s.db.QueryRow(
+		`SELECT id, account_id, extension, username, password, description, route_to, enabled, created_at, updated_at
+		 FROM sip_endpoints WHERE id = ?`, id)
+	return scanSIPEndpoint(row)
+}
+
+// GetSIPEndpointByExtension returns the first enabled endpoint with this extension, or nil.
+func (s *Store) GetSIPEndpointByExtension(extension string) (*SIPEndpoint, error) {
+	row := s.db.QueryRow(
+		`SELECT id, account_id, extension, username, password, description, route_to, enabled, created_at, updated_at
+		 FROM sip_endpoints WHERE extension = ? AND enabled = 1 LIMIT 1`, extension)
+	return scanSIPEndpoint(row)
+}
+
+// ListSIPEndpoints returns all endpoints for an account.
+func (s *Store) ListSIPEndpoints(accountID string) ([]SIPEndpoint, error) {
+	rows, err := s.db.Query(
+		`SELECT id, account_id, extension, username, password, description, route_to, enabled, created_at, updated_at
+		 FROM sip_endpoints WHERE account_id = ? ORDER BY extension`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []SIPEndpoint
+	for rows.Next() {
+		ep, err := scanSIPEndpointRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *ep)
+	}
+	return out, rows.Err()
+}
+
+// ListAllSIPEndpoints returns every endpoint (used for config generation).
+func (s *Store) ListAllSIPEndpoints() ([]SIPEndpoint, error) {
+	rows, err := s.db.Query(
+		`SELECT id, account_id, extension, username, password, description, route_to, enabled, created_at, updated_at
+		 FROM sip_endpoints ORDER BY account_id, extension`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []SIPEndpoint
+	for rows.Next() {
+		ep, err := scanSIPEndpointRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *ep)
+	}
+	return out, rows.Err()
+}
+
+// UpdateSIPEndpoint updates mutable fields of a SIP endpoint.
+func (s *Store) UpdateSIPEndpoint(id, description, password, routeTo string, enabled bool) error {
+	_, err := s.db.Exec(
+		`UPDATE sip_endpoints SET description = ?, password = ?, route_to = ?, enabled = ?,
+		 updated_at = datetime('now') WHERE id = ?`,
+		description, password, routeTo, boolInt(enabled), id,
+	)
+	return err
+}
+
+// DeleteSIPEndpoint removes a SIP endpoint by ID.
+func (s *Store) DeleteSIPEndpoint(id string) error {
+	_, err := s.db.Exec(`DELETE FROM sip_endpoints WHERE id = ?`, id)
+	return err
+}
+
+// ---- scan helpers -----------------------------------------------------------
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanSIPEndpoint(row rowScanner) (*SIPEndpoint, error) {
+	ep := &SIPEndpoint{}
+	var enabled int
+	err := row.Scan(
+		&ep.ID, &ep.AccountID, &ep.Extension, &ep.Username, &ep.Password,
+		&ep.Description, &ep.RouteTo, &enabled, &ep.CreatedAt, &ep.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ep.Enabled = enabled == 1
+	return ep, nil
+}
+
+func scanSIPEndpointRow(rows *sql.Rows) (*SIPEndpoint, error) {
+	ep := &SIPEndpoint{}
+	var enabled int
+	err := rows.Scan(
+		&ep.ID, &ep.AccountID, &ep.Extension, &ep.Username, &ep.Password,
+		&ep.Description, &ep.RouteTo, &enabled, &ep.CreatedAt, &ep.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	ep.Enabled = enabled == 1
+	return ep, nil
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

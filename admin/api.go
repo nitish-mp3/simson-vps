@@ -1,12 +1,15 @@
 package admin
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/nitish-mp3/simson-vps/asterisk"
 	"github.com/nitish-mp3/simson-vps/calls"
 	"github.com/nitish-mp3/simson-vps/config"
 	"github.com/nitish-mp3/simson-vps/hub"
@@ -16,17 +19,21 @@ import (
 
 // API holds dependencies for admin handlers.
 type API struct {
-	cfg   *config.Config
-	store *store.Store
-	hub   *hub.Hub
-	calls *calls.Manager
-	log   *logging.Logger
+	cfg      *config.Config
+	store    *store.Store
+	hub      *hub.Hub
+	calls    *calls.Manager
+	log      *logging.Logger
+	asterisk *asterisk.Router // nil when Asterisk disabled
 }
 
 // New creates an admin API.
 func New(cfg *config.Config, st *store.Store, h *hub.Hub, cm *calls.Manager, log *logging.Logger) *API {
 	return &API{cfg: cfg, store: st, hub: h, calls: cm, log: log}
 }
+
+// SetAsterisk injects the AMI router so admin endpoints can trigger reloads.
+func (a *API) SetAsterisk(r *asterisk.Router) { a.asterisk = r }
 
 // Router returns an http.Handler with all admin routes.
 func (a *API) Router() http.Handler {
@@ -56,6 +63,17 @@ func (a *API) Router() http.Handler {
 
 	// Audit
 	mux.HandleFunc("GET /admin/audit", a.auth(a.handleAudit))
+
+	// SIP Endpoints (Central VPS Asterisk)
+	mux.HandleFunc("POST /admin/accounts/{accountId}/sip-endpoints", a.auth(a.handleCreateSIPEndpoint))
+	mux.HandleFunc("GET /admin/accounts/{accountId}/sip-endpoints", a.auth(a.handleListSIPEndpoints))
+	mux.HandleFunc("GET /admin/sip-endpoints/{id}", a.auth(a.handleGetSIPEndpoint))
+	mux.HandleFunc("PUT /admin/sip-endpoints/{id}", a.auth(a.handleUpdateSIPEndpoint))
+	mux.HandleFunc("DELETE /admin/sip-endpoints/{id}", a.auth(a.handleDeleteSIPEndpoint))
+
+	// Asterisk management
+	mux.HandleFunc("POST /admin/asterisk/reload-sip", a.auth(a.handleAsteriskReloadSIP))
+	mux.HandleFunc("POST /admin/asterisk/reload-dialplan", a.auth(a.handleAsteriskReloadDialplan))
 
 	return mux
 }
@@ -393,6 +411,165 @@ func (a *API) handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, entries)
+}
+
+// --- SIP Endpoints ---
+
+func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	if accountID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing accountId"})
+		return
+	}
+	var body struct {
+		Extension   string `json:"extension"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		Description string `json:"description"`
+		RouteTo     string `json:"route_to"`
+		Enabled     *bool  `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+	if body.Extension == "" || body.Username == "" || body.Password == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "extension, username, and password are required"})
+		return
+	}
+	enabled := true
+	if body.Enabled != nil {
+		enabled = *body.Enabled
+	}
+	// Generate a random ID
+	idb := make([]byte, 16)
+	rand.Read(idb) //nolint:errcheck
+	ep := store.SIPEndpoint{
+		ID:          hex.EncodeToString(idb),
+		AccountID:   accountID,
+		Extension:   body.Extension,
+		Username:    body.Username,
+		Password:    body.Password,
+		Description: body.Description,
+		RouteTo:     body.RouteTo,
+		Enabled:     enabled,
+	}
+	if err := a.store.CreateSIPEndpoint(ep); err != nil {
+		a.log.Error("create sip endpoint", map[string]any{"err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusCreated, ep)
+}
+
+func (a *API) handleListSIPEndpoints(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	if accountID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing accountId"})
+		return
+	}
+	eps, err := a.store.ListSIPEndpoints(accountID)
+	if err != nil {
+		a.log.Error("list sip endpoints", map[string]any{"err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, eps)
+}
+
+func (a *API) handleGetSIPEndpoint(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ep, err := a.store.GetSIPEndpoint(id)
+	if err != nil {
+		a.log.Error("get sip endpoint", map[string]any{"err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	if ep == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, ep)
+}
+
+func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ep, err := a.store.GetSIPEndpoint(id)
+	if err != nil {
+		a.log.Error("get sip endpoint for update", map[string]any{"err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	if ep == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+		return
+	}
+	var body struct {
+		Description *string `json:"description"`
+		Password    *string `json:"password"`
+		RouteTo     *string `json:"route_to"`
+		Enabled     *bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+	if body.Description != nil {
+		ep.Description = *body.Description
+	}
+	if body.Password != nil && *body.Password != "" {
+		ep.Password = *body.Password
+	}
+	if body.RouteTo != nil {
+		ep.RouteTo = *body.RouteTo
+	}
+	if body.Enabled != nil {
+		ep.Enabled = *body.Enabled
+	}
+	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.Enabled); err != nil {
+		a.log.Error("update sip endpoint", map[string]any{"err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, ep)
+}
+
+func (a *API) handleDeleteSIPEndpoint(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := a.store.DeleteSIPEndpoint(id); err != nil {
+		a.log.Error("delete sip endpoint", map[string]any{"err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Asterisk management ---
+
+func (a *API) handleAsteriskReloadSIP(w http.ResponseWriter, r *http.Request) {
+	if a.asterisk == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Asterisk integration disabled"})
+		return
+	}
+	if err := a.asterisk.ReloadSIP(); err != nil {
+		a.log.Error("asterisk reload-sip", map[string]any{"err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *API) handleAsteriskReloadDialplan(w http.ResponseWriter, r *http.Request) {
+	if a.asterisk == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Asterisk integration disabled"})
+		return
+	}
+	if err := a.asterisk.ReloadDialplan(); err != nil {
+		a.log.Error("asterisk reload-dialplan", map[string]any{"err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // --- Helpers ---

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nitish-mp3/simson-vps/admin"
+	"github.com/nitish-mp3/simson-vps/asterisk"
 	"github.com/nitish-mp3/simson-vps/config"
 	"github.com/nitish-mp3/simson-vps/logging"
 	"github.com/nitish-mp3/simson-vps/server"
@@ -63,10 +64,44 @@ func main() {
 
 	// --- Server ---
 	srv := server.New(cfg, st, log)
+
+	// --- Asterisk auto-configure (runs before background tasks so confs are ready) ---
+	if cfg.Asterisk.Enabled && cfg.Asterisk.AutoConfigure {
+		eps, err := st.ListAllSIPEndpoints()
+		if err != nil {
+			log.Warn("asterisk auto-configure: failed to load SIP endpoints", map[string]any{"err": err.Error()})
+		} else {
+			defs := make([]asterisk.SIPEndpointDef, len(eps))
+			for i, ep := range eps {
+				defs[i] = asterisk.SIPEndpointDef{
+					ID:       ep.ID,
+					Username: ep.Username,
+					Password: ep.Password,
+					Enabled:  ep.Enabled,
+				}
+			}
+			scfg := asterisk.SetupConfig{
+				AmiUser:     cfg.Asterisk.User,
+				AmiSecret:   cfg.Asterisk.Secret,
+				SIPDomain:   cfg.Asterisk.SIPDomain,
+				InContext:    cfg.Asterisk.InContext,
+				NodeContext: cfg.Asterisk.NodeContext,
+			}
+			if err := asterisk.Setup(scfg, defs, log); err != nil {
+				log.Warn("asterisk auto-configure failed (continuing)", map[string]any{"err": err.Error()})
+			} else {
+				log.Info("asterisk auto-configure complete", nil)
+			}
+		}
+	}
+
 	srv.StartBackgroundTasks()
 
 	// --- Admin API ---
 	adminAPI := admin.New(cfg, st, srv.Hub(), srv.Calls(), log)
+	if srv.Asterisk() != nil {
+		adminAPI.SetAsterisk(srv.Asterisk())
+	}
 
 	// --- HTTP Router ---
 	mux := http.NewServeMux()

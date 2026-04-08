@@ -8,5 +8,17 @@
   "max_concurrent_calls": 5,
   "rate_limit_per_sec": 20,
   "max_payload_bytes": 65536,
-  "admin_token": ""
+  "admin_token": "",
+
+  "asterisk": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 5038,
+    "user": "simson",
+    "secret": "changeme",
+    "auto_configure": true,
+    "sip_domain": "sip.example.com",
+    "in_context": "from-simson-sip",
+    "node_context": "from-simson-node"
+  }
 }
