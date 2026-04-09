@@ -66,8 +66,9 @@ type CallInvitePayload struct {
 }
 
 type CallAcceptPayload struct {
-	CallID string `json:"call_id"`
-	NodeID string `json:"node_id"`
+	CallID           string `json:"call_id"`
+	NodeID           string `json:"node_id"`
+	AnsweredByUserID string `json:"answered_by_user_id,omitempty"`
 }
 
 type CallRejectPayload struct {
@@ -83,9 +84,10 @@ type CallEndPayload struct {
 }
 
 type CallStatusPayload struct {
-	CallID string `json:"call_id"`
-	Status string `json:"status"` // "ringing","active","ended","failed"
-	Reason string `json:"reason,omitempty"`
+	CallID           string `json:"call_id"`
+	Status           string `json:"status"` // "ringing","active","ended","failed"
+	Reason           string `json:"reason,omitempty"`
+	AnsweredByUserID string `json:"answered_by_user_id,omitempty"`
 }
 
 // --- Error ---

@@ -200,7 +200,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// Send auth result.
 	authResult := protocol.NewEnvelope(protocol.TypeAuthResult, protocol.AuthResultPayload{
 		OK:              true,
-		ServerVersion:   "1.0.0",
+		ServerVersion:   "1.3.0",
 		ProtocolVersion: protocol.ProtocolVersion,
 		HeartbeatSec:    s.cfg.HeartbeatSec,
 	})
@@ -433,14 +433,18 @@ func (s *Server) handleCallAccept(sess *hub.Session, env *protocol.Envelope) {
 	}
 
 	s.store.WriteAudit(sess.AccountID, sess.NodeID, "call_accepted", "call="+payload.CallID, sess.RemoteIP)
-	s.log.Info("call accepted", map[string]any{"call_id": payload.CallID})
+	s.log.Info("call accepted", map[string]any{"call_id": payload.CallID, "answered_by": payload.AnsweredByUserID})
+
+	// Include answered_by_user_id so call-all participants can dismiss.
+	answeredBy := payload.AnsweredByUserID
 
 	// Notify caller.
 	callerSess := s.hub.Get(c.FromNode)
 	if callerSess != nil {
 		status := protocol.NewEnvelope(protocol.TypeCallStatus, protocol.CallStatusPayload{
-			CallID: c.ID,
-			Status: string(calls.StateActive),
+			CallID:           c.ID,
+			Status:           string(calls.StateActive),
+			AnsweredByUserID: answeredBy,
 		})
 		data, _ := status.Encode()
 		callerSess.Send(data)
@@ -448,8 +452,9 @@ func (s *Server) handleCallAccept(sess *hub.Session, env *protocol.Envelope) {
 
 	// Notify callee too.
 	calleeStatus := protocol.NewEnvelope(protocol.TypeCallStatus, protocol.CallStatusPayload{
-		CallID: c.ID,
-		Status: string(calls.StateActive),
+		CallID:           c.ID,
+		Status:           string(calls.StateActive),
+		AnsweredByUserID: answeredBy,
 	})
 	data, _ := calleeStatus.Encode()
 	sess.Send(data)
@@ -770,6 +775,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 
 // handleSIPIncomingCall is the AMI callback for an incoming SIP call.
 // It routes the call to the correct Simson node based on the dialled extension.
+// When RouteTo is empty, it broadcasts (rings) ALL online nodes in the account.
 func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	ep, err := s.store.GetSIPEndpointByExtension(in.Extension)
 	if err != nil || ep == nil {
@@ -781,16 +787,20 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		return
 	}
 
-	targetNodeID := ep.RouteTo
-	if targetNodeID == "" {
-		// Broadcast: ring any online node in this account.
+	// Collect target nodes: either a specific RouteTo or all online nodes.
+	var targetNodeIDs []string
+	if ep.RouteTo != "" {
+		if s.hub.IsOnline(ep.RouteTo) {
+			targetNodeIDs = append(targetNodeIDs, ep.RouteTo)
+		}
+	} else {
+		// Broadcast: ring ALL online nodes in this account.
 		for _, sess := range s.hub.ListByAccount(ep.AccountID) {
-			targetNodeID = sess.NodeID
-			break
+			targetNodeIDs = append(targetNodeIDs, sess.NodeID)
 		}
 	}
 
-	if targetNodeID == "" || !s.hub.IsOnline(targetNodeID) {
+	if len(targetNodeIDs) == 0 {
 		s.log.Warn("no online target node for SIP call — hanging up",
 			map[string]any{"extension": in.Extension})
 		if s.asterisk != nil {
@@ -799,11 +809,14 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		return
 	}
 
+	// Use the first node as primary call target (for call state tracking).
+	primaryNode := targetNodeIDs[0]
+
 	callID := "call_" + uuid.NewString()
 	c := &calls.Call{
 		ID:        callID,
 		FromNode:  "sip:" + in.Extension,
-		ToNode:    targetNodeID,
+		ToNode:    primaryNode,
 		AccountID: ep.AccountID,
 		CallType:  "sip",
 	}
@@ -813,13 +826,6 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 
 	// Track channel before doing anything else.
 	s.asterisk.TrackCall(callID, in.Channel)
-
-	targetSess := s.hub.Get(targetNodeID)
-	if targetSess == nil {
-		s.calls.End(callID, "target_disappeared")
-		s.asterisk.UntrackCall(callID)
-		return
-	}
 
 	invite := protocol.NewEnvelope(protocol.TypeCallInvite, protocol.CallInvitePayload{
 		CallID:     callID,
@@ -835,12 +841,27 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		},
 	})
 	inviteData, _ := invite.Encode()
-	targetSess.Send(inviteData)
 
-	s.store.WriteAudit(ep.AccountID, targetNodeID, "sip_incoming_call",
-		fmt.Sprintf("call=%s ext=%s ch=%s", callID, in.Extension, in.Channel), "")
+	// Send invite to ALL target nodes (call-all for SIP).
+	sentCount := 0
+	for _, nodeID := range targetNodeIDs {
+		targetSess := s.hub.Get(nodeID)
+		if targetSess != nil {
+			targetSess.Send(inviteData)
+			sentCount++
+		}
+	}
+
+	if sentCount == 0 {
+		s.calls.End(callID, "target_disappeared")
+		s.asterisk.UntrackCall(callID)
+		return
+	}
+
+	s.store.WriteAudit(ep.AccountID, primaryNode, "sip_incoming_call",
+		fmt.Sprintf("call=%s ext=%s ch=%s targets=%d", callID, in.Extension, in.Channel, sentCount), "")
 	s.log.Info("SIP invite dispatched", map[string]any{
-		"call_id": callID, "extension": in.Extension, "to_node": targetNodeID,
+		"call_id": callID, "extension": in.Extension, "targets": sentCount,
 	})
 }
 
