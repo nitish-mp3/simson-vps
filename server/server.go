@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/subtle"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -735,7 +736,17 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 	}
 
 	// Caller label shown on the phone display.
-	callerID := req.Metadata["caller_id"]
+	callerID := ""
+	if len(req.Metadata) > 0 {
+		var metaMap map[string]any
+		if err := json.Unmarshal(req.Metadata, &metaMap); err == nil {
+			if v, ok := metaMap["caller_id"]; ok {
+				if s, ok := v.(string); ok {
+					callerID = s
+				}
+			}
+		}
+	}
 	if callerID == "" {
 		if node, _ := s.store.GetNode(sess.NodeID); node != nil && node.Label != "" {
 			callerID = node.Label
@@ -827,18 +838,20 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	// Track channel before doing anything else.
 	s.asterisk.TrackCall(callID, in.Channel)
 
+	sipMeta, _ := json.Marshal(map[string]string{
+		"sip_channel":   in.Channel,
+		"sip_bridge_id": in.BridgeID,
+		"sip_caller_id": in.CallerID,
+		"sip_extension": in.Extension,
+		"sip_unique_id": in.UniqueID,
+	})
+
 	invite := protocol.NewEnvelope(protocol.TypeCallInvite, protocol.CallInvitePayload{
 		CallID:     callID,
 		FromNodeID: "sip:" + in.Extension,
 		FromLabel:  in.CallerID,
 		CallType:   "sip",
-		Metadata: map[string]string{
-			"sip_channel":   in.Channel,
-			"sip_bridge_id": in.BridgeID,
-			"sip_caller_id": in.CallerID,
-			"sip_extension": in.Extension,
-			"sip_unique_id": in.UniqueID,
-		},
+		Metadata:   json.RawMessage(sipMeta),
 	})
 	inviteData, _ := invite.Encode()
 

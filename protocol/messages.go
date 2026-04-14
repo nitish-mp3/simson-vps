@@ -1,6 +1,9 @@
 package protocol
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Protocol version — increment on breaking changes.
 const ProtocolVersion = "1.0.0"
@@ -50,19 +53,19 @@ type HeartbeatAckPayload struct {
 // --- Call lifecycle ---
 
 type CallRequestPayload struct {
-	CallID       string            `json:"call_id"`
-	FromNodeID   string            `json:"from_node_id"`
-	ToNodeID     string            `json:"to_node_id"`
-	CallType     string            `json:"call_type"` // "voice", "intercom", "sip"
-	Metadata     map[string]string `json:"metadata,omitempty"`
+	CallID       string          `json:"call_id"`
+	FromNodeID   string          `json:"from_node_id"`
+	ToNodeID     string          `json:"to_node_id"`
+	CallType     string          `json:"call_type"` // "voice", "intercom", "sip"
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
 }
 
 type CallInvitePayload struct {
-	CallID       string            `json:"call_id"`
-	FromNodeID   string            `json:"from_node_id"`
-	FromLabel    string            `json:"from_label"`
-	CallType     string            `json:"call_type"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
+	CallID       string          `json:"call_id"`
+	FromNodeID   string          `json:"from_node_id"`
+	FromLabel    string          `json:"from_label"`
+	CallType     string          `json:"call_type"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
 }
 
 type CallAcceptPayload struct {
