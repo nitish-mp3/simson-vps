@@ -35,7 +35,7 @@ type Router struct {
 	OnOriginateResult func(actionID string, ok bool) // async Originate outcome
 
 	// call tracking
-	mu           sync.Mutex
+	mu           sync.RWMutex
 	chanToCallID map[string]string // asterisk channel → simson call ID
 	callIDToChan map[string]string // simson call ID  → asterisk channel
 
@@ -113,9 +113,9 @@ func (r *Router) ChannelForCall(callID string) (string, bool) {
 // CallIDForChannel returns the Simson call ID for an Asterisk channel.
 func (r *Router) CallIDForChannel(channel string) (string, bool) {
 	channel = normalizeChannel(channel)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	id, ok := r.chanToCallID[channel]
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	id, _, ok := r.findCallByChannelLocked(channel)
 	return id, ok
 }
 
@@ -247,9 +247,9 @@ func (r *Router) handleHangup(ev Event) {
 
 	// Clean up tracking.
 	r.mu.Lock()
-	if callID, ok := r.chanToCallID[channel]; ok {
-		delete(r.chanToCallID, channel)
-		if tracked, exists := r.callIDToChan[callID]; exists && tracked == channel {
+	if callID, trackedChannel, ok := r.findCallByChannelLocked(channel); ok {
+		delete(r.chanToCallID, trackedChannel)
+		if tracked, exists := r.callIDToChan[callID]; exists && tracked == trackedChannel {
 			delete(r.callIDToChan, callID)
 		}
 	}
@@ -301,4 +301,67 @@ func normalizeChannel(channel string) string {
 		ch = ch[:idx]
 	}
 	return ch
+}
+
+func (r *Router) findCallByChannelLocked(channel string) (callID string, trackedChannel string, ok bool) {
+	if id, found := r.chanToCallID[channel]; found {
+		return id, channel, true
+	}
+
+	base := channelBaseKey(channel)
+	if base == "" {
+		return "", "", false
+	}
+
+	var matchedID string
+	var matchedChannel string
+	for ch, id := range r.chanToCallID {
+		if channelBaseKey(ch) != base {
+			continue
+		}
+		if matchedID != "" && matchedID != id {
+			// Ambiguous base-channel match; refuse to guess.
+			return "", "", false
+		}
+		matchedID = id
+		matchedChannel = ch
+	}
+	if matchedID == "" {
+		return "", "", false
+	}
+	return matchedID, matchedChannel, true
+}
+
+func channelBaseKey(channel string) string {
+	ch := normalizeChannel(channel)
+	if ch == "" {
+		return ""
+	}
+
+	slash := strings.Index(ch, "/")
+	if slash < 0 {
+		return ch
+	}
+
+	dash := strings.LastIndex(ch, "-")
+	if dash <= slash+1 || dash+1 >= len(ch) {
+		return ch
+	}
+
+	suffix := ch[dash+1:]
+	if len(suffix) < 6 || !isHexString(suffix) {
+		return ch
+	}
+	return ch[:dash]
+}
+
+func isHexString(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
 }
