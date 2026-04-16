@@ -41,7 +41,7 @@ func Setup(cfg SetupConfig, endpoints []SIPEndpointDef, log *logging.Logger) err
 	root := findAsteriskRoot()
 	if root == "" {
 		return fmt.Errorf(
-			"asterisk config root not found (tried /etc/asterisk, /usr/local/etc/asterisk). "+
+			"asterisk config root not found (tried /etc/asterisk, /usr/local/etc/asterisk). " +
 				"Install Asterisk first: sudo apt install asterisk",
 		)
 	}
@@ -86,8 +86,11 @@ func findAsteriskRoot() string {
 // ensureInclude appends a #include directive to confFile if not already present.
 func ensureInclude(confFile, glob string) error {
 	data, _ := os.ReadFile(confFile) // file may not exist — ignore err
+	content := string(data)
+	normGlob := strings.ReplaceAll(glob, "\\", "/")
+	dirPattern := filepath.Base(filepath.Dir(normGlob)) + "/*.conf"
 	line := "#include " + glob
-	if strings.Contains(string(data), line) {
+	if strings.Contains(content, line) || strings.Contains(content, normGlob) || strings.Contains(content, dirPattern) {
 		return nil
 	}
 	f, err := os.OpenFile(confFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -99,16 +102,31 @@ func ensureInclude(confFile, glob string) error {
 	return err
 }
 
+// detectSnippetDirName picks the snippet dir already included by a base conf.
+// Falls back to fallbackDir when no include is present.
+func detectSnippetDirName(root, confFile string, candidates []string, fallbackDir string) string {
+	data, _ := os.ReadFile(filepath.Join(root, confFile))
+	content := strings.ReplaceAll(string(data), "\"", "")
+	for _, name := range candidates {
+		pattern := name + "/*.conf"
+		if strings.Contains(content, pattern) || strings.Contains(content, "/"+pattern) {
+			return name
+		}
+	}
+	return fallbackDir
+}
+
 // ---- manager.conf -----------------------------------------------------------
 
 func writeManagerConf(root, amiUser, amiSecret string) error {
-	dir := filepath.Join(root, "manager.conf.d")
+	dirName := detectSnippetDirName(root, "manager.conf", []string{"manager.d", "manager.conf.d"}, "manager.d")
+	dir := filepath.Join(root, dirName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	if err := ensureInclude(
 		filepath.Join(root, "manager.conf"),
-		filepath.Join(dir, "*.conf"),
+		dirName+"/*.conf",
 	); err != nil {
 		return err
 	}
@@ -137,13 +155,14 @@ writetimeout = 5000
 // ---- pjsip.conf -------------------------------------------------------------
 
 func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) error {
-	dir := filepath.Join(root, "pjsip.conf.d")
+	dirName := detectSnippetDirName(root, "pjsip.conf", []string{"pjsip.d", "pjsip.conf.d"}, "pjsip.d")
+	dir := filepath.Join(root, dirName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	if err := ensureInclude(
 		filepath.Join(root, "pjsip.conf"),
-		filepath.Join(dir, "*.conf"),
+		dirName+"/*.conf",
 	); err != nil {
 		return err
 	}
@@ -191,14 +210,33 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 	)
 	sb.WriteString("[simson-auth-tpl](!)\ntype=auth\nauth_type=userpass\n\n")
 	sb.WriteString("[simson-aor-tpl](!)\ntype=aor\nmax_contacts=2\nremove_existing=yes\nqualify_frequency=60\n\n")
+	sb.WriteString(
+		"[simson-webrtc-ep-tpl](!)\ntype=endpoint\n" +
+			"transport=simson-ws\n" +
+			"context=from-simson-node\n" +
+			"disallow=all\n" +
+			"allow=opus\nallow=ulaw\nallow=alaw\n" +
+			"direct_media=no\n" +
+			"rtp_symmetric=yes\n" +
+			"force_rport=yes\n" +
+			"rewrite_contact=yes\n" +
+			"ice_support=yes\n" +
+			"webrtc=yes\n" +
+			"use_avpf=yes\n" +
+			"rtcp_mux=yes\n" +
+			"media_use_received_transport=yes\n" +
+			"media_encryption=dtls\n" +
+			"dtls_auto_generate_cert=yes\n" +
+			"dtls_setup=actpass\n" +
+			"dtmf_mode=rfc4733\n\n",
+	)
 
 	// ── Shared WebRTC pool endpoint (for browser SIP.js clients) ─────────────
 	// All browser clients use the same credentials; individual routing is done
 	// via the ConfBridge extension, not the SIP identity.
 	if cfg.WebRTCUser != "" && cfg.WebRTCPass != "" {
 		sb.WriteString(
-			"[simson-webrtc-pool](simson-ep-tpl)\n" +
-				"context=from-simson-node\n" + // browsers always go to the node/bridge context
+			"[simson-webrtc-pool](simson-webrtc-ep-tpl)\n" +
 				"auth=simson-webrtc-pool-auth\n" +
 				"aors=simson-webrtc-pool-aor\n\n",
 		)
@@ -224,13 +262,14 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 // ---- extensions.conf --------------------------------------------------------
 
 func writeConfBridgeConf(root string) error {
-	dir := filepath.Join(root, "confbridge.conf.d")
+	dirName := detectSnippetDirName(root, "confbridge.conf", []string{"confbridge.conf.d", "confbridge.d"}, "confbridge.conf.d")
+	dir := filepath.Join(root, dirName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	if err := ensureInclude(
 		filepath.Join(root, "confbridge.conf"),
-		filepath.Join(dir, "*.conf"),
+		dirName+"/*.conf",
 	); err != nil {
 		return err
 	}
@@ -249,13 +288,14 @@ video_mode=none
 // ---- extensions.conf --------------------------------------------------------
 
 func writeDialplanConf(root, inCtx, nodeCtx string) error {
-	dir := filepath.Join(root, "extensions.conf.d")
+	dirName := detectSnippetDirName(root, "extensions.conf", []string{"extensions.d", "extensions.conf.d"}, "extensions.d")
+	dir := filepath.Join(root, dirName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	if err := ensureInclude(
 		filepath.Join(root, "extensions.conf"),
-		filepath.Join(dir, "*.conf"),
+		dirName+"/*.conf",
 	); err != nil {
 		return err
 	}

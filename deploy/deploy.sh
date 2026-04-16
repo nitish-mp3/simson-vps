@@ -287,6 +287,9 @@ $DOMAIN {
     handle /ws {
         reverse_proxy localhost:8080
     }
+    handle /sip/ws* {
+        reverse_proxy localhost:8088
+    }
     handle /admin/* {
         reverse_proxy localhost:8080
     }

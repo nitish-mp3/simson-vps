@@ -30,8 +30,8 @@ type Router struct {
 	log *logging.Logger
 
 	// Callbacks set by server.go after construction.
-	OnIncomingCall    func(in IncomingSIPCall)     // SIP phone dialled in
-	OnChannelHangup   func(channel string)          // SIP channel hung up
+	OnIncomingCall    func(in IncomingSIPCall)       // SIP phone dialled in
+	OnChannelHangup   func(channel string)           // SIP channel hung up
 	OnOriginateResult func(actionID string, ok bool) // async Originate outcome
 
 	// call tracking
@@ -82,6 +82,10 @@ func (r *Router) Connected() bool { return r.ami.Connected() }
 
 // TrackCall registers a Simson call ID ↔ Asterisk channel mapping.
 func (r *Router) TrackCall(callID, channel string) {
+	channel = normalizeChannel(channel)
+	if callID == "" || channel == "" {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.chanToCallID[channel] = callID
@@ -108,6 +112,7 @@ func (r *Router) ChannelForCall(callID string) (string, bool) {
 
 // CallIDForChannel returns the Simson call ID for an Asterisk channel.
 func (r *Router) CallIDForChannel(channel string) (string, bool) {
+	channel = normalizeChannel(channel)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	id, ok := r.chanToCallID[channel]
@@ -229,7 +234,7 @@ func (r *Router) handleSimsonRoute(ev Event) {
 }
 
 func (r *Router) handleHangup(ev Event) {
-	channel := ev.Fields["Channel"]
+	channel := normalizeChannel(ev.Fields["Channel"])
 	if channel == "" {
 		return
 	}
@@ -244,7 +249,9 @@ func (r *Router) handleHangup(ev Event) {
 	r.mu.Lock()
 	if callID, ok := r.chanToCallID[channel]; ok {
 		delete(r.chanToCallID, channel)
-		delete(r.callIDToChan, callID)
+		if tracked, exists := r.callIDToChan[callID]; exists && tracked == channel {
+			delete(r.callIDToChan, callID)
+		}
 	}
 	r.mu.Unlock()
 }
@@ -267,7 +274,7 @@ func (r *Router) handleOriginateResponse(ev Event) {
 	}
 
 	ok := ev.Fields["Response"] == "Success"
-	channel := ev.Fields["Channel"]
+	channel := normalizeChannel(ev.Fields["Channel"])
 
 	if ok && channel != "" {
 		r.TrackCall(callID, channel)
@@ -283,4 +290,15 @@ func (r *Router) handleOriginateResponse(ev Event) {
 	if r.OnOriginateResult != nil {
 		r.OnOriginateResult(callID, ok)
 	}
+}
+
+func normalizeChannel(channel string) string {
+	ch := strings.TrimSpace(channel)
+	if ch == "" {
+		return ""
+	}
+	if idx := strings.Index(ch, ";"); idx > 0 {
+		ch = ch[:idx]
+	}
+	return ch
 }
