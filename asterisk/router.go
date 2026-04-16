@@ -115,10 +115,11 @@ func (r *Router) CallIDForChannel(channel string) (string, bool) {
 }
 
 // OriginateToExtension dials a SIP extension on behalf of a Simson node.
+// bridgeExt is the extension in nodeCtx that answered SIP legs are sent to.
 // Returns the AMI ActionID that can be used to match the async OriginateResponse event.
-func (r *Router) OriginateToExtension(extension, context, callerID, callID, fromNode string, timeoutSec int) (string, error) {
+func (r *Router) OriginateToExtension(extension, context, bridgeExt, callerID, callID, fromNode string, timeoutSec int) (string, error) {
 	channel := fmt.Sprintf("PJSIP/%s", extension)
-	actionID, err := r.ami.Originate(channel, context, "s", callerID, callID, fromNode, timeoutSec*1000)
+	actionID, err := r.ami.Originate(channel, context, bridgeExt, callerID, callID, fromNode, timeoutSec*1000)
 	if err != nil {
 		return "", err
 	}

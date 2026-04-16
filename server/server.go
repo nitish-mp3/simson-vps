@@ -223,6 +223,11 @@ func (s *Server) readLoop(sess *hub.Session) {
 		// End any in-flight calls for this node.
 		activeCalls := s.calls.ActiveByNode(sess.NodeID)
 		for _, c := range activeCalls {
+			if c.CallType == "sip" && s.asterisk != nil {
+				if err := s.asterisk.HangupCall(c.ID); err != nil {
+					s.log.Warn("failed to hang up SIP call on disconnect", map[string]any{"call_id": c.ID, "err": err.Error()})
+				}
+			}
 			if ended, ok := s.calls.End(c.ID, "disconnect"); ok {
 				s.notifyCallStatus(ended)
 			}
@@ -445,6 +450,7 @@ func (s *Server) handleCallAccept(sess *hub.Session, env *protocol.Envelope) {
 		status := protocol.NewEnvelope(protocol.TypeCallStatus, protocol.CallStatusPayload{
 			CallID:           c.ID,
 			Status:           string(calls.StateActive),
+			SIPBridgeID:      c.SIPBridgeID,
 			AnsweredByUserID: answeredBy,
 		})
 		data, _ := status.Encode()
@@ -455,6 +461,7 @@ func (s *Server) handleCallAccept(sess *hub.Session, env *protocol.Envelope) {
 	calleeStatus := protocol.NewEnvelope(protocol.TypeCallStatus, protocol.CallStatusPayload{
 		CallID:           c.ID,
 		Status:           string(calls.StateActive),
+		SIPBridgeID:      c.SIPBridgeID,
 		AnsweredByUserID: answeredBy,
 	})
 	data, _ := calleeStatus.Encode()
@@ -522,6 +529,12 @@ func (s *Server) handleCallEnd(sess *hub.Session, env *protocol.Envelope) {
 	if !ok {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found or already ended")
 		return
+	}
+
+	if existing.CallType == "sip" && s.asterisk != nil {
+		if err := s.asterisk.HangupCall(payload.CallID); err != nil {
+			s.log.Warn("failed to hang up SIP leg", map[string]any{"call_id": payload.CallID, "err": err.Error()})
+		}
 	}
 
 	s.store.WriteAudit(sess.AccountID, sess.NodeID, "call_ended", "call="+payload.CallID+" reason="+reason, sess.RemoteIP)
@@ -659,9 +672,10 @@ func (s *Server) handleUsersQuery(sess *hub.Session, env *protocol.Envelope) {
 // notifyCallStatus sends a call.status to both participants.
 func (s *Server) notifyCallStatus(c *calls.Call) {
 	status := protocol.NewEnvelope(protocol.TypeCallStatus, protocol.CallStatusPayload{
-		CallID: c.ID,
-		Status: string(c.State),
-		Reason: c.EndReason,
+		CallID:      c.ID,
+		Status:      string(c.State),
+		Reason:      c.EndReason,
+		SIPBridgeID: c.SIPBridgeID,
 	})
 	data, _ := status.Encode()
 
@@ -722,13 +736,15 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 	if callID == "" {
 		callID = "call_" + uuid.NewString()
 	}
+	bridgeID := "bridge-" + strings.TrimPrefix(callID, "call_")
 
 	c := &calls.Call{
-		ID:        callID,
-		FromNode:  sess.NodeID,
-		ToNode:    "sip:" + ext, // virtual node ID for the SIP side
-		AccountID: sess.AccountID,
-		CallType:  "sip",
+		ID:          callID,
+		FromNode:    sess.NodeID,
+		ToNode:      "sip:" + ext, // virtual node ID for the SIP side
+		AccountID:   sess.AccountID,
+		CallType:    "sip",
+		SIPBridgeID: bridgeID,
 	}
 	if !s.calls.Create(c) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "duplicate call ID")
@@ -759,6 +775,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 	_, err = s.asterisk.OriginateToExtension(
 		ext,
 		s.cfg.Asterisk.InContext,
+		bridgeID,
 		callerID,
 		callID,
 		sess.NodeID,
@@ -776,12 +793,8 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		"call_id": callID, "ext": ext, "from": sess.NodeID,
 	})
 
-	// Tell the calling node the phone is ringing.
-	status := protocol.NewEnvelope(protocol.TypeCallStatus, protocol.CallStatusPayload{
-		CallID: callID, Status: string(calls.StateRinging),
-	})
-	sd, _ := status.Encode()
-	sess.Send(sd)
+	// Tell the calling node the phone is ringing (includes SIP bridge metadata).
+	s.notifyCallStatus(c)
 }
 
 // handleSIPIncomingCall is the AMI callback for an incoming SIP call.
@@ -825,11 +838,12 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 
 	callID := "call_" + uuid.NewString()
 	c := &calls.Call{
-		ID:        callID,
-		FromNode:  "sip:" + in.Extension,
-		ToNode:    primaryNode,
-		AccountID: ep.AccountID,
-		CallType:  "sip",
+		ID:          callID,
+		FromNode:    "sip:" + in.Extension,
+		ToNode:      primaryNode,
+		AccountID:   ep.AccountID,
+		CallType:    "sip",
+		SIPBridgeID: in.BridgeID,
 	}
 	if !s.calls.Create(c) {
 		return

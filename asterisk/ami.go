@@ -94,17 +94,31 @@ func (a *AMIClient) Connect() error {
 	a.writeMu.Lock()
 	a.conn = conn
 	a.reader = reader
-	a.writeMu.Unlock()
 
-	// Authenticate.
-	_, resp, err := a.sendAction(map[string]string{
-		"Action":   "Login",
-		"Username": a.user,
-		"Secret":   a.secret,
-	})
+	// Authenticate synchronously. ReadLoop is started only after Connect returns,
+	// so sendAction() cannot be used here (it waits for ReadLoop to dispatch).
+	actionID := uuid.NewString()
+	login := "Action: Login\r\n" +
+		"ActionID: " + actionID + "\r\n" +
+		"Username: " + a.user + "\r\n" +
+		"Secret: " + a.secret + "\r\n" +
+		"Events: on\r\n\r\n"
+
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, writeErr := fmt.Fprint(conn, login)
+	conn.SetWriteDeadline(time.Time{})
+	a.writeMu.Unlock()
+	if writeErr != nil {
+		conn.Close()
+		return fmt.Errorf("ami login write: %w", writeErr)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	resp, err := a.readBlock()
+	conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		conn.Close()
-		return fmt.Errorf("ami login: %w", err)
+		return fmt.Errorf("ami login read: %w", err)
 	}
 	if resp["Response"] != "Success" {
 		conn.Close()

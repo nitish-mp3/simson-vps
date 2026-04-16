@@ -90,6 +90,7 @@ type CallStatusPayload struct {
 	CallID           string `json:"call_id"`
 	Status           string `json:"status"` // "ringing","active","ended","failed"
 	Reason           string `json:"reason,omitempty"`
+	SIPBridgeID      string `json:"sip_bridge_id,omitempty"`
 	AnsweredByUserID string `json:"answered_by_user_id,omitempty"`
 }
 

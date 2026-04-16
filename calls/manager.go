@@ -22,6 +22,7 @@ type Call struct {
 	ToNode     string
 	AccountID  string
 	CallType   string
+	SIPBridgeID string
 	State      State
 	CreatedAt  time.Time
 	AnsweredAt time.Time
