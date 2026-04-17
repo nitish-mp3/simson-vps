@@ -78,9 +78,10 @@ func (m *Manager) End(callID, reason string) (*Call, bool) {
 	if c.State == StateEnded || c.State == StateFailed {
 		return c, false
 	}
-	if reason == "error" || reason == "timeout" {
+	switch reason {
+	case "error", "timeout", "phone_unavailable", "originate_failed":
 		c.State = StateFailed
-	} else {
+	default:
 		c.State = StateEnded
 	}
 	c.EndedAt = time.Now().UTC()

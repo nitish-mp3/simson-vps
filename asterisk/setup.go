@@ -31,6 +31,7 @@ type SetupConfig struct {
 // It mirrors store.SIPEndpoint but avoids an import cycle.
 type SIPEndpointDef struct {
 	ID       string
+	Extension string
 	Username string
 	Password string
 	Enabled  bool
@@ -201,15 +202,20 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 	sb.WriteString("[global]\ntype=global\nmax_initial_qualify_time=60\n\n")
 
 	// ── Endpoint template (shared settings for all Simson phones) ─────────────
+	sipContext := cfg.InContext
+	if sipContext == "" {
+		sipContext = "from-simson-sip"
+	}
 	sb.WriteString(
 		"[simson-ep-tpl](!)\ntype=endpoint\n" +
-			"context=from-simson-sip\n" +
+			"context=" + sipContext + "\n" +
 			"disallow=all\n" +
 			"allow=ulaw\nallow=alaw\nallow=g722\nallow=opus\n" +
 			"direct_media=no\n" +
 			"rtp_symmetric=yes\n" +
 			"force_rport=yes\n" +
 			"rewrite_contact=yes\n" +
+			"identify_by=auth_username,username\n" +
 			"ice_support=yes\n" +
 			"media_encryption=no\n" +
 			"dtmf_mode=rfc4733\n\n",
@@ -252,14 +258,31 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 	}
 
 	// ── Per-endpoint entries (registered SIP phones / devices) ────────────────
+	//
+	// Standard PJSIP pattern: the AoR name matches the SIP auth username so that
+	// REGISTER (To: sip:<username>@domain) maps to the correct AoR.  Endpoint
+	// and AoR may share the same section name — PJSIP stores them in separate
+	// sorcery containers keyed by type.
 	for _, ep := range endpoints {
 		if !ep.Enabled {
 			continue
 		}
-		id := sanitizeID(ep.ID)
-		fmt.Fprintf(&sb, "[%s](simson-ep-tpl)\nauth=%s-auth\naors=%s-aor\n\n", id, id, id)
-		fmt.Fprintf(&sb, "[%s-auth](simson-auth-tpl)\nusername=%s\npassword=%s\n\n", id, ep.Username, ep.Password)
-		fmt.Fprintf(&sb, "[%s-aor](simson-aor-tpl)\n\n", id)
+		endpointID := sanitizeID(ep.Extension)
+		if endpointID == "" {
+			endpointID = sanitizeID(ep.ID)
+		}
+		if endpointID == "" {
+			continue
+		}
+
+		aorName := sanitizeID(ep.Username)
+		if aorName == "" {
+			aorName = endpointID
+		}
+
+		fmt.Fprintf(&sb, "[%s](simson-ep-tpl)\nauth=%s-auth\naors=%s\n\n", endpointID, endpointID, aorName)
+		fmt.Fprintf(&sb, "[%s-auth](simson-auth-tpl)\nusername=%s\npassword=%s\n\n", endpointID, ep.Username, ep.Password)
+		fmt.Fprintf(&sb, "[%s](simson-aor-tpl)\n\n", aorName)
 	}
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(sb.String()), 0640)
@@ -362,12 +385,21 @@ func reloadModules(log *logging.Logger) error {
 		"dialplan reload",
 		"module reload app_confbridge.so",
 	}
+	anyFailed := false
 	for _, cmd := range cmds {
 		out, err := exec.Command("asterisk", "-rx", cmd).CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("asterisk -rx %q: %w (output: %s)", cmd, err, string(out))
+			// Non-fatal: CLI socket may be unavailable when the service runs
+			// sandboxed. The server will reload via AMI once connected.
+			log.Debug("asterisk cli reload skipped (will reload via AMI)",
+				map[string]any{"cmd": cmd, "err": err.Error()})
+			anyFailed = true
+			continue
 		}
 		log.Debug("asterisk reload", map[string]any{"cmd": cmd, "output": strings.TrimSpace(string(out))})
+	}
+	if anyFailed {
+		log.Info("asterisk configs written; CLI reload unavailable, will reload via AMI", nil)
 	}
 	return nil
 }

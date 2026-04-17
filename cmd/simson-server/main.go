@@ -74,10 +74,11 @@ func main() {
 			defs := make([]asterisk.SIPEndpointDef, len(eps))
 			for i, ep := range eps {
 				defs[i] = asterisk.SIPEndpointDef{
-					ID:       ep.ID,
-					Username: ep.Username,
-					Password: ep.Password,
-					Enabled:  ep.Enabled,
+					ID:        ep.ID,
+					Extension: ep.Extension,
+					Username:  ep.Username,
+					Password:  ep.Password,
+					Enabled:   ep.Enabled,
 				}
 			}
 			scfg := asterisk.SetupConfig{

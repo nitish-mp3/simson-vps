@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/google/uuid"
 	"github.com/nitish-mp3/simson-vps/logging"
 )
 
@@ -30,9 +31,9 @@ type Router struct {
 	log *logging.Logger
 
 	// Callbacks set by server.go after construction.
-	OnIncomingCall    func(in IncomingSIPCall)       // SIP phone dialled in
-	OnChannelHangup   func(channel string)           // SIP channel hung up
-	OnOriginateResult func(actionID string, ok bool) // async Originate outcome
+	OnIncomingCall    func(in IncomingSIPCall)              // SIP phone dialled in
+	OnChannelHangup   func(channel string)                  // SIP channel hung up
+	OnOriginateResult func(callID string, ok bool, reason string) // async Originate outcome
 
 	// call tracking
 	mu           sync.RWMutex
@@ -124,14 +125,21 @@ func (r *Router) CallIDForChannel(channel string) (string, bool) {
 // Returns the AMI ActionID that can be used to match the async OriginateResponse event.
 func (r *Router) OriginateToExtension(extension, context, bridgeExt, callerID, callID, fromNode string, timeoutSec int) (string, error) {
 	channel := fmt.Sprintf("PJSIP/%s", extension)
-	actionID, err := r.ami.Originate(channel, context, bridgeExt, callerID, callID, fromNode, timeoutSec*1000)
-	if err != nil {
-		return "", err
-	}
+	actionID := uuid.NewString()
 
+	// Register before sending Originate so very fast OriginateResponse events
+	// (for immediate failures) cannot race ahead of tracking.
 	r.originateMu.Lock()
 	r.actionIDToCallID[actionID] = callID
 	r.originateMu.Unlock()
+
+	_, err := r.ami.OriginateWithActionID(channel, context, bridgeExt, callerID, callID, fromNode, timeoutSec*1000, actionID)
+	if err != nil {
+		r.originateMu.Lock()
+		delete(r.actionIDToCallID, actionID)
+		r.originateMu.Unlock()
+		return "", err
+	}
 
 	return actionID, nil
 }
@@ -171,6 +179,28 @@ func (r *Router) ReloadSIP() error {
 func (r *Router) ReloadDialplan() error {
 	_, err := r.ami.RunCommand("dialplan reload")
 	return err
+}
+
+// RunCommand sends an Asterisk CLI command via AMI and returns the output.
+func (r *Router) RunCommand(cmd string) (string, error) {
+	return r.ami.RunCommand(cmd)
+}
+
+// EndpointHasContacts returns true if the given PJSIP AoR has at least one
+// registered contact. Use this to pre-flight outbound calls and give the
+// caller a clear error instead of a silent immediate failure.
+func (r *Router) EndpointHasContacts(ext string) bool {
+	out, err := r.ami.RunCommand("pjsip show contacts " + ext)
+	if err != nil {
+		// Cannot verify — assume contacts exist so transient AMI issues
+		// don't block calls entirely.
+		r.log.Warn("could not check endpoint contacts via AMI",
+			map[string]any{"ext": ext, "err": err.Error()})
+		return true
+	}
+	lower := strings.ToLower(out)
+	return !strings.Contains(lower, "no objects found") &&
+		!strings.Contains(lower, "objects found: 0")
 }
 
 // ---- AMI event dispatch -----------------------------------------------------
@@ -280,15 +310,16 @@ func (r *Router) handleOriginateResponse(ev Event) {
 		r.TrackCall(callID, channel)
 	}
 
+	reason := ev.Fields["Reason"]
 	r.log.Info("originate result", map[string]any{
 		"call_id": callID,
 		"ok":      ok,
-		"reason":  ev.Fields["Reason"],
+		"reason":  reason,
 		"channel": channel,
 	})
 
 	if r.OnOriginateResult != nil {
-		r.OnOriginateResult(callID, ok)
+		r.OnOriginateResult(callID, ok, reason)
 	}
 }
 

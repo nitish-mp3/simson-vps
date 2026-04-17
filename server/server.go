@@ -201,7 +201,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// Send auth result.
 	authResult := protocol.NewEnvelope(protocol.TypeAuthResult, protocol.AuthResultPayload{
 		OK:              true,
-		ServerVersion:   "1.3.0",
+		ServerVersion:   "1.5.0",
 		ProtocolVersion: protocol.ProtocolVersion,
 		HeartbeatSec:    s.cfg.HeartbeatSec,
 	})
@@ -764,17 +764,39 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		}
 	}
 	if callerID == "" {
+		label := sess.NodeID
 		if node, _ := s.store.GetNode(sess.NodeID); node != nil && node.Label != "" {
-			callerID = node.Label
-		} else {
-			callerID = sess.NodeID
+			label = node.Label
 		}
+		// SIP CallerID format: "Display Name" <number>
+		callerID = fmt.Sprintf("\"%s\" <0>", label)
 	}
 
-	// Originate the call via AMI.
+	// Pre-flight: verify the SIP phone has at least one registered contact.
+	// This prevents a silent immediate failure when the phone is offline or
+	// misconfigured, and gives the caller a meaningful error message.
+	if !s.asterisk.EndpointHasContacts(ext) {
+		if c2, ended := s.calls.End(callID, "phone_unavailable"); ended {
+			s.notifyCallStatus(c2)
+		}
+		s.log.Warn("SIP phone has no registered contacts — rejecting call",
+			map[string]any{"ext": ext, "call_id": callID})
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeSIPUnavailable,
+			fmt.Sprintf("SIP phone %q is not registered. Check the phone's SIP account settings (server: %s, username: %s).",
+				ext, s.cfg.Asterisk.Host, ext))
+		return
+	}
+
+	// Notify the caller of ringing BEFORE the async Originate fires.
+	// This guarantees the addon always sees "ringing" before any AMI result
+	// event, eliminating the race between the ReadLoop goroutine and this handler.
+	s.notifyCallStatus(c)
+
+	// Originate the call via AMI.  NodeContext contains the bridge-joining
+	// dialplan (extension _bridge-.) that the answered SIP leg joins.
 	_, err = s.asterisk.OriginateToExtension(
 		ext,
-		s.cfg.Asterisk.InContext,
+		s.cfg.Asterisk.NodeContext,
 		bridgeID,
 		callerID,
 		callID,
@@ -782,7 +804,9 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		s.cfg.CallTimeoutSec,
 	)
 	if err != nil {
-		s.calls.End(callID, "originate_failed")
+		if c2, ended := s.calls.End(callID, "originate_failed"); ended {
+			s.notifyCallStatus(c2)
+		}
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "AMI originate failed: "+err.Error())
 		return
 	}
@@ -792,34 +816,67 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 	s.log.Info("SIP call originated", map[string]any{
 		"call_id": callID, "ext": ext, "from": sess.NodeID,
 	})
-
-	// Tell the calling node the phone is ringing (includes SIP bridge metadata).
-	s.notifyCallStatus(c)
 }
 
 // handleSIPIncomingCall is the AMI callback for an incoming SIP call.
 // It routes the call to the correct Simson node based on the dialled extension.
-// When RouteTo is empty, it broadcasts (rings) ALL online nodes in the account.
+//
+// Routing priority:
+//  1. Dialled extension matches a SIP endpoint with RouteTo set → ring that node.
+//  2. Dialled extension matches a SIP endpoint with RouteTo empty → ring all online nodes.
+//  3. No matching endpoint → identify the caller’s account from the channel and ring
+//     all online nodes in that account (allows a SIP phone to reach any node).
 func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
+	// Step 1: try to find a SIP endpoint matching the dialled extension.
 	ep, err := s.store.GetSIPEndpointByExtension(in.Extension)
-	if err != nil || ep == nil {
-		s.log.Warn("no SIP endpoint for extension — hanging up",
-			map[string]any{"extension": in.Extension, "channel": in.Channel})
+	if err != nil {
+		s.log.Error("db error looking up SIP endpoint", map[string]any{"err": err.Error()})
 		if s.asterisk != nil {
 			_ = s.asterisk.HangupChannel(in.Channel)
 		}
 		return
 	}
 
-	// Collect target nodes: either a specific RouteTo or all online nodes.
+	var accountID string
+	var routeTo string
+
+	if ep != nil {
+		accountID = ep.AccountID
+		routeTo = ep.RouteTo
+	} else {
+		// Step 2: no matching endpoint — identify the caller’s account from
+		// the Asterisk channel name (e.g. "PJSIP/1025-00000001" → ext "1025").
+		callerExt := extractEndpointFromChannel(in.Channel)
+		if callerExt == "" {
+			s.log.Warn("cannot identify caller for unknown extension",
+				map[string]any{"extension": in.Extension, "channel": in.Channel})
+			if s.asterisk != nil {
+				_ = s.asterisk.HangupChannel(in.Channel)
+			}
+			return
+		}
+		callerEP, cerr := s.store.GetSIPEndpointByExtension(callerExt)
+		if cerr != nil || callerEP == nil {
+			s.log.Warn("caller endpoint not found — hanging up",
+				map[string]any{"caller_ext": callerExt, "extension": in.Extension})
+			if s.asterisk != nil {
+				_ = s.asterisk.HangupChannel(in.Channel)
+			}
+			return
+		}
+		accountID = callerEP.AccountID
+		// Ring all online nodes in the caller’s account.
+		routeTo = ""
+	}
+
+	// Collect target nodes.
 	var targetNodeIDs []string
-	if ep.RouteTo != "" {
-		if s.hub.IsOnline(ep.RouteTo) {
-			targetNodeIDs = append(targetNodeIDs, ep.RouteTo)
+	if routeTo != "" {
+		if s.hub.IsOnline(routeTo) {
+			targetNodeIDs = append(targetNodeIDs, routeTo)
 		}
 	} else {
-		// Broadcast: ring ALL online nodes in this account.
-		for _, sess := range s.hub.ListByAccount(ep.AccountID) {
+		for _, sess := range s.hub.ListByAccount(accountID) {
 			targetNodeIDs = append(targetNodeIDs, sess.NodeID)
 		}
 	}
@@ -833,7 +890,6 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		return
 	}
 
-	// Use the first node as primary call target (for call state tracking).
 	primaryNode := targetNodeIDs[0]
 
 	callID := "call_" + uuid.NewString()
@@ -841,7 +897,7 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		ID:          callID,
 		FromNode:    "sip:" + in.Extension,
 		ToNode:      primaryNode,
-		AccountID:   ep.AccountID,
+		AccountID:   accountID,
 		CallType:    "sip",
 		SIPBridgeID: in.BridgeID,
 	}
@@ -849,8 +905,13 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		return
 	}
 
-	// Track channel before doing anything else.
 	s.asterisk.TrackCall(callID, in.Channel)
+
+	// Build a friendly caller display: prefer caller name, fall back to extension.
+	callerDisplay := in.CallerID
+	if callerDisplay == "" {
+		callerDisplay = in.Extension
+	}
 
 	sipMeta, _ := json.Marshal(map[string]string{
 		"sip_channel":   in.Channel,
@@ -863,17 +924,15 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	invite := protocol.NewEnvelope(protocol.TypeCallInvite, protocol.CallInvitePayload{
 		CallID:     callID,
 		FromNodeID: "sip:" + in.Extension,
-		FromLabel:  in.CallerID,
+		FromLabel:  callerDisplay,
 		CallType:   "sip",
 		Metadata:   json.RawMessage(sipMeta),
 	})
 	inviteData, _ := invite.Encode()
 
-	// Send invite to ALL target nodes (call-all for SIP).
 	sentCount := 0
 	for _, nodeID := range targetNodeIDs {
-		targetSess := s.hub.Get(nodeID)
-		if targetSess != nil {
+		if targetSess := s.hub.Get(nodeID); targetSess != nil {
 			targetSess.Send(inviteData)
 			sentCount++
 		}
@@ -885,7 +944,7 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		return
 	}
 
-	s.store.WriteAudit(ep.AccountID, primaryNode, "sip_incoming_call",
+	s.store.WriteAudit(accountID, primaryNode, "sip_incoming_call",
 		fmt.Sprintf("call=%s ext=%s ch=%s targets=%d", callID, in.Extension, in.Channel, sentCount), "")
 	s.log.Info("SIP invite dispatched", map[string]any{
 		"call_id": callID, "extension": in.Extension, "targets": sentCount,
@@ -912,7 +971,7 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 
 // handleSIPOriginateResult is the AMI callback when an async Originate
 // (outbound call to an IP phone) either connects or fails.
-func (s *Server) handleSIPOriginateResult(callID string, ok bool) {
+func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string) {
 	if ok {
 		// Phone answered — transition call to active.
 		c, accepted := s.calls.Accept(callID)
@@ -921,14 +980,23 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool) {
 			s.log.Info("SIP outbound call answered", map[string]any{"call_id": callID})
 		}
 	} else {
-		// Phone rejected / no answer.
-		c, ended := s.calls.End(callID, "no_answer")
+		// Map Asterisk reason code to a descriptive end reason.
+		endReason := "no_answer"
+		switch reason {
+		case "4", "17":
+			endReason = "busy"
+		case "0", "":
+			// reason=0 typically means endpoint had no contacts or no route.
+			endReason = "phone_unavailable"
+		}
+		c, ended := s.calls.End(callID, endReason)
 		if ended {
 			s.notifyCallStatus(c)
 			if s.asterisk != nil {
 				s.asterisk.UntrackCall(callID)
 			}
-			s.log.Info("SIP outbound call not answered", map[string]any{"call_id": callID})
+			s.log.Info("SIP outbound call not answered",
+				map[string]any{"call_id": callID, "reason": endReason})
 		}
 	}
 }
@@ -954,15 +1022,38 @@ func (s *Server) asteriskConnectLoop() {
 			"host": s.cfg.Asterisk.Host,
 			"port": s.cfg.Asterisk.Port,
 		})
-		// Run() connects and blocks until the connection drops.
-		if err := s.asterisk.Run(); err != nil {
+		if err := s.asterisk.Connect(); err != nil {
 			s.log.Warn("Asterisk AMI connect failed — retrying in 15s",
 				map[string]any{"err": err.Error()})
-		} else {
-			s.log.Warn("Asterisk AMI connection dropped — reconnecting in 15s", nil)
+			time.Sleep(15 * time.Second)
+			continue
 		}
-		s.asterisk.Disconnect() // ensure clean state before reconnect
+
+		s.asterisk.Start() // non-blocking ReadLoop
+
+		// Reload modules via AMI now that we have a live connection.
+		// This covers the case where auto-configure wrote configs but the
+		// CLI socket was unavailable for a reload.
+		s.reloadAsteriskViaAMI()
+		// Block until disconnected by sleeping in a check loop.
+		for s.asterisk.Connected() {
+			time.Sleep(5 * time.Second)
+		}
+		s.log.Warn("Asterisk AMI connection dropped — reconnecting in 15s", nil)
+		s.asterisk.Disconnect()
 		time.Sleep(15 * time.Second)
+	}
+}
+
+// reloadAsteriskViaAMI sends reload commands through the AMI connection.
+func (s *Server) reloadAsteriskViaAMI() {
+	cmds := []string{"pjsip reload", "dialplan reload", "module reload app_confbridge.so"}
+	for _, cmd := range cmds {
+		if _, err := s.asterisk.RunCommand(cmd); err != nil {
+			s.log.Warn("AMI reload command failed", map[string]any{"cmd": cmd, "err": err.Error()})
+		} else {
+			s.log.Debug("AMI reload OK", map[string]any{"cmd": cmd})
+		}
 	}
 }
 
@@ -992,6 +1083,20 @@ func extractIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// extractEndpointFromChannel extracts the PJSIP endpoint name from an Asterisk
+// channel string like "PJSIP/1025-00000001" → "1025".
+func extractEndpointFromChannel(channel string) string {
+	ch := strings.TrimSpace(channel)
+	if !strings.HasPrefix(ch, "PJSIP/") {
+		return ""
+	}
+	ch = ch[len("PJSIP/"):]
+	if idx := strings.Index(ch, "-"); idx > 0 {
+		ch = ch[:idx]
+	}
+	return ch
 }
 
 // --- Background Tasks ---

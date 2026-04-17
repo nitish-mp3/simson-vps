@@ -171,4 +171,5 @@ const (
 	ErrCodeCallTimeout    = 4008
 	ErrCodeLimitExceeded  = 4009
 	ErrCodeVersionMismatch = 4010
+	ErrCodeSIPUnavailable  = 4051 // SIP phone not registered or unreachable
 )

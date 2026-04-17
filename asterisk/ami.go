@@ -213,8 +213,16 @@ func (a *AMIClient) ReadLoop() {
 // Originate makes an outbound call to a SIP extension.
 // Returns the ActionID so the caller can correlate the async OriginateResponse event.
 func (a *AMIClient) Originate(channel, context, exten, callerID, callID, fromNode string, timeoutMs int) (string, error) {
+	return a.OriginateWithActionID(channel, context, exten, callerID, callID, fromNode, timeoutMs, "")
+}
+
+// OriginateWithActionID is like Originate but allows a caller-provided ActionID.
+// This is useful when the caller needs to register async tracking before sending
+// the AMI action to avoid missing very fast OriginateResponse events.
+func (a *AMIClient) OriginateWithActionID(channel, context, exten, callerID, callID, fromNode string, timeoutMs int, actionID string) (string, error) {
 	actionID, resp, err := a.sendAction(map[string]string{
 		"Action":   "Originate",
+		"ActionID": actionID,
 		"Channel":  channel,
 		"Context":  context,
 		"Exten":    exten,
@@ -365,9 +373,16 @@ func (a *AMIClient) readBlock() (map[string]string, error) {
 		}
 		key := strings.TrimSpace(line[:idx])
 		val := strings.TrimSpace(line[idx+1:])
-		// Only store the first occurrence of a key (some events repeat keys
-		// like "Output" across multiple lines — we accept this limitation).
-		if _, exists := block[key]; !exists {
+		// AMI "Command" responses emit one "Output" header per CLI output line.
+		// Concatenate them so RunCommand() returns the full output.
+		// For every other key, keep only the first occurrence.
+		if key == "Output" {
+			if prev, ok := block["Output"]; ok {
+				block["Output"] = prev + "\n" + val
+			} else {
+				block["Output"] = val
+			}
+		} else if _, exists := block[key]; !exists {
 			block[key] = val
 		}
 	}
