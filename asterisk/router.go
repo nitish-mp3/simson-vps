@@ -189,18 +189,23 @@ func (r *Router) RunCommand(cmd string) (string, error) {
 // EndpointHasContacts returns true if the given PJSIP AoR has at least one
 // registered contact. Use this to pre-flight outbound calls and give the
 // caller a clear error instead of a silent immediate failure.
+//
+// NOTE: "pjsip show contacts <ext>" does NOT filter by AoR — it matches the
+// literal string anywhere in the output, so it returns contacts belonging to
+// *other* endpoints. Use "pjsip show aor <ext>" instead, which scopes the
+// query to that specific AoR object. A registered contact appears as
+// "<ext>/sip:..." in that output.
 func (r *Router) EndpointHasContacts(ext string) bool {
-	out, err := r.ami.RunCommand("pjsip show contacts " + ext)
+	out, err := r.ami.RunCommand("pjsip show aor " + ext)
 	if err != nil {
 		// Cannot verify — assume contacts exist so transient AMI issues
 		// don't block calls entirely.
-		r.log.Warn("could not check endpoint contacts via AMI",
+		r.log.Warn("could not check endpoint aor via AMI",
 			map[string]any{"ext": ext, "err": err.Error()})
 		return true
 	}
-	lower := strings.ToLower(out)
-	return !strings.Contains(lower, "no objects found") &&
-		!strings.Contains(lower, "objects found: 0")
+	// A registered contact always appears as "<aor>/sip:..." or "<aor>/sips:..."
+	return strings.Contains(out, ext+"/sip:") || strings.Contains(out, ext+"/sips:")
 }
 
 // ---- AMI event dispatch -----------------------------------------------------
