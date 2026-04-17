@@ -783,7 +783,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 			map[string]any{"ext": ext, "call_id": callID})
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeSIPUnavailable,
 			fmt.Sprintf("SIP phone %q is not registered. Check the phone's SIP account settings (server: %s, username: %s).",
-				ext, s.cfg.Asterisk.Host, ext))
+				ext, s.cfg.Asterisk.SIPDomain, ext))
 		return
 	}
 
