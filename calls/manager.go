@@ -17,17 +17,18 @@ const (
 
 // Call tracks a single in-flight call.
 type Call struct {
-	ID         string
-	FromNode   string
-	ToNode     string
-	AccountID  string
-	CallType   string
+	ID          string
+	FromNode    string
+	ToNode      string
+	InviteNodes []string
+	AccountID   string
+	CallType    string
 	SIPBridgeID string
-	State      State
-	CreatedAt  time.Time
-	AnsweredAt time.Time
-	EndedAt    time.Time
-	EndReason  string
+	State       State
+	CreatedAt   time.Time
+	AnsweredAt  time.Time
+	EndedAt     time.Time
+	EndReason   string
 }
 
 // Manager tracks active calls in memory.
@@ -54,17 +55,77 @@ func (m *Manager) Create(c *Call) bool {
 	return true
 }
 
+// CanNodeAnswer reports whether nodeID is allowed to accept this call.
+func (c *Call) CanNodeAnswer(nodeID string) bool {
+	if c == nil || nodeID == "" {
+		return false
+	}
+	if c.ToNode == nodeID {
+		return true
+	}
+	for _, invited := range c.InviteNodes {
+		if invited == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
 // Accept transitions a call to active.
-func (m *Manager) Accept(callID string) (*Call, bool) {
+func (m *Manager) Accept(callID, answeredByNode string) (*Call, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c, ok := m.calls[callID]
 	if !ok || c.State != StateRinging {
 		return nil, false
 	}
+	if answeredByNode != "" {
+		c.ToNode = answeredByNode
+	}
 	c.State = StateActive
 	c.AnsweredAt = time.Now().UTC()
 	return c, true
+}
+
+// DeclineByNode records that one invited node declined a ringing call.
+// It returns continueRinging=true when other invited nodes can still answer.
+func (m *Manager) DeclineByNode(callID, nodeID, reason string) (*Call, bool, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.calls[callID]
+	if !ok || c.State != StateRinging || !c.CanNodeAnswer(nodeID) {
+		return nil, false, false
+	}
+
+	remaining := c.InviteNodes[:0]
+	for _, invited := range c.InviteNodes {
+		if invited != nodeID {
+			remaining = append(remaining, invited)
+		}
+	}
+	c.InviteNodes = remaining
+
+	if c.ToNode == nodeID {
+		if len(c.InviteNodes) > 0 {
+			c.ToNode = c.InviteNodes[0]
+		} else {
+			c.ToNode = ""
+		}
+	}
+
+	if len(c.InviteNodes) > 0 {
+		return c, true, true
+	}
+
+	switch reason {
+	case "error", "timeout", "phone_unavailable", "originate_failed":
+		c.State = StateFailed
+	default:
+		c.State = StateEnded
+	}
+	c.EndedAt = time.Now().UTC()
+	c.EndReason = reason
+	return c, false, true
 }
 
 // End terminates a call.
@@ -96,13 +157,29 @@ func (m *Manager) Get(callID string) *Call {
 	return m.calls[callID]
 }
 
+// Invitees returns a snapshot of all invited nodes for a call.
+func (m *Manager) Invitees(callID string) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	c := m.calls[callID]
+	if c == nil {
+		return nil
+	}
+	out := make([]string, 0, len(c.InviteNodes))
+	out = append(out, c.InviteNodes...)
+	return out
+}
+
 // ActiveByNode returns all active/ringing calls involving a node.
 func (m *Manager) ActiveByNode(nodeID string) []*Call {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var out []*Call
 	for _, c := range m.calls {
-		if (c.FromNode == nodeID || c.ToNode == nodeID) && (c.State == StateRinging || c.State == StateActive) {
+		if c.State != StateRinging && c.State != StateActive {
+			continue
+		}
+		if c.FromNode == nodeID || c.ToNode == nodeID || (c.State == StateRinging && c.CanNodeAnswer(nodeID)) {
 			out = append(out, c)
 		}
 	}

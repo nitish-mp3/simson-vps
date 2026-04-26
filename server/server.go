@@ -383,7 +383,7 @@ func (s *Server) handleCallRequest(sess *hub.Session, env *protocol.Envelope) {
 
 	// Send invite to target.
 	invite := protocol.NewEnvelope(protocol.TypeCallInvite, protocol.CallInvitePayload{
-		CallID:   callID,
+		CallID:     callID,
 		FromNodeID: sess.NodeID,
 		FromLabel:  fromLabel,
 		CallType:   req.CallType,
@@ -421,18 +421,19 @@ func (s *Server) handleCallAccept(sess *hub.Session, env *protocol.Envelope) {
 		return
 	}
 
-	// Verify the accepter is the target BEFORE mutating state.
+	// Verify the accepter is an invited target BEFORE mutating state.
 	existing := s.calls.Get(payload.CallID)
 	if existing == nil {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found")
 		return
 	}
-	if sess.NodeID != existing.ToNode {
+	if !existing.CanNodeAnswer(sess.NodeID) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "not the call target")
 		return
 	}
 
-	c, ok := s.calls.Accept(payload.CallID)
+	invitedNodes := s.calls.Invitees(payload.CallID)
+	c, ok := s.calls.Accept(payload.CallID, sess.NodeID)
 	if !ok {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found or not ringing")
 		return
@@ -466,6 +467,15 @@ func (s *Server) handleCallAccept(sess *hub.Session, env *protocol.Envelope) {
 	})
 	data, _ := calleeStatus.Encode()
 	sess.Send(data)
+
+	// For SIP fan-out calls, clear the ringing popup on every node that did
+	// not answer. The accepting node receives "active" above.
+	for _, nodeID := range invitedNodes {
+		if nodeID == "" || nodeID == sess.NodeID {
+			continue
+		}
+		s.notifyCallStatusToNode(nodeID, c, string(calls.StateEnded), "answered_elsewhere", answeredBy)
+	}
 }
 
 // --- Call Reject ---
@@ -477,14 +487,31 @@ func (s *Server) handleCallReject(sess *hub.Session, env *protocol.Envelope) {
 		return
 	}
 
-	// Verify the rejecter is the target BEFORE mutating state.
+	// Verify the rejecter is an invited target BEFORE mutating state.
 	existing := s.calls.Get(payload.CallID)
 	if existing == nil {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found")
 		return
 	}
-	if sess.NodeID != existing.ToNode {
+	if !existing.CanNodeAnswer(sess.NodeID) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "not the call target")
+		return
+	}
+
+	// In a SIP fan-out call, one support node declining should not cancel the
+	// caller for every other available support node.
+	if len(existing.InviteNodes) > 1 {
+		c, keepRinging, ok := s.calls.DeclineByNode(payload.CallID, sess.NodeID, "rejected")
+		if !ok {
+			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found or already ended")
+			return
+		}
+		s.store.WriteAudit(sess.AccountID, sess.NodeID, "call_rejected", "call="+payload.CallID+" reason="+payload.Reason, sess.RemoteIP)
+		s.log.Info("call invite rejected", map[string]any{"call_id": payload.CallID, "node_id": sess.NodeID, "keep_ringing": keepRinging})
+		s.notifyCallStatusToNode(sess.NodeID, c, string(calls.StateEnded), "rejected", "")
+		if !keepRinging {
+			s.notifyCallStatus(c)
+		}
 		return
 	}
 
@@ -520,7 +547,7 @@ func (s *Server) handleCallEnd(sess *hub.Session, env *protocol.Envelope) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found")
 		return
 	}
-	if sess.NodeID != existing.FromNode && sess.NodeID != existing.ToNode {
+	if sess.NodeID != existing.FromNode && sess.NodeID != existing.ToNode && !existing.CanNodeAnswer(sess.NodeID) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "not a participant")
 		return
 	}
@@ -685,6 +712,33 @@ func (s *Server) notifyCallStatus(c *calls.Call) {
 	if toSess := s.hub.Get(c.ToNode); toSess != nil {
 		toSess.Send(data)
 	}
+	for _, nodeID := range c.InviteNodes {
+		if nodeID == "" || nodeID == c.FromNode || nodeID == c.ToNode {
+			continue
+		}
+		if nodeSess := s.hub.Get(nodeID); nodeSess != nil {
+			nodeSess.Send(data)
+		}
+	}
+}
+
+func (s *Server) notifyCallStatusToNode(nodeID string, c *calls.Call, status, reason, answeredBy string) {
+	if nodeID == "" {
+		return
+	}
+	nodeSess := s.hub.Get(nodeID)
+	if nodeSess == nil {
+		return
+	}
+	env := protocol.NewEnvelope(protocol.TypeCallStatus, protocol.CallStatusPayload{
+		CallID:           c.ID,
+		Status:           status,
+		Reason:           reason,
+		SIPBridgeID:      c.SIPBridgeID,
+		AnsweredByUserID: answeredBy,
+	})
+	data, _ := env.Encode()
+	nodeSess.Send(data)
 }
 
 // ---- Central VPS Asterisk (SIP) handlers ------------------------------------
@@ -769,7 +823,9 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 			label = node.Label
 		}
 		// SIP CallerID format: "Display Name" <number>
-		callerID = fmt.Sprintf("\"%s\" <0>", label)
+		// Use 100 as a callback extension the phone can redial.
+		// Any number works because from-simson-sip catches _X.
+		callerID = fmt.Sprintf("\"%s\" <100>", label)
 	}
 
 	// Pre-flight: verify the SIP phone has at least one registered contact.
@@ -827,6 +883,18 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 //  3. No matching endpoint → identify the caller’s account from the channel and ring
 //     all online nodes in that account (allows a SIP phone to reach any node).
 func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
+	// Reject calls that look like external PSTN numbers (> 15 digits).
+	// SIP phones sometimes dial mobile/landline numbers that should never be
+	// dispatched to Simson nodes — just hang up immediately.
+	if len(in.Extension) > 15 {
+		s.log.Warn("rejecting call to external-looking extension",
+			map[string]any{"extension": in.Extension, "channel": in.Channel})
+		if s.asterisk != nil {
+			_ = s.asterisk.HangupChannel(in.Channel)
+		}
+		return
+	}
+
 	// Step 1: try to find a SIP endpoint matching the dialled extension.
 	ep, err := s.store.GetSIPEndpointByExtension(in.Extension)
 	if err != nil {
@@ -869,15 +937,57 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		routeTo = ""
 	}
 
-	// Collect target nodes.
+	// Collect target nodes, prioritizing those without active calls.
 	var targetNodeIDs []string
+	appendUnique := func(nodeID string) {
+		if nodeID == "" {
+			return
+		}
+		for _, existing := range targetNodeIDs {
+			if existing == nodeID {
+				return
+			}
+		}
+		targetNodeIDs = append(targetNodeIDs, nodeID)
+	}
+
+	var available, busy []string
+	for _, sess := range s.hub.ListByAccount(accountID) {
+		if len(s.calls.ActiveByNode(sess.NodeID)) == 0 {
+			available = append(available, sess.NodeID)
+		} else {
+			busy = append(busy, sess.NodeID)
+		}
+	}
+
 	if routeTo != "" {
-		if s.hub.IsOnline(routeTo) {
-			targetNodeIDs = append(targetNodeIDs, routeTo)
+		if s.hub.IsOnline(routeTo) && len(s.calls.ActiveByNode(routeTo)) == 0 {
+			appendUnique(routeTo)
+		} else {
+			// Configured route_to node is offline or busy — fall back to available
+			// support nodes first, then let busy nodes ring only as a last resort.
+			reason := "offline"
+			if s.hub.IsOnline(routeTo) {
+				reason = "busy"
+			}
+			s.log.Warn("route_to node unavailable, falling back to support nodes",
+				map[string]any{"route_to": routeTo, "reason": reason, "extension": in.Extension})
+			for _, nodeID := range available {
+				appendUnique(nodeID)
+			}
+			if reason == "busy" {
+				appendUnique(routeTo)
+			}
+		}
+		for _, nodeID := range busy {
+			appendUnique(nodeID)
 		}
 	} else {
-		for _, sess := range s.hub.ListByAccount(accountID) {
-			targetNodeIDs = append(targetNodeIDs, sess.NodeID)
+		for _, nodeID := range available {
+			appendUnique(nodeID)
+		}
+		for _, nodeID := range busy {
+			appendUnique(nodeID)
 		}
 	}
 
@@ -897,6 +1007,7 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		ID:          callID,
 		FromNode:    "sip:" + in.Extension,
 		ToNode:      primaryNode,
+		InviteNodes: append([]string(nil), targetNodeIDs...),
 		AccountID:   accountID,
 		CallType:    "sip",
 		SIPBridgeID: in.BridgeID,
@@ -974,7 +1085,7 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string) {
 	if ok {
 		// Phone answered — transition call to active.
-		c, accepted := s.calls.Accept(callID)
+		c, accepted := s.calls.Accept(callID, "")
 		if accepted {
 			s.notifyCallStatus(c)
 			s.log.Info("SIP outbound call answered", map[string]any{"call_id": callID})
