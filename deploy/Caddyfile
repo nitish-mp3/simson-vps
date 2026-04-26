@@ -1,30 +1,36 @@
 {
-	simson-vps.niti.life {
-		# Simson control-plane WebSocket
-		handle /ws {
-			reverse_proxy localhost:8080
-		}
+	servers {
+		protocols h1 h2
+	}
+}
 
-		# Admin API
-		handle /admin/* {
-			reverse_proxy localhost:8080
-		}
+simson-vps.niti.life {
+	# Simson control-plane WebSocket
+	handle /ws {
+		reverse_proxy localhost:8080
+	}
 
-		# Metrics
-		handle /metrics {
-			reverse_proxy localhost:8080
-		}
+	# Admin API
+	handle /admin/* {
+		reverse_proxy localhost:8080
+	}
 
-		# Asterisk SIP-over-WebSocket for browser SIP.js clients.
-		# Caddy provides valid TLS; Asterisk listens plain WS on port 8088.
-		# Browsers connect to wss://simson-vps.niti.life/sip/ws
-		handle /sip/ws {
-			reverse_proxy localhost:8088
-		}
+	# Metrics
+	handle /metrics {
+		reverse_proxy localhost:8080
+	}
 
-		# Default — reject
-		handle {
-			respond "Not found" 404
-		}
+	# Asterisk SIP-over-WebSocket for browser SIP.js clients.
+	# Caddy provides valid TLS; Asterisk listens plain WS on port 8088.
+	# Browsers connect to wss://simson-vps.niti.life/sip/ws
+	# Strip the /sip prefix so Asterisk sees /ws (its registered endpoint).
+	handle /sip/ws {
+		uri strip_prefix /sip
+		reverse_proxy localhost:8088
+	}
+
+	# Default — reject
+	handle {
+		respond "Not found" 404
 	}
 }
