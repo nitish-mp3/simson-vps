@@ -267,7 +267,9 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 		)
 		fmt.Fprintf(&sb, "[%s-auth](simson-auth-tpl)\nusername=%s\npassword=%s\n\n",
 			cfg.WebRTCUser, cfg.WebRTCUser, cfg.WebRTCPass)
-		fmt.Fprintf(&sb, "[%s](simson-aor-tpl)\nmax_contacts=50\nremove_existing=no\nqualify_frequency=30\n\n", cfg.WebRTCUser)
+		// AOR must NOT inherit from template — explicit settings override.
+		// Use type=aor directly without (template) so template values don't override.
+		fmt.Fprintf(&sb, "[%s]\ntype=aor\nmax_contacts=50\nremove_existing=no\nqualify_frequency=30\n\n", cfg.WebRTCUser)
 	}
 
 	// ── Per-endpoint entries (registered SIP phones / devices) ────────────────
