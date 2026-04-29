@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,6 +33,11 @@ type Server struct {
 	log      *logging.Logger
 	upgrader websocket.Upgrader
 	asterisk *asterisk.Router // nil when Asterisk integration is disabled
+
+	// recentSIPInvites tracks short-lived SIP source keys to suppress rapid
+	// duplicate AMI UserEvent bursts from misdialing phones.
+	recentSIPInvitesMu sync.Mutex
+	recentSIPInvites   map[string]time.Time
 }
 
 // New constructs a Server.
@@ -43,6 +49,7 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 		calls:   calls.NewManager(),
 		limiter: ratelimit.New(cfg.RateLimitPerSec, cfg.RateLimitPerSec*2),
 		log:     log,
+		recentSIPInvites: make(map[string]time.Time),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -912,6 +919,15 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		accountID = ep.AccountID
 		routeTo = ep.RouteTo
 	} else {
+		if !isLikelyInternalExtension(in.Extension) {
+			s.log.Warn("rejecting unknown non-internal extension",
+				map[string]any{"extension": in.Extension, "channel": in.Channel, "caller_id": in.CallerID})
+			if s.asterisk != nil {
+				_ = s.asterisk.HangupChannel(in.Channel)
+			}
+			return
+		}
+
 		// Step 2: no matching endpoint — identify the caller’s account from
 		// the Asterisk channel name (e.g. "PJSIP/1025-00000001" → ext "1025").
 		callerExt := extractEndpointFromChannel(in.Channel)
@@ -935,6 +951,15 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		accountID = callerEP.AccountID
 		// Ring all online nodes in the caller’s account.
 		routeTo = ""
+	}
+
+	if s.shouldSuppressIncomingSIPInvite(accountID, in) {
+		s.log.Warn("suppressing duplicate SIP incoming invite",
+			map[string]any{"extension": in.Extension, "caller_id": in.CallerID, "channel": in.Channel, "bridge": in.BridgeID})
+		if s.asterisk != nil {
+			_ = s.asterisk.HangupChannel(in.Channel)
+		}
+		return
 	}
 
 	// Collect target nodes, prioritizing those without active calls.
@@ -1062,6 +1087,49 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	})
 }
 
+func (s *Server) shouldSuppressIncomingSIPInvite(accountID string, in asterisk.IncomingSIPCall) bool {
+	now := time.Now().UTC()
+	callerExt := extractEndpointFromChannel(in.Channel)
+	key := strings.ToLower(strings.TrimSpace(accountID)) + "|" +
+		strings.ToLower(strings.TrimSpace(in.Extension)) + "|" +
+		strings.ToLower(strings.TrimSpace(callerExt)) + "|" +
+		strings.ToLower(strings.TrimSpace(in.CallerID))
+
+	s.recentSIPInvitesMu.Lock()
+	for k, ts := range s.recentSIPInvites {
+		if now.Sub(ts) > 30*time.Second {
+			delete(s.recentSIPInvites, k)
+		}
+	}
+	if ts, ok := s.recentSIPInvites[key]; ok && now.Sub(ts) < 4*time.Second {
+		s.recentSIPInvites[key] = now
+		s.recentSIPInvitesMu.Unlock()
+		return true
+	}
+	s.recentSIPInvites[key] = now
+	s.recentSIPInvitesMu.Unlock()
+
+	for _, c := range s.calls.ListAll() {
+		if c == nil || c.CallType != "sip" || c.AccountID != accountID {
+			continue
+		}
+		if c.State != calls.StateRinging && c.State != calls.StateActive {
+			continue
+		}
+		if c.FromNode != "sip:"+in.Extension {
+			continue
+		}
+		if in.BridgeID != "" && c.SIPBridgeID == in.BridgeID {
+			return true
+		}
+		if c.State == calls.StateRinging && now.Sub(c.CreatedAt) < 20*time.Second {
+			return true
+		}
+	}
+
+	return false
+}
+
 // handleSIPChannelHangup cleans up a call when the SIP channel hangs up.
 func (s *Server) handleSIPChannelHangup(channel string) {
 	if s.asterisk == nil {
@@ -1070,6 +1138,17 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 	callID, ok := s.asterisk.CallIDForChannel(channel)
 	if !ok {
 		return
+	}
+	call := s.calls.Get(callID)
+	if call != nil && call.State == calls.StateActive && !call.AnsweredAt.IsZero() {
+		// Asterisk can emit a brief channel hangup while the answered leg is
+		// still settling into ConfBridge. Do not tear the whole call down if
+		// the active call has only just been answered.
+		if time.Since(call.AnsweredAt) < 10*time.Second {
+			s.log.Warn("ignoring early SIP channel hangup on active call",
+				map[string]any{"call_id": callID, "channel": channel, "answered_at": call.AnsweredAt})
+			return
+		}
 	}
 	c, ok := s.calls.End(callID, "sip_hangup")
 	if !ok {
@@ -1124,6 +1203,19 @@ func (s *Server) sendError(conn *websocket.Conn, refID string, code int, message
 	}
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	conn.WriteMessage(websocket.TextMessage, data)
+}
+
+func isLikelyInternalExtension(ext string) bool {
+	ext = strings.TrimSpace(ext)
+	if len(ext) < 2 || len(ext) > 6 {
+		return false
+	}
+	for _, ch := range ext {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // asteriskConnectLoop keeps the AMI connection alive, reconnecting on failure.
