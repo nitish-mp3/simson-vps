@@ -31,8 +31,8 @@ type Router struct {
 	log *logging.Logger
 
 	// Callbacks set by server.go after construction.
-	OnIncomingCall    func(in IncomingSIPCall)              // SIP phone dialled in
-	OnChannelHangup   func(channel string)                  // SIP channel hung up
+	OnIncomingCall    func(in IncomingSIPCall)                    // SIP phone dialled in
+	OnChannelHangup   func(channel string)                        // SIP channel hung up
 	OnOriginateResult func(callID string, ok bool, reason string) // async Originate outcome
 
 	// call tracking
@@ -134,6 +134,37 @@ func (r *Router) OriginateToExtension(extension, context, bridgeExt, callerID, c
 	r.originateMu.Unlock()
 
 	_, err := r.ami.OriginateWithActionID(channel, context, bridgeExt, callerID, callID, fromNode, timeoutSec*1000, actionID)
+	if err != nil {
+		r.originateMu.Lock()
+		delete(r.actionIDToCallID, actionID)
+		r.originateMu.Unlock()
+		return "", err
+	}
+
+	return actionID, nil
+}
+
+// OriginateToTrunk dials an external number through an existing PJSIP trunk and
+// then sends the answered leg into the same ConfBridge extension used by SIP
+// phone calls.
+func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, bridgeExt, callerID, callID, fromNode string, timeoutSec int) (string, error) {
+	if outContext == "" {
+		outContext = "from-simson-out"
+	}
+	channel := fmt.Sprintf("Local/%s@%s", number, outContext)
+	actionID := uuid.NewString()
+
+	r.originateMu.Lock()
+	r.actionIDToCallID[actionID] = callID
+	r.originateMu.Unlock()
+
+	vars := map[string]string{
+		"SIMSON_CALL_ID":      callID,
+		"SIMSON_FROM_NODE":    fromNode,
+		"SIMSON_TRUNK":        trunk,
+		"SIMSON_WAIT_TIMEOUT": fmt.Sprintf("%d", timeoutSec),
+	}
+	_, err := r.ami.OriginateWithVars(channel, bridgeContext, bridgeExt, callerID, timeoutSec*1000, actionID, vars)
 	if err != nil {
 		r.originateMu.Lock()
 		delete(r.actionIDToCallID, actionID)

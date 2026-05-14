@@ -21,6 +21,7 @@
     "external_ip": "",
     "in_context": "from-simson-sip",
     "node_context": "from-simson-node",
+    "out_context": "from-simson-out",
     "sip_webrtc": {
       "enabled": false,
       "username": "webrtc-pool",

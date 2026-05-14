@@ -220,6 +220,17 @@ func (a *AMIClient) Originate(channel, context, exten, callerID, callID, fromNod
 // This is useful when the caller needs to register async tracking before sending
 // the AMI action to avoid missing very fast OriginateResponse events.
 func (a *AMIClient) OriginateWithActionID(channel, context, exten, callerID, callID, fromNode string, timeoutMs int, actionID string) (string, error) {
+	return a.OriginateWithVars(channel, context, exten, callerID, timeoutMs, actionID, map[string]string{
+		"SIMSON_CALL_ID":   callID,
+		"SIMSON_FROM_NODE": fromNode,
+	})
+}
+
+func (a *AMIClient) OriginateWithVars(channel, context, exten, callerID string, timeoutMs int, actionID string, variables map[string]string) (string, error) {
+	varPairs := make([]string, 0, len(variables))
+	for k, v := range variables {
+		varPairs = append(varPairs, fmt.Sprintf("%s=%s", k, v))
+	}
 	actionID, resp, err := a.sendAction(map[string]string{
 		"Action":   "Originate",
 		"ActionID": actionID,
@@ -230,7 +241,7 @@ func (a *AMIClient) OriginateWithActionID(channel, context, exten, callerID, cal
 		"CallerID": callerID,
 		"Timeout":  fmt.Sprintf("%d", timeoutMs),
 		// comma-joined variables — Asterisk Originate supports KEY=VAL,KEY2=VAL2
-		"Variable": fmt.Sprintf("SIMSON_CALL_ID=%s,SIMSON_FROM_NODE=%s", callID, fromNode),
+		"Variable": strings.Join(varPairs, ","),
 		"Async":    "true",
 	})
 	if err != nil {

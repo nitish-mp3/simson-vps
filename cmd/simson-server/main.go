@@ -50,8 +50,8 @@ func main() {
 	// --- Logger ---
 	log := logging.New(cfg.LogLevel)
 	log.Info("starting simson control plane", map[string]any{
-		"listen":  cfg.Listen,
-		"db":      cfg.DBPath,
+		"listen": cfg.Listen,
+		"db":     cfg.DBPath,
 	})
 
 	// --- Store ---
@@ -88,6 +88,7 @@ func main() {
 				ExternalIP:  cfg.Asterisk.ExternalIP,
 				InContext:   cfg.Asterisk.InContext,
 				NodeContext: cfg.Asterisk.NodeContext,
+				OutContext:  cfg.Asterisk.OutContext,
 				WebRTCUser:  cfg.Asterisk.SIPWebRTC.Username,
 				WebRTCPass:  cfg.Asterisk.SIPWebRTC.Password,
 			}
@@ -112,6 +113,7 @@ func main() {
 
 	// WebSocket endpoint.
 	mux.HandleFunc("/ws", srv.HandleWS)
+	mux.HandleFunc("/node/webrtc-config", srv.HandleNodeWebRTCConfig)
 
 	// Admin endpoints.
 	adminRouter := adminAPI.Router()

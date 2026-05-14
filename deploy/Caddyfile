@@ -15,6 +15,11 @@ simson-vps.niti.life {
 		reverse_proxy localhost:8080
 	}
 
+	# Node-authenticated runtime config for addons.
+	handle /node/* {
+		reverse_proxy localhost:8080
+	}
+
 	# Metrics
 	handle /metrics {
 		reverse_proxy localhost:8080
@@ -24,7 +29,7 @@ simson-vps.niti.life {
 	# Caddy provides valid TLS; Asterisk listens plain WS on port 8088.
 	# Browsers connect to wss://simson-vps.niti.life/sip/ws
 	# Strip the /sip prefix so Asterisk sees /ws (its registered endpoint).
-	handle /sip/ws {
+	handle /sip/ws* {
 		uri strip_prefix /sip
 		reverse_proxy localhost:8088
 	}

@@ -141,10 +141,67 @@ systemctl start  asterisk || true
 
 # ── Config.d directories ─────────────────────────────────────
 info "Creating Asterisk include directories…"
-install -d -m 0750 -o asterisk -g asterisk \
-    /etc/asterisk/pjsip.conf.d \
-    /etc/asterisk/manager.conf.d \
-    /etc/asterisk/extensions.conf.d
+if id -u simson >/dev/null 2>&1; then
+    install -d -m 2775 -o simson -g asterisk \
+        /etc/asterisk/pjsip.d \
+        /etc/asterisk/extensions.d \
+        /etc/asterisk/manager.d \
+        /etc/asterisk/http.conf.d \
+        /etc/asterisk/confbridge.conf.d
+    touch \
+        /etc/asterisk/pjsip.d/simson.conf \
+        /etc/asterisk/extensions.d/simson.conf \
+        /etc/asterisk/manager.d/simson.conf \
+        /etc/asterisk/http.conf.d/simson.conf \
+        /etc/asterisk/confbridge.conf.d/simson.conf \
+        /etc/asterisk/rtp.conf
+    chown simson:asterisk \
+        /etc/asterisk/pjsip.d/simson.conf \
+        /etc/asterisk/extensions.d/simson.conf \
+        /etc/asterisk/manager.d/simson.conf \
+        /etc/asterisk/http.conf.d/simson.conf \
+        /etc/asterisk/confbridge.conf.d/simson.conf \
+        /etc/asterisk/rtp.conf
+    chmod 0640 \
+        /etc/asterisk/pjsip.d/simson.conf \
+        /etc/asterisk/extensions.d/simson.conf \
+        /etc/asterisk/manager.d/simson.conf \
+        /etc/asterisk/http.conf.d/simson.conf \
+        /etc/asterisk/confbridge.conf.d/simson.conf \
+        /etc/asterisk/rtp.conf
+else
+    install -d -m 0750 -o asterisk -g asterisk \
+        /etc/asterisk/pjsip.d \
+        /etc/asterisk/extensions.d \
+        /etc/asterisk/manager.d \
+        /etc/asterisk/http.conf.d \
+        /etc/asterisk/confbridge.conf.d
+fi
+
+if ! grep -qE '^[[:space:]]*#include[[:space:]]+http\.conf\.d/\*\.conf' /etc/asterisk/http.conf 2>/dev/null; then
+    printf '\n; Added by Simson VPS server\n#include http.conf.d/*.conf\n' >> /etc/asterisk/http.conf
+fi
+
+# Public SIP receives constant scanner traffic. Keep logs useful without
+# letting notices/debug output fill the disk and take calls down.
+cat > /etc/logrotate.d/asterisk <<'LREOF'
+/var/log/asterisk/debug /var/log/asterisk/messages /var/log/asterisk/full /var/log/asterisk/*_log {
+        daily
+        size 50M
+        rotate 7
+        missingok
+        notifempty
+        compress
+        delaycompress
+        sharedscripts
+        postrotate
+                /usr/sbin/asterisk -rx "logger reload" > /dev/null 2>&1 || true
+        endscript
+}
+LREOF
+sed -i 's/^messages => .*/messages => warning,error/; s/^full => .*/full => warning,error/' \
+    /etc/asterisk/logger.conf 2>/dev/null || true
+asterisk -rx "logger reload" >/dev/null 2>&1 || true
 
 # Ensure minimal manager.conf if missing
 MANAGER_CONF=/etc/asterisk/manager.conf
@@ -164,7 +221,7 @@ CADDYFILE=$(find /etc/caddy /opt/simson -name "Caddyfile" 2>/dev/null | head -1 
 if [[ -n "$CADDYFILE" ]]; then
     if ! grep -q '/sip/ws' "$CADDYFILE"; then
         # Inject /sip/ws block before the closing brace of the first server block
-        sed -i '/handle \/ws {/i\\t\thandle /sip/ws {\n\t\t\treverse_proxy localhost:8088\n\t\t}\n' "$CADDYFILE" 2>/dev/null || \
+        sed -i '/handle \/ws {/i\\t\thandle /sip/ws* {\n\t\t\turi strip_prefix /sip\n\t\t\treverse_proxy localhost:8088\n\t\t}\n' "$CADDYFILE" 2>/dev/null || \
         warn "Could not auto-update Caddyfile — add the /sip/ws block manually (see below)"
     else
         info "Caddyfile already has /sip/ws — skipping"
@@ -193,6 +250,7 @@ cat << CFGEOF
     "external_ip": "${PUBLIC_IP}",
     "in_context": "from-simson-sip",
     "node_context": "from-simson-node",
+    "out_context": "from-simson-out",
     "sip_webrtc": {
       "enabled": true,
       "username": "${WEBRTC_USER}",
@@ -241,4 +299,3 @@ info "TLS TURN (optional, for HTTPS pages that block plain TURN):"
 info "  Uncomment the cert/pkey lines in /etc/turnserver.conf once"
 info "  Let's Encrypt certs are available, then: systemctl restart coturn"
 info "────────────────────────────────────────────────"
-

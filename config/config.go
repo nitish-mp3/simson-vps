@@ -9,11 +9,11 @@ import (
 
 // ICEConfig holds WebRTC ICE server settings published to clients via the API.
 type ICEConfig struct {
-	STUNServers []string `json:"stun_servers"` // public STUN URIs (no auth)
-	TURNEnabled bool     `json:"turn_enabled"`
-	TURNURLs    []string `json:"turn_urls"`     // e.g. ["turn:vps.example.com:3478"]
-	TURNUsername string  `json:"turn_username"`
-	TURNSecret  string   `json:"turn_secret"`  // static TURN credential (rotate periodically)
+	STUNServers  []string `json:"stun_servers"` // public STUN URIs (no auth)
+	TURNEnabled  bool     `json:"turn_enabled"`
+	TURNURLs     []string `json:"turn_urls"` // e.g. ["turn:vps.example.com:3478"]
+	TURNUsername string   `json:"turn_username"`
+	TURNSecret   string   `json:"turn_secret"` // static TURN credential (rotate periodically)
 }
 
 // SIPWebRTCConfig holds the shared SIP-over-WebSocket credentials used by browser clients.
@@ -27,36 +27,37 @@ type SIPWebRTCConfig struct {
 
 // AsteriskConfig holds settings for the optional central VPS Asterisk integration.
 type AsteriskConfig struct {
-	Enabled       bool            `json:"enabled"`          // false → AMI disabled
-	Host          string          `json:"host"`             // AMI host (default: 127.0.0.1)
-	Port          int             `json:"port"`             // AMI port  (default: 5038)
-	User          string          `json:"user"`             // AMI user name
-	Secret        string          `json:"secret"`           // AMI password
-	AutoConfigure bool            `json:"auto_configure"`   // write pjsip/manager/dialplan conf on start
-	SIPDomain     string          `json:"sip_domain"`       // hostname phones register to
-	ExternalIP    string          `json:"external_ip"`      // VPS public IP for RTP NAT (auto-detected if empty)
-	InContext      string         `json:"in_context"`       // incoming-SIP dialplan context
-	NodeContext   string          `json:"node_context"`     // node-callback dialplan context
-	SIPWebRTC     SIPWebRTCConfig `json:"sip_webrtc"`       // shared browser SIP endpoint
+	Enabled       bool            `json:"enabled"`        // false → AMI disabled
+	Host          string          `json:"host"`           // AMI host (default: 127.0.0.1)
+	Port          int             `json:"port"`           // AMI port  (default: 5038)
+	User          string          `json:"user"`           // AMI user name
+	Secret        string          `json:"secret"`         // AMI password
+	AutoConfigure bool            `json:"auto_configure"` // write pjsip/manager/dialplan conf on start
+	SIPDomain     string          `json:"sip_domain"`     // hostname phones register to
+	ExternalIP    string          `json:"external_ip"`    // VPS public IP for RTP NAT (auto-detected if empty)
+	InContext     string          `json:"in_context"`     // incoming-SIP dialplan context
+	NodeContext   string          `json:"node_context"`   // node-callback dialplan context
+	OutContext    string          `json:"out_context"`    // outbound PSTN/trunk dialplan context
+	SIPWebRTC     SIPWebRTCConfig `json:"sip_webrtc"`     // shared browser SIP endpoint
 }
 
 // Config holds all server configuration.
 type Config struct {
-	Listen             string         `json:"listen"`               // e.g. ":8443"
-	DBPath             string         `json:"db_path"`              // SQLite file
-	LogLevel           string         `json:"log_level"`            // "debug","info","warn","error"
-	HeartbeatSec       int            `json:"heartbeat_sec"`        // expected heartbeat interval
-	HeartbeatTimeout   time.Duration  `json:"-"`                    // computed
-	CallTimeoutSec     int            `json:"call_timeout_sec"`     // ring timeout
+	Listen             string         `json:"listen"`           // e.g. ":8443"
+	DBPath             string         `json:"db_path"`          // SQLite file
+	LogLevel           string         `json:"log_level"`        // "debug","info","warn","error"
+	HeartbeatSec       int            `json:"heartbeat_sec"`    // expected heartbeat interval
+	HeartbeatTimeout   time.Duration  `json:"-"`                // computed
+	CallTimeoutSec     int            `json:"call_timeout_sec"` // ring timeout
 	MaxNodesPerAcct    int            `json:"max_nodes_per_account"`
 	MaxConcurrentCalls int            `json:"max_concurrent_calls"`
 	RateLimitPerSec    int            `json:"rate_limit_per_sec"`
 	MaxPayloadBytes    int            `json:"max_payload_bytes"`
-	AdminToken         string         `json:"admin_token"`          // bearer token for admin API
+	AdminToken         string         `json:"admin_token"` // bearer token for admin API
 	TLSCert            string         `json:"tls_cert,omitempty"`
 	TLSKey             string         `json:"tls_key,omitempty"`
-	Asterisk           AsteriskConfig `json:"asterisk"`             // optional central PBX
-	ICE                ICEConfig      `json:"ice"`                  // WebRTC ICE/TURN settings
+	Asterisk           AsteriskConfig `json:"asterisk"` // optional central PBX
+	ICE                ICEConfig      `json:"ice"`      // WebRTC ICE/TURN settings
 }
 
 // DefaultConfig returns production defaults.
@@ -78,6 +79,7 @@ func DefaultConfig() *Config {
 			Port:        5038,
 			InContext:   "from-simson-sip",
 			NodeContext: "from-simson-node",
+			OutContext:  "from-simson-out",
 			SIPWebRTC: SIPWebRTCConfig{
 				Enabled:  false,
 				Username: "webrtc-pool",

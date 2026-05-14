@@ -43,12 +43,12 @@ type Server struct {
 // New constructs a Server.
 func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 	s := &Server{
-		cfg:     cfg,
-		store:   st,
-		hub:     hub.New(),
-		calls:   calls.NewManager(),
-		limiter: ratelimit.New(cfg.RateLimitPerSec, cfg.RateLimitPerSec*2),
-		log:     log,
+		cfg:              cfg,
+		store:            st,
+		hub:              hub.New(),
+		calls:            calls.NewManager(),
+		limiter:          ratelimit.New(cfg.RateLimitPerSec, cfg.RateLimitPerSec*2),
+		log:              log,
 		recentSIPInvites: make(map[string]time.Time),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
@@ -86,6 +86,76 @@ func (s *Server) Store() *store.Store { return s.store }
 
 // Asterisk returns the AMI router, or nil if Asterisk is disabled.
 func (s *Server) Asterisk() *asterisk.Router { return s.asterisk }
+
+// HandleNodeWebRTCConfig returns ICE/TURN and SIP-over-WebSocket credentials
+// to an authenticated addon node. This lets browser cards join the central
+// Asterisk ConfBridge without users manually copying SIP passwords into each
+// addon instance.
+func (s *Server) HandleNodeWebRTCConfig(w http.ResponseWriter, r *http.Request) {
+	accountID := strings.TrimSpace(r.Header.Get("X-Simson-Account-ID"))
+	nodeID := strings.TrimSpace(r.Header.Get("X-Simson-Node-ID"))
+	token := strings.TrimSpace(r.Header.Get("X-Simson-Install-Token"))
+	if accountID == "" {
+		accountID = strings.TrimSpace(r.URL.Query().Get("account_id"))
+	}
+	if nodeID == "" {
+		nodeID = strings.TrimSpace(r.URL.Query().Get("node_id"))
+	}
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("install_token"))
+	}
+	if accountID == "" || nodeID == "" || token == "" {
+		http.Error(w, "missing node credentials", http.StatusUnauthorized)
+		return
+	}
+
+	node, err := s.store.GetNode(nodeID)
+	if err != nil {
+		s.log.Error("node webrtc-config lookup failed", map[string]any{"err": err.Error(), "node_id": nodeID})
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if node == nil ||
+		node.AccountID != accountID ||
+		!node.Enabled ||
+		subtle.ConstantTimeCompare([]byte(node.AuthToken), []byte(token)) != 1 {
+		s.log.Warn("node webrtc-config auth failed", map[string]any{"node_id": nodeID, "account": accountID, "ip": extractIP(r)})
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	iceServers := []map[string]any{}
+	for _, stun := range s.cfg.ICE.STUNServers {
+		iceServers = append(iceServers, map[string]any{"urls": stun})
+	}
+	if s.cfg.ICE.TURNEnabled && len(s.cfg.ICE.TURNURLs) > 0 {
+		entry := map[string]any{
+			"urls":       s.cfg.ICE.TURNURLs,
+			"username":   s.cfg.ICE.TURNUsername,
+			"credential": s.cfg.ICE.TURNSecret,
+		}
+		iceServers = append(iceServers, entry)
+	}
+
+	wsPath := s.cfg.Asterisk.SIPWebRTC.WSPath
+	if wsPath == "" {
+		wsPath = "/sip/ws"
+	}
+	sipConfig := map[string]any{
+		"enabled":  s.cfg.Asterisk.Enabled && s.cfg.Asterisk.SIPWebRTC.Enabled,
+		"username": s.cfg.Asterisk.SIPWebRTC.Username,
+		"password": s.cfg.Asterisk.SIPWebRTC.Password,
+		"domain":   s.cfg.Asterisk.SIPDomain,
+		"ws_path":  wsPath,
+		"ws_url":   sipWSURL(s.cfg.Asterisk.SIPDomain, wsPath),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ice_servers": iceServers,
+		"sip":         sipConfig,
+	})
+}
 
 // HandleWS is the HTTP handler for WebSocket upgrades at /ws.
 func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
@@ -771,15 +841,11 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "internal error")
 		return
 	}
-	if ep == nil {
-		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "SIP extension not registered: "+ext)
-		return
-	}
-	if ep.AccountID != sess.AccountID {
+	if ep != nil && ep.AccountID != sess.AccountID {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "SIP extension belongs to a different account")
 		return
 	}
-	if !ep.Enabled {
+	if ep != nil && !ep.Enabled {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "SIP extension is disabled")
 		return
 	}
@@ -814,12 +880,18 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 
 	// Caller label shown on the phone display.
 	callerID := ""
+	trunk := ""
 	if len(req.Metadata) > 0 {
 		var metaMap map[string]any
 		if err := json.Unmarshal(req.Metadata, &metaMap); err == nil {
 			if v, ok := metaMap["caller_id"]; ok {
 				if s, ok := v.(string); ok {
 					callerID = s
+				}
+			}
+			if v, ok := metaMap["trunk"]; ok {
+				if s, ok := v.(string); ok {
+					trunk = strings.TrimSpace(s)
 				}
 			}
 		}
@@ -835,19 +907,30 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		callerID = fmt.Sprintf("\"%s\" <100>", label)
 	}
 
-	// Pre-flight: verify the SIP phone has at least one registered contact.
-	// This prevents a silent immediate failure when the phone is offline or
-	// misconfigured, and gives the caller a meaningful error message.
-	if !s.asterisk.EndpointHasContacts(ext) {
-		if c2, ended := s.calls.End(callID, "phone_unavailable"); ended {
-			s.notifyCallStatus(c2)
+	if ep == nil {
+		if trunk == "" {
+			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "SIP extension not registered: "+ext)
+			return
 		}
-		s.log.Warn("SIP phone has no registered contacts — rejecting call",
-			map[string]any{"ext": ext, "call_id": callID})
-		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeSIPUnavailable,
-			fmt.Sprintf("SIP phone %q is not registered. Check the phone's SIP account settings (server: %s, username: %s).",
-				ext, s.cfg.Asterisk.SIPDomain, ext))
-		return
+		if !isSafeDialNumber(ext) || !isSafeAsteriskName(trunk) {
+			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "invalid outbound trunk target")
+			return
+		}
+	} else {
+		// Pre-flight: verify the SIP phone has at least one registered contact.
+		// This prevents a silent immediate failure when the phone is offline or
+		// misconfigured, and gives the caller a meaningful error message.
+		if !s.asterisk.EndpointHasContacts(ext) {
+			if c2, ended := s.calls.End(callID, "phone_unavailable"); ended {
+				s.notifyCallStatus(c2)
+			}
+			s.log.Warn("SIP phone has no registered contacts — rejecting call",
+				map[string]any{"ext": ext, "call_id": callID})
+			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeSIPUnavailable,
+				fmt.Sprintf("SIP phone %q is not registered. Check the phone's SIP account settings (server: %s, username: %s).",
+					ext, s.cfg.Asterisk.SIPDomain, ext))
+			return
+		}
 	}
 
 	// Notify the caller of ringing BEFORE the async Originate fires.
@@ -855,17 +938,31 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 	// event, eliminating the race between the ReadLoop goroutine and this handler.
 	s.notifyCallStatus(c)
 
-	// Originate the call via AMI.  NodeContext contains the bridge-joining
-	// dialplan (extension _bridge-.) that the answered SIP leg joins.
-	_, err = s.asterisk.OriginateToExtension(
-		ext,
-		s.cfg.Asterisk.NodeContext,
-		bridgeID,
-		callerID,
-		callID,
-		sess.NodeID,
-		s.cfg.CallTimeoutSec,
-	)
+	// Originate the call via AMI. NodeContext contains the bridge-joining
+	// dialplan (extension _bridge-.) that the answered leg joins.
+	if trunk != "" {
+		_, err = s.asterisk.OriginateToTrunk(
+			ext,
+			trunk,
+			s.cfg.Asterisk.OutContext,
+			s.cfg.Asterisk.NodeContext,
+			bridgeID,
+			callerID,
+			callID,
+			sess.NodeID,
+			s.cfg.CallTimeoutSec,
+		)
+	} else {
+		_, err = s.asterisk.OriginateToExtension(
+			ext,
+			s.cfg.Asterisk.NodeContext,
+			bridgeID,
+			callerID,
+			callID,
+			sess.NodeID,
+			s.cfg.CallTimeoutSec,
+		)
+	}
 	if err != nil {
 		if c2, ended := s.calls.End(callID, "originate_failed"); ended {
 			s.notifyCallStatus(c2)
@@ -877,7 +974,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 	s.store.WriteAudit(sess.AccountID, sess.NodeID, "sip_call_request",
 		fmt.Sprintf("call=%s ext=%s", callID, ext), sess.RemoteIP)
 	s.log.Info("SIP call originated", map[string]any{
-		"call_id": callID, "ext": ext, "from": sess.NodeID,
+		"call_id": callID, "ext": ext, "from": sess.NodeID, "trunk": trunk,
 	})
 }
 
@@ -890,18 +987,6 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 //  3. No matching endpoint → identify the caller’s account from the channel and ring
 //     all online nodes in that account (allows a SIP phone to reach any node).
 func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
-	// Reject calls that look like external PSTN numbers (> 15 digits).
-	// SIP phones sometimes dial mobile/landline numbers that should never be
-	// dispatched to Simson nodes — just hang up immediately.
-	if len(in.Extension) > 15 {
-		s.log.Warn("rejecting call to external-looking extension",
-			map[string]any{"extension": in.Extension, "channel": in.Channel})
-		if s.asterisk != nil {
-			_ = s.asterisk.HangupChannel(in.Channel)
-		}
-		return
-	}
-
 	// Step 1: try to find a SIP endpoint matching the dialled extension.
 	ep, err := s.store.GetSIPEndpointByExtension(in.Extension)
 	if err != nil {
@@ -919,6 +1004,17 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		accountID = ep.AccountID
 		routeTo = ep.RouteTo
 	} else {
+		// Unknown external-looking numbers should not be dispatched to nodes.
+		// A configured SIP endpoint may still intentionally use a DID/landline
+		// number as its extension, so this check must happen after endpoint lookup.
+		if len(in.Extension) > 15 {
+			s.log.Warn("rejecting unknown external-looking extension",
+				map[string]any{"extension": in.Extension, "channel": in.Channel})
+			if s.asterisk != nil {
+				_ = s.asterisk.HangupChannel(in.Channel)
+			}
+			return
+		}
 		if !isLikelyInternalExtension(in.Extension) {
 			s.log.Warn("rejecting unknown non-internal extension",
 				map[string]any{"extension": in.Extension, "channel": in.Channel, "caller_id": in.CallerID})
@@ -1218,6 +1314,33 @@ func isLikelyInternalExtension(ext string) bool {
 	return true
 }
 
+func isSafeDialNumber(number string) bool {
+	number = strings.TrimSpace(number)
+	if len(number) < 2 || len(number) > 15 {
+		return false
+	}
+	for _, ch := range number {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isSafeAsteriskName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, ch := range name {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // asteriskConnectLoop keeps the AMI connection alive, reconnecting on failure.
 func (s *Server) asteriskConnectLoop() {
 	for {
@@ -1250,7 +1373,13 @@ func (s *Server) asteriskConnectLoop() {
 
 // reloadAsteriskViaAMI sends reload commands through the AMI connection.
 func (s *Server) reloadAsteriskViaAMI() {
-	cmds := []string{"pjsip reload", "dialplan reload", "module reload app_confbridge.so"}
+	cmds := []string{
+		"pjsip reload",
+		"dialplan reload",
+		"module reload app_confbridge.so",
+		"module reload res_http_websocket.so",
+		"module reload res_pjsip_transport_websocket.so",
+	}
 	for _, cmd := range cmds {
 		if _, err := s.asterisk.RunCommand(cmd); err != nil {
 			s.log.Warn("AMI reload command failed", map[string]any{"cmd": cmd, "err": err.Error()})
@@ -1258,6 +1387,56 @@ func (s *Server) reloadAsteriskViaAMI() {
 			s.log.Debug("AMI reload OK", map[string]any{"cmd": cmd})
 		}
 	}
+}
+
+func (s *Server) configureAsteriskFromStore() {
+	if s.asterisk == nil || !s.cfg.Asterisk.AutoConfigure {
+		return
+	}
+
+	endpoints, err := s.store.ListAllSIPEndpoints()
+	if err != nil {
+		s.log.Error("could not load SIP endpoints for Asterisk config", map[string]any{"err": err.Error()})
+		return
+	}
+
+	defs := make([]asterisk.SIPEndpointDef, 0, len(endpoints))
+	for _, ep := range endpoints {
+		defs = append(defs, asterisk.SIPEndpointDef{
+			ID:        ep.ID,
+			Extension: ep.Extension,
+			Username:  ep.Username,
+			Password:  ep.Password,
+			Enabled:   ep.Enabled,
+		})
+	}
+
+	webrtcUser := ""
+	webrtcPass := ""
+	if s.cfg.Asterisk.SIPWebRTC.Enabled {
+		webrtcUser = s.cfg.Asterisk.SIPWebRTC.Username
+		webrtcPass = s.cfg.Asterisk.SIPWebRTC.Password
+	}
+
+	if err := asterisk.Setup(asterisk.SetupConfig{
+		AmiUser:     s.cfg.Asterisk.User,
+		AmiSecret:   s.cfg.Asterisk.Secret,
+		SIPDomain:   s.cfg.Asterisk.SIPDomain,
+		ExternalIP:  s.cfg.Asterisk.ExternalIP,
+		InContext:   s.cfg.Asterisk.InContext,
+		NodeContext: s.cfg.Asterisk.NodeContext,
+		OutContext:  s.cfg.Asterisk.OutContext,
+		WebRTCUser:  webrtcUser,
+		WebRTCPass:  webrtcPass,
+	}, defs, s.log); err != nil {
+		s.log.Error("Asterisk auto-configure failed", map[string]any{"err": err.Error()})
+		return
+	}
+
+	s.log.Info("Asterisk auto-configure complete", map[string]any{
+		"sip_endpoints": len(defs),
+		"webrtc":        webrtcUser != "" && webrtcPass != "",
+	})
 }
 
 // sendErrorSafe sends an error through the session's mutex-protected Send method.
@@ -1288,6 +1467,21 @@ func extractIP(r *http.Request) string {
 	return host
 }
 
+func sipWSURL(domain, path string) string {
+	host := strings.TrimSpace(domain)
+	if host == "" {
+		return ""
+	}
+	wsPath := strings.TrimSpace(path)
+	if wsPath == "" {
+		wsPath = "/sip/ws"
+	}
+	if !strings.HasPrefix(wsPath, "/") {
+		wsPath = "/" + wsPath
+	}
+	return "wss://" + host + wsPath
+}
+
 // extractEndpointFromChannel extracts the PJSIP endpoint name from an Asterisk
 // channel string like "PJSIP/1025-00000001" → "1025".
 func extractEndpointFromChannel(channel string) string {
@@ -1308,6 +1502,7 @@ func extractEndpointFromChannel(channel string) string {
 func (s *Server) StartBackgroundTasks() {
 	// ── Central VPS Asterisk ─────────────────────────────────────────────────
 	if s.asterisk != nil {
+		s.configureAsteriskFromStore()
 		go s.asteriskConnectLoop()
 	}
 

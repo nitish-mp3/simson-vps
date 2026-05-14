@@ -103,8 +103,8 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":          "ok",
-		"server_version":  "1.3.0",
+		"status":           "ok",
+		"server_version":   "1.3.0",
 		"protocol_version": "1.0.0",
 	})
 }
@@ -463,6 +463,7 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
 	}
+	a.reconfigureAsterisk()
 	writeJSON(w, http.StatusCreated, ep)
 }
 
@@ -535,6 +536,7 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
 	}
+	a.reconfigureAsterisk()
 	writeJSON(w, http.StatusOK, ep)
 }
 
@@ -545,6 +547,7 @@ func (a *API) handleDeleteSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
 	}
+	a.reconfigureAsterisk()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -602,6 +605,7 @@ func (a *API) handleGetWebRTCConfig(w http.ResponseWriter, r *http.Request) {
 		"password": a.cfg.Asterisk.SIPWebRTC.Password,
 		"domain":   a.cfg.Asterisk.SIPDomain,
 		"ws_path":  a.cfg.Asterisk.SIPWebRTC.WSPath,
+		"ws_url":   sipWSURL(a.cfg.Asterisk.SIPDomain, a.cfg.Asterisk.SIPWebRTC.WSPath),
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -614,13 +618,13 @@ func (a *API) handleGetWebRTCConfig(w http.ResponseWriter, r *http.Request) {
 // (changes take effect immediately on the next client request; no server restart needed).
 func (a *API) handlePutWebRTCConfig(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		TURNEnabled  *bool     `json:"turn_enabled"`
-		TURNURLs     []string  `json:"turn_urls"`
-		TURNUsername *string   `json:"turn_username"`
-		TURNSecret   *string   `json:"turn_secret"`
-		SIPEnabled   *bool     `json:"sip_enabled"`
-		SIPUsername  *string   `json:"sip_username"`
-		SIPPassword  *string   `json:"sip_password"`
+		TURNEnabled  *bool    `json:"turn_enabled"`
+		TURNURLs     []string `json:"turn_urls"`
+		TURNUsername *string  `json:"turn_username"`
+		TURNSecret   *string  `json:"turn_secret"`
+		SIPEnabled   *bool    `json:"sip_enabled"`
+		SIPUsername  *string  `json:"sip_username"`
+		SIPPassword  *string  `json:"sip_password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
@@ -651,10 +655,85 @@ func (a *API) handlePutWebRTCConfig(w http.ResponseWriter, r *http.Request) {
 		"turn_enabled": a.cfg.ICE.TURNEnabled,
 		"sip_enabled":  a.cfg.Asterisk.SIPWebRTC.Enabled,
 	})
+	a.reconfigureAsterisk()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // --- Helpers ---
+
+func (a *API) reconfigureAsterisk() {
+	if !a.cfg.Asterisk.Enabled || !a.cfg.Asterisk.AutoConfigure {
+		return
+	}
+
+	endpoints, err := a.store.ListAllSIPEndpoints()
+	if err != nil {
+		a.log.Error("could not load SIP endpoints for Asterisk config", map[string]any{"err": err.Error()})
+		return
+	}
+
+	defs := make([]asterisk.SIPEndpointDef, 0, len(endpoints))
+	for _, ep := range endpoints {
+		defs = append(defs, asterisk.SIPEndpointDef{
+			ID:        ep.ID,
+			Extension: ep.Extension,
+			Username:  ep.Username,
+			Password:  ep.Password,
+			Enabled:   ep.Enabled,
+		})
+	}
+
+	webrtcUser := ""
+	webrtcPass := ""
+	if a.cfg.Asterisk.SIPWebRTC.Enabled {
+		webrtcUser = a.cfg.Asterisk.SIPWebRTC.Username
+		webrtcPass = a.cfg.Asterisk.SIPWebRTC.Password
+	}
+
+	if err := asterisk.Setup(asterisk.SetupConfig{
+		AmiUser:     a.cfg.Asterisk.User,
+		AmiSecret:   a.cfg.Asterisk.Secret,
+		SIPDomain:   a.cfg.Asterisk.SIPDomain,
+		ExternalIP:  a.cfg.Asterisk.ExternalIP,
+		InContext:   a.cfg.Asterisk.InContext,
+		NodeContext: a.cfg.Asterisk.NodeContext,
+		OutContext:  a.cfg.Asterisk.OutContext,
+		WebRTCUser:  webrtcUser,
+		WebRTCPass:  webrtcPass,
+	}, defs, a.log); err != nil {
+		a.log.Error("Asterisk auto-configure failed", map[string]any{"err": err.Error()})
+		return
+	}
+
+	if a.asterisk != nil && a.asterisk.Connected() {
+		for _, cmd := range []string{
+			"pjsip reload",
+			"dialplan reload",
+			"module reload app_confbridge.so",
+			"module reload res_http_websocket.so",
+			"module reload res_pjsip_transport_websocket.so",
+		} {
+			if _, err := a.asterisk.RunCommand(cmd); err != nil {
+				a.log.Warn("AMI reload command failed", map[string]any{"cmd": cmd, "err": err.Error()})
+			}
+		}
+	}
+}
+
+func sipWSURL(domain, path string) string {
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return ""
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = "/sip/ws"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return "wss://" + domain + path
+}
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
