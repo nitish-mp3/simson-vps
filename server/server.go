@@ -835,7 +835,6 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		return
 	}
 
-	// Caller label shown on the phone display.
 	callerID := ""
 	trunk := ""
 	if len(req.Metadata) > 0 {
@@ -854,6 +853,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		}
 	}
 
+	originalExt := ext
 	ep, err := s.store.GetSIPEndpointByExtension(ext)
 	if err != nil {
 		s.log.Error("db error looking up SIP endpoint", map[string]any{"err": err.Error()})
@@ -920,7 +920,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 
 	if ep == nil {
 		if trunk == "" {
-			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "SIP extension not registered: "+ext)
+			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "SIP extension not registered: "+originalExt)
 			return
 		}
 		if !isSafeDialNumber(ext) || !isSafeAsteriskName(trunk) {
@@ -1282,12 +1282,17 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 	} else {
 		// Map Asterisk reason code to a descriptive end reason.
 		endReason := "no_answer"
+		if c := s.calls.Get(callID); c != nil && isExternalDialString(strings.TrimPrefix(c.ToNode, "sip:")) {
+			endReason = "gateway_unavailable"
+		}
 		switch reason {
 		case "4", "17":
 			endReason = "busy"
 		case "0", "":
-			// reason=0 typically means endpoint had no contacts or no route.
-			endReason = "phone_unavailable"
+			if endReason == "no_answer" {
+				// reason=0 typically means endpoint had no contacts or no route.
+				endReason = "phone_unavailable"
+			}
 		}
 		c, ended := s.calls.End(callID, endReason)
 		if ended {

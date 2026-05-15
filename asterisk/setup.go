@@ -345,7 +345,18 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 			aorName = endpointID
 		}
 
-		fmt.Fprintf(&sb, "[%s](simson-ep-tpl)\nauth=%s-auth\noutbound_auth=%s-auth\naors=%s\n\n", endpointID, endpointID, endpointID, aorName)
+		fmt.Fprintf(&sb, "[%s](simson-ep-tpl)\nauth=%s-auth\noutbound_auth=%s-auth\naors=%s\n", endpointID, endpointID, endpointID, aorName)
+		if _, ok := noAuthInbound[endpointID]; ok {
+			sb.WriteString(
+				"; Synway/GSM gateway compatibility: avoid dynamic RTP payloads\n" +
+					"; and SIP extensions that this gateway answers inconsistently.\n" +
+					"dtmf_mode=inband\n" +
+					"preferred_codec_only=yes\n" +
+					"timers=no\n" +
+					"100rel=no\n",
+			)
+		}
+		sb.WriteString("\n")
 		fmt.Fprintf(&sb, "[%s-auth](simson-auth-tpl)\nusername=%s\npassword=%s\n\n", endpointID, ep.Username, ep.Password)
 		fmt.Fprintf(&sb, "[%s](simson-aor-tpl)\n\n", aorName)
 	}
