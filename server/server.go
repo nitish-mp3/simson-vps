@@ -891,7 +891,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		}
 	}
 	if ep == nil && trunk != "" {
-		ext = digitsOnly(ext)
+		ext = normalizePSTNDigits(digitsOnly(ext), trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
 	}
 
 	c := &calls.Call{
@@ -1354,6 +1354,18 @@ func digitsOnly(value string) string {
 		}
 	}
 	return b.String()
+}
+
+func normalizePSTNDigits(digits, trunk, defaultTrunk string) string {
+	trunk = strings.TrimSpace(trunk)
+	defaultTrunk = strings.TrimSpace(defaultTrunk)
+	if defaultTrunk == "" {
+		defaultTrunk = "7009"
+	}
+	if trunk == defaultTrunk && len(digits) == 12 && strings.HasPrefix(digits, "91") {
+		return digits[2:]
+	}
+	return digits
 }
 
 func isExternalDialString(value string) bool {
