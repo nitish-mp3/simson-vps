@@ -1024,8 +1024,10 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 			return
 		}
 
-		// Step 2: no matching endpoint — identify the caller’s account from
-		// the Asterisk channel name (e.g. "PJSIP/1025-00000001" → ext "1025").
+		// Step 2: no matching dialled endpoint — identify the caller’s account
+		// from the Asterisk channel name (e.g. "PJSIP/7001-00000001" → ext
+		// "7001"). For gateway-style endpoints, RouteTo on the caller endpoint
+		// is the preferred destination for PSTN/GSM calls forwarded into Simson.
 		callerExt := extractEndpointFromChannel(in.Channel)
 		if callerExt == "" {
 			s.log.Warn("cannot identify caller for unknown extension",
@@ -1045,8 +1047,7 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 			return
 		}
 		accountID = callerEP.AccountID
-		// Ring all online nodes in the caller’s account.
-		routeTo = ""
+		routeTo = callerEP.RouteTo
 	}
 
 	if s.shouldSuppressIncomingSIPInvite(accountID, in) {
@@ -1237,14 +1238,8 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 	}
 	call := s.calls.Get(callID)
 	if call != nil && call.State == calls.StateActive && !call.AnsweredAt.IsZero() {
-		// Asterisk can emit a brief channel hangup while the answered leg is
-		// still settling into ConfBridge. Do not tear the whole call down if
-		// the active call has only just been answered.
-		if time.Since(call.AnsweredAt) < 10*time.Second {
-			s.log.Warn("ignoring early SIP channel hangup on active call",
-				map[string]any{"call_id": callID, "channel": channel, "answered_at": call.AnsweredAt})
-			return
-		}
+		s.log.Debug("SIP channel hangup for active call",
+			map[string]any{"call_id": callID, "channel": channel, "answered_age_ms": time.Since(call.AnsweredAt).Milliseconds()})
 	}
 	c, ok := s.calls.End(callID, "sip_hangup")
 	if !ok {
@@ -1419,15 +1414,17 @@ func (s *Server) configureAsteriskFromStore() {
 	}
 
 	if err := asterisk.Setup(asterisk.SetupConfig{
-		AmiUser:     s.cfg.Asterisk.User,
-		AmiSecret:   s.cfg.Asterisk.Secret,
-		SIPDomain:   s.cfg.Asterisk.SIPDomain,
-		ExternalIP:  s.cfg.Asterisk.ExternalIP,
-		InContext:   s.cfg.Asterisk.InContext,
-		NodeContext: s.cfg.Asterisk.NodeContext,
-		OutContext:  s.cfg.Asterisk.OutContext,
-		WebRTCUser:  webrtcUser,
-		WebRTCPass:  webrtcPass,
+		AmiUser:                 s.cfg.Asterisk.User,
+		AmiSecret:               s.cfg.Asterisk.Secret,
+		SIPDomain:               s.cfg.Asterisk.SIPDomain,
+		ExternalIP:              s.cfg.Asterisk.ExternalIP,
+		InContext:               s.cfg.Asterisk.InContext,
+		NodeContext:             s.cfg.Asterisk.NodeContext,
+		OutContext:              s.cfg.Asterisk.OutContext,
+		TrustedGatewayIPs:       s.cfg.Asterisk.TrustedGatewayIPs,
+		NoAuthInboundExtensions: s.cfg.Asterisk.NoAuthInboundExtensions,
+		WebRTCUser:              webrtcUser,
+		WebRTCPass:              webrtcPass,
 	}, defs, s.log); err != nil {
 		s.log.Error("Asterisk auto-configure failed", map[string]any{"err": err.Error()})
 		return
@@ -1518,6 +1515,10 @@ func (s *Server) StartBackgroundTasks() {
 				// End calls.
 				for _, c := range s.calls.ActiveByNode(nodeID) {
 					if ended, ok := s.calls.End(c.ID, "stale_disconnect"); ok {
+						if ended.CallType == "sip" && s.asterisk != nil {
+							_ = s.asterisk.HangupCall(ended.ID)
+							s.asterisk.UntrackCall(ended.ID)
+						}
 						s.notifyCallStatus(ended)
 					}
 				}
@@ -1535,6 +1536,10 @@ func (s *Server) StartBackgroundTasks() {
 			for _, c := range expired {
 				s.log.Info("call timed out", map[string]any{"call_id": c.ID})
 				s.store.WriteAudit(c.AccountID, c.FromNode, "call_timeout", "call="+c.ID, "")
+				if c.CallType == "sip" && s.asterisk != nil {
+					_ = s.asterisk.HangupCall(c.ID)
+					s.asterisk.UntrackCall(c.ID)
+				}
 				s.notifyCallStatus(c)
 			}
 		}

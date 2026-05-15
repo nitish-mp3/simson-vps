@@ -15,13 +15,15 @@ import (
 
 // SetupConfig holds parameters for auto-configuring Asterisk on the VPS.
 type SetupConfig struct {
-	AmiUser     string
-	AmiSecret   string
-	SIPDomain   string // PJSIP transport domain / hostname seen by phones
-	ExternalIP  string // Public IP for RTP NAT traversal (empty → omit external_media_address)
-	InContext   string // dialplan context for incoming SIP calls ("from-simson-sip")
-	NodeContext string // dialplan context for node-callback channels ("from-simson-node")
-	OutContext  string // dialplan context for configured outbound trunk/landline calls
+	AmiUser                 string
+	AmiSecret               string
+	SIPDomain               string   // PJSIP transport domain / hostname seen by phones
+	ExternalIP              string   // Public IP for RTP NAT traversal (empty → omit external_media_address)
+	InContext               string   // dialplan context for incoming SIP calls ("from-simson-sip")
+	NodeContext             string   // dialplan context for node-callback channels ("from-simson-node")
+	OutContext              string   // dialplan context for configured outbound trunk/landline calls
+	TrustedGatewayIPs       []string // trusted SIP gateway public IPs for inbound INVITEs that cannot digest-auth
+	NoAuthInboundExtensions []string // gateway extensions that cannot digest-auth inbound INVITEs
 	// Shared SIP-over-WebSocket endpoint for browser SIP.js clients.
 	// Empty Username disables the webrtc-pool endpoint.
 	WebRTCUser string
@@ -64,7 +66,7 @@ func Setup(cfg SetupConfig, endpoints []SIPEndpointDef, log *logging.Logger) err
 	if err := writeConfBridgeConf(root); err != nil {
 		return fmt.Errorf("confbridge.conf: %w", err)
 	}
-	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext); err != nil {
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, cfg.NoAuthInboundExtensions); err != nil {
 		return fmt.Errorf("extensions.conf: %w", err)
 	}
 
@@ -218,8 +220,12 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 	appendTransportNATConfig(&sb, externalIP)
 	sb.WriteString("\n")
 
-	// ── Global settings (STUN for Asterisk's own ICE negotiation) ────────────
-	sb.WriteString("[global]\ntype=global\nmax_initial_qualify_time=60\n\n")
+	// ── Global settings ──────────────────────────────────────────────────────
+	// Prefer username matching first so registered phones authenticate normally.
+	// Unmatched INVITEs can fall through to the locked-down anonymous context
+	// below; we intentionally avoid IP identification because gateways behind the
+	// same NAT can otherwise hijack REGISTER requests for unrelated accounts.
+	sb.WriteString("[global]\ntype=global\nmax_initial_qualify_time=60\nendpoint_identifier_order=username,anonymous\n\n")
 
 	// ── Endpoint template (shared settings for all Simson phones) ─────────────
 	sipContext := cfg.InContext
@@ -243,6 +249,40 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 	)
 	sb.WriteString("[simson-auth-tpl](!)\ntype=auth\nauth_type=userpass\n\n")
 	sb.WriteString("[simson-aor-tpl](!)\ntype=aor\nmax_contacts=2\nremove_existing=yes\nqualify_frequency=0\n\n")
+	sb.WriteString(
+		"[simson-gateway-in-tpl](!)\ntype=endpoint\n" +
+			"transport=simson-udp\n" +
+			"context=" + sipContext + "\n" +
+			"disallow=all\n" +
+			"allow=ulaw\nallow=alaw\n" +
+			"direct_media=no\n" +
+			"rtp_symmetric=yes\n" +
+			"rtp_keepalive=2\n" +
+			"force_rport=yes\n" +
+			"rewrite_contact=yes\n" +
+			"identify_by=ip\n" +
+			"ice_support=no\n" +
+			"media_encryption=no\n" +
+			"dtmf_mode=rfc4733\n\n",
+	)
+	noAuthInbound := stringSet(cfg.NoAuthInboundExtensions)
+	if len(noAuthInbound) > 0 {
+		sb.WriteString(
+			"[anonymous]\ntype=endpoint\n" +
+				"transport=simson-udp\n" +
+				"context=from-simson-anonymous\n" +
+				"disallow=all\n" +
+				"allow=ulaw\nallow=alaw\n" +
+				"direct_media=no\n" +
+				"rtp_symmetric=yes\n" +
+				"rtp_keepalive=2\n" +
+				"force_rport=yes\n" +
+				"rewrite_contact=yes\n" +
+				"ice_support=no\n" +
+				"media_encryption=no\n" +
+				"dtmf_mode=rfc4733\n\n",
+		)
+	}
 	sb.WriteString(
 		"[simson-webrtc-ep-tpl](!)\ntype=endpoint\n" +
 			"transport=simson-ws\n" +
@@ -308,6 +348,20 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 		fmt.Fprintf(&sb, "[%s](simson-ep-tpl)\nauth=%s-auth\naors=%s\n\n", endpointID, endpointID, aorName)
 		fmt.Fprintf(&sb, "[%s-auth](simson-auth-tpl)\nusername=%s\npassword=%s\n\n", endpointID, ep.Username, ep.Password)
 		fmt.Fprintf(&sb, "[%s](simson-aor-tpl)\n\n", aorName)
+	}
+
+	trustedGatewayIPs := normalizeIPList(cfg.TrustedGatewayIPs)
+	if len(trustedGatewayIPs) > 0 {
+		aors := gatewayAORList(endpoints)
+		if aors != "" {
+			sb.WriteString("[simson-trusted-gateway-in](simson-gateway-in-tpl)\n")
+			sb.WriteString("aors=" + aors + "\n\n")
+			sb.WriteString("[simson-trusted-gateway-in-identify]\ntype=identify\nendpoint=simson-trusted-gateway-in\n")
+			for _, ip := range trustedGatewayIPs {
+				sb.WriteString("match=" + ip + "\n")
+			}
+			sb.WriteString("\n")
+		}
 	}
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(sb.String()), 0640)
@@ -441,7 +495,7 @@ func localIPForICE() string {
 
 // ---- extensions.conf --------------------------------------------------------
 
-func writeDialplanConf(root, inCtx, nodeCtx, outCtx string) error {
+func writeDialplanConf(root, inCtx, nodeCtx, outCtx string, noAuthInboundExtensions []string) error {
 	dirName := detectSnippetDirName(root, "extensions.conf", []string{"extensions.d", "extensions.conf.d"}, "extensions.d")
 	dir := filepath.Join(root, dirName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -464,6 +518,8 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx string) error {
 	if outCtx == "" {
 		outCtx = "from-simson-out"
 	}
+
+	anonymousRoutes := buildAnonymousInboundDialplan(noAuthInboundExtensions)
 
 	content := fmt.Sprintf(
 		`; Auto-generated by Simson VPS server — do not edit manually.
@@ -512,7 +568,15 @@ exten => _X.,1,NoOp(Simson outbound trunk call ${EXTEN} via ${SIMSON_TRUNK})
 exten => missing-trunk,1,NoOp(Simson outbound trunk call missing SIMSON_TRUNK)
  same  => n,Congestion(5)
  same  => n,Hangup(21)
-`, inCtx, nodeCtx, outCtx, inCtx, nodeCtx, outCtx, outCtx)
+
+[from-simson-anonymous]
+; Locked-down ingress for gateways that cannot digest-auth inbound INVITEs.
+; Only explicitly configured extensions are accepted here.
+%s
+exten => _X.,1,Hangup(21)
+exten => i,1,Hangup(21)
+exten => t,1,Hangup(16)
+`, inCtx, nodeCtx, outCtx, inCtx, nodeCtx, outCtx, outCtx, anonymousRoutes)
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(content), 0640)
 }
@@ -587,6 +651,92 @@ func resolveExternalIPFromDomain(domain string) string {
 		}
 	}
 	return ""
+}
+
+func normalizeIPList(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		ip := strings.TrimSpace(value)
+		if ip == "" {
+			continue
+		}
+		if parsed := net.ParseIP(ip); parsed != nil {
+			if v4 := parsed.To4(); v4 != nil {
+				ip = v4.String()
+			} else {
+				ip = parsed.String()
+			}
+		}
+		if strings.Contains(ip, "/") {
+			ip = strings.TrimSpace(ip)
+		}
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		out = append(out, ip)
+	}
+	return out
+}
+
+func gatewayAORList(endpoints []SIPEndpointDef) string {
+	seen := map[string]struct{}{}
+	aors := []string{}
+	for _, ep := range endpoints {
+		if !ep.Enabled {
+			continue
+		}
+		aor := sanitizeID(ep.Username)
+		if aor == "" {
+			aor = sanitizeID(ep.Extension)
+		}
+		if aor == "" {
+			aor = sanitizeID(ep.ID)
+		}
+		if aor == "" {
+			continue
+		}
+		if _, ok := seen[aor]; ok {
+			continue
+		}
+		seen[aor] = struct{}{}
+		aors = append(aors, aor)
+	}
+	return strings.Join(aors, ",")
+}
+
+func stringSet(values []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = sanitizeID(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		out[value] = struct{}{}
+	}
+	return out
+}
+
+func buildAnonymousInboundDialplan(extensions []string) string {
+	seen := map[string]struct{}{}
+	var sb strings.Builder
+	for _, ext := range extensions {
+		ext = sanitizeID(strings.TrimSpace(ext))
+		if ext == "" {
+			continue
+		}
+		if _, ok := seen[ext]; ok {
+			continue
+		}
+		seen[ext] = struct{}{}
+		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson anonymous gateway call to ${EXTEN} from ${CALLERID(num)})\n", ext)
+		sb.WriteString(" same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})\n")
+		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
+		sb.WriteString(" same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)\n")
+		sb.WriteString(" same  => n,Hangup()\n")
+	}
+	return sb.String()
 }
 
 // sanitizeID strips unsafe characters from an endpoint ID.

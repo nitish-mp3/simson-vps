@@ -97,18 +97,45 @@ func (r *Router) TrackCall(callID, channel string) {
 func (r *Router) UntrackCall(callID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if ch, ok := r.callIDToChan[callID]; ok {
-		delete(r.chanToCallID, ch)
+	for ch, id := range r.chanToCallID {
+		if id == callID {
+			delete(r.chanToCallID, ch)
+		}
 	}
 	delete(r.callIDToChan, callID)
 }
 
 // ChannelForCall returns the Asterisk channel for a Simson call ID.
 func (r *Router) ChannelForCall(callID string) (string, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	ch, ok := r.callIDToChan[callID]
 	return ch, ok
+}
+
+// ChannelsForCall returns every Asterisk channel currently mapped to a Simson call.
+func (r *Router) ChannelsForCall(callID string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	channels := []string{}
+	for ch, id := range r.chanToCallID {
+		if id == callID {
+			channels = append(channels, ch)
+		}
+	}
+	if ch, ok := r.callIDToChan[callID]; ok {
+		found := false
+		for _, existing := range channels {
+			if existing == ch {
+				found = true
+				break
+			}
+		}
+		if !found {
+			channels = append(channels, ch)
+		}
+	}
+	return channels
 }
 
 // CallIDForChannel returns the Simson call ID for an Asterisk channel.
@@ -178,11 +205,17 @@ func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, brid
 // HangupCall hangs up the Asterisk channel mapped to a Simson call ID.
 // Silently succeeds if no channel is tracked.
 func (r *Router) HangupCall(callID string) error {
-	ch, ok := r.ChannelForCall(callID)
-	if !ok {
+	channels := r.ChannelsForCall(callID)
+	if len(channels) == 0 {
 		return nil
 	}
-	return r.ami.HangupChannel(ch)
+	var firstErr error
+	for _, ch := range channels {
+		if err := r.ami.HangupChannel(ch); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // HangupChannel hangs up an Asterisk channel directly by name.

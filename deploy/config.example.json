@@ -22,6 +22,8 @@
     "in_context": "from-simson-sip",
     "node_context": "from-simson-node",
     "out_context": "from-simson-out",
+    "trusted_gateway_ips": [],
+    "no_auth_inbound_extensions": [],
     "sip_webrtc": {
       "enabled": false,
       "username": "webrtc-pool",

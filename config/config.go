@@ -27,18 +27,20 @@ type SIPWebRTCConfig struct {
 
 // AsteriskConfig holds settings for the optional central VPS Asterisk integration.
 type AsteriskConfig struct {
-	Enabled       bool            `json:"enabled"`        // false → AMI disabled
-	Host          string          `json:"host"`           // AMI host (default: 127.0.0.1)
-	Port          int             `json:"port"`           // AMI port  (default: 5038)
-	User          string          `json:"user"`           // AMI user name
-	Secret        string          `json:"secret"`         // AMI password
-	AutoConfigure bool            `json:"auto_configure"` // write pjsip/manager/dialplan conf on start
-	SIPDomain     string          `json:"sip_domain"`     // hostname phones register to
-	ExternalIP    string          `json:"external_ip"`    // VPS public IP for RTP NAT (auto-detected if empty)
-	InContext     string          `json:"in_context"`     // incoming-SIP dialplan context
-	NodeContext   string          `json:"node_context"`   // node-callback dialplan context
-	OutContext    string          `json:"out_context"`    // outbound PSTN/trunk dialplan context
-	SIPWebRTC     SIPWebRTCConfig `json:"sip_webrtc"`     // shared browser SIP endpoint
+	Enabled                 bool            `json:"enabled"`                    // false → AMI disabled
+	Host                    string          `json:"host"`                       // AMI host (default: 127.0.0.1)
+	Port                    int             `json:"port"`                       // AMI port  (default: 5038)
+	User                    string          `json:"user"`                       // AMI user name
+	Secret                  string          `json:"secret"`                     // AMI password
+	AutoConfigure           bool            `json:"auto_configure"`             // write pjsip/manager/dialplan conf on start
+	SIPDomain               string          `json:"sip_domain"`                 // hostname phones register to
+	ExternalIP              string          `json:"external_ip"`                // VPS public IP for RTP NAT (auto-detected if empty)
+	InContext               string          `json:"in_context"`                 // incoming-SIP dialplan context
+	NodeContext             string          `json:"node_context"`               // node-callback dialplan context
+	OutContext              string          `json:"out_context"`                // outbound PSTN/trunk dialplan context
+	TrustedGatewayIPs       []string        `json:"trusted_gateway_ips"`        // trusted SIP gateway public IPs for unauthenticated inbound INVITEs
+	NoAuthInboundExtensions []string        `json:"no_auth_inbound_extensions"` // gateway extensions that cannot digest-auth inbound INVITEs
+	SIPWebRTC               SIPWebRTCConfig `json:"sip_webrtc"`                 // shared browser SIP endpoint
 }
 
 // Config holds all server configuration.
