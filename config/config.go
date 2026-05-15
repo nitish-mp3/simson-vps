@@ -38,6 +38,7 @@ type AsteriskConfig struct {
 	InContext               string          `json:"in_context"`                 // incoming-SIP dialplan context
 	NodeContext             string          `json:"node_context"`               // node-callback dialplan context
 	OutContext              string          `json:"out_context"`                // outbound PSTN/trunk dialplan context
+	DefaultPSTNTrunk        string          `json:"default_pstn_trunk"`         // fallback trunk for outside numbers entered as sip:+E164
 	TrustedGatewayIPs       []string        `json:"trusted_gateway_ips"`        // trusted SIP gateway public IPs for unauthenticated inbound INVITEs
 	NoAuthInboundExtensions []string        `json:"no_auth_inbound_extensions"` // gateway extensions that cannot digest-auth inbound INVITEs
 	SIPWebRTC               SIPWebRTCConfig `json:"sip_webrtc"`                 // shared browser SIP endpoint
@@ -76,12 +77,13 @@ func DefaultConfig() *Config {
 		MaxPayloadBytes:    65536,
 		AdminToken:         "",
 		Asterisk: AsteriskConfig{
-			Enabled:     false,
-			Host:        "127.0.0.1",
-			Port:        5038,
-			InContext:   "from-simson-sip",
-			NodeContext: "from-simson-node",
-			OutContext:  "from-simson-out",
+			Enabled:          false,
+			Host:             "127.0.0.1",
+			Port:             5038,
+			InContext:        "from-simson-sip",
+			NodeContext:      "from-simson-node",
+			OutContext:       "from-simson-out",
+			DefaultPSTNTrunk: "7009",
 			SIPWebRTC: SIPWebRTCConfig{
 				Enabled:  false,
 				Username: "webrtc-pool",

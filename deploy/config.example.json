@@ -22,6 +22,7 @@
     "in_context": "from-simson-sip",
     "node_context": "from-simson-node",
     "out_context": "from-simson-out",
+    "default_pstn_trunk": "7009",
     "trusted_gateway_ips": [],
     "no_auth_inbound_extensions": [],
     "sip_webrtc": {

@@ -835,6 +835,25 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		return
 	}
 
+	// Caller label shown on the phone display.
+	callerID := ""
+	trunk := ""
+	if len(req.Metadata) > 0 {
+		var metaMap map[string]any
+		if err := json.Unmarshal(req.Metadata, &metaMap); err == nil {
+			if v, ok := metaMap["caller_id"]; ok {
+				if s, ok := v.(string); ok {
+					callerID = s
+				}
+			}
+			if v, ok := metaMap["trunk"]; ok {
+				if s, ok := v.(string); ok {
+					trunk = strings.TrimSpace(s)
+				}
+			}
+		}
+	}
+
 	ep, err := s.store.GetSIPEndpointByExtension(ext)
 	if err != nil {
 		s.log.Error("db error looking up SIP endpoint", map[string]any{"err": err.Error()})
@@ -865,6 +884,16 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 	}
 	bridgeID := "bridge-" + strings.TrimPrefix(callID, "call_")
 
+	if ep == nil && trunk == "" && isExternalDialString(ext) {
+		trunk = strings.TrimSpace(s.cfg.Asterisk.DefaultPSTNTrunk)
+		if trunk == "" {
+			trunk = "7009"
+		}
+	}
+	if ep == nil && trunk != "" {
+		ext = digitsOnly(ext)
+	}
+
 	c := &calls.Call{
 		ID:          callID,
 		FromNode:    sess.NodeID,
@@ -878,24 +907,6 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		return
 	}
 
-	// Caller label shown on the phone display.
-	callerID := ""
-	trunk := ""
-	if len(req.Metadata) > 0 {
-		var metaMap map[string]any
-		if err := json.Unmarshal(req.Metadata, &metaMap); err == nil {
-			if v, ok := metaMap["caller_id"]; ok {
-				if s, ok := v.(string); ok {
-					callerID = s
-				}
-			}
-			if v, ok := metaMap["trunk"]; ok {
-				if s, ok := v.(string); ok {
-					trunk = strings.TrimSpace(s)
-				}
-			}
-		}
-	}
 	if callerID == "" {
 		label := sess.NodeID
 		if node, _ := s.store.GetNode(sess.NodeID); node != nil && node.Label != "" {
@@ -1237,6 +1248,14 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 		return
 	}
 	call := s.calls.Get(callID)
+	if call != nil && strings.HasPrefix(channel, "Local/") && (call.State == calls.StateRinging || call.State == calls.StateActive) {
+		// Local channels are helper legs for outbound trunk calls. They can hang
+		// up during normal dial/bridge transitions; the real PJSIP leg owns the
+		// user-visible call lifecycle.
+		s.log.Debug("ignoring outbound helper channel hangup",
+			map[string]any{"call_id": callID, "channel": channel, "state": call.State})
+		return
+	}
 	if call != nil && call.State == calls.StateActive && !call.AnsweredAt.IsZero() {
 		s.log.Debug("SIP channel hangup for active call",
 			map[string]any{"call_id": callID, "channel": channel, "answered_age_ms": time.Since(call.AnsweredAt).Milliseconds()})
@@ -1320,6 +1339,25 @@ func isSafeDialNumber(number string) bool {
 		}
 	}
 	return true
+}
+
+func digitsOnly(value string) string {
+	var b strings.Builder
+	for _, ch := range value {
+		if ch >= '0' && ch <= '9' {
+			b.WriteRune(ch)
+		}
+	}
+	return b.String()
+}
+
+func isExternalDialString(value string) bool {
+	value = strings.TrimSpace(value)
+	digits := digitsOnly(value)
+	if strings.HasPrefix(value, "+") && len(digits) >= 7 {
+		return true
+	}
+	return len(digits) >= 7 && len(digits) <= 15
 }
 
 func isSafeAsteriskName(name string) bool {

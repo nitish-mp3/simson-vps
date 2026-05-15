@@ -178,7 +178,9 @@ func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, brid
 	if outContext == "" {
 		outContext = "from-simson-out"
 	}
-	channel := fmt.Sprintf("Local/%s@%s", number, outContext)
+	// Keep the Local channel from being optimized away before we can track the
+	// real outbound PJSIP leg and bridge/hang it up cleanly.
+	channel := fmt.Sprintf("Local/%s@%s/n", number, outContext)
 	actionID := uuid.NewString()
 
 	r.originateMu.Lock()
@@ -187,7 +189,9 @@ func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, brid
 
 	vars := map[string]string{
 		"SIMSON_CALL_ID":      callID,
+		"__SIMSON_CALL_ID":    callID,
 		"SIMSON_FROM_NODE":    fromNode,
+		"__SIMSON_FROM_NODE":  fromNode,
 		"SIMSON_TRUNK":        trunk,
 		"SIMSON_WAIT_TIMEOUT": fmt.Sprintf("%d", timeoutSec),
 	}

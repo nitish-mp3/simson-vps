@@ -345,7 +345,7 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 			aorName = endpointID
 		}
 
-		fmt.Fprintf(&sb, "[%s](simson-ep-tpl)\nauth=%s-auth\naors=%s\n\n", endpointID, endpointID, aorName)
+		fmt.Fprintf(&sb, "[%s](simson-ep-tpl)\nauth=%s-auth\noutbound_auth=%s-auth\naors=%s\n\n", endpointID, endpointID, endpointID, aorName)
 		fmt.Fprintf(&sb, "[%s-auth](simson-auth-tpl)\nusername=%s\npassword=%s\n\n", endpointID, ep.Username, ep.Password)
 		fmt.Fprintf(&sb, "[%s](simson-aor-tpl)\n\n", aorName)
 	}
@@ -562,12 +562,17 @@ exten => s,1,NoOp(Simson originate leg)
 ; The VPS originates Local/<number>@%s and passes SIMSON_TRUNK.
 exten => _X.,1,NoOp(Simson outbound trunk call ${EXTEN} via ${SIMSON_TRUNK})
  same  => n,GotoIf($["${SIMSON_TRUNK}" = ""]?missing-trunk,1)
- same  => n,Dial(PJSIP/${EXTEN}@${SIMSON_TRUNK},${SIMSON_WAIT_TIMEOUT:=120},rT)
+ same  => n,Dial(PJSIP/${EXTEN}@${SIMSON_TRUNK},${SIMSON_WAIT_TIMEOUT:=120},rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))
  same  => n,Hangup()
 
 exten => missing-trunk,1,NoOp(Simson outbound trunk call missing SIMSON_TRUNK)
  same  => n,Congestion(5)
  same  => n,Hangup(21)
+
+[simson-outbound-mark]
+exten => s,1,NoOp(Mark Simson outbound child channel ${ARG1})
+ same  => n,Set(SIMSON_CALL_ID=${ARG1})
+ same  => n,Return()
 
 [from-simson-anonymous]
 ; Locked-down ingress for gateways that cannot digest-auth inbound INVITEs.
