@@ -1,7 +1,7 @@
 # Simson VPS — Control Plane Server
 
 Signaling-only control plane for the Simson HAOS addon system. Routes commands between Home Assistant instances and Asterisk endpoints over persistent WebSocket connections. **No media flows through this server.**
-
+..
 ## Architecture
 
 ```
