@@ -15,9 +15,9 @@ type Envelope struct {
 	Type      string    `json:"type"`
 	ID        string    `json:"id"`                  // unique message ID (UUID)
 	Timestamp time.Time `json:"ts"`                  // sender wall-clock
-	Nonce     string    `json:"nonce,omitempty"`      // replay prevention
-	Signature string    `json:"signature,omitempty"`  // HMAC-SHA256 hex
-	Payload   any       `json:"payload"`              // type-specific body
+	Nonce     string    `json:"nonce,omitempty"`     // replay prevention
+	Signature string    `json:"signature,omitempty"` // HMAC-SHA256 hex
+	Payload   any       `json:"payload"`             // type-specific body
 }
 
 // --- Auth ---
@@ -53,19 +53,19 @@ type HeartbeatAckPayload struct {
 // --- Call lifecycle ---
 
 type CallRequestPayload struct {
-	CallID       string          `json:"call_id"`
-	FromNodeID   string          `json:"from_node_id"`
-	ToNodeID     string          `json:"to_node_id"`
-	CallType     string          `json:"call_type"` // "voice", "intercom", "sip"
-	Metadata     json.RawMessage `json:"metadata,omitempty"`
+	CallID     string          `json:"call_id"`
+	FromNodeID string          `json:"from_node_id"`
+	ToNodeID   string          `json:"to_node_id"`
+	CallType   string          `json:"call_type"` // "voice", "intercom", "sip"
+	Metadata   json.RawMessage `json:"metadata,omitempty"`
 }
 
 type CallInvitePayload struct {
-	CallID       string          `json:"call_id"`
-	FromNodeID   string          `json:"from_node_id"`
-	FromLabel    string          `json:"from_label"`
-	CallType     string          `json:"call_type"`
-	Metadata     json.RawMessage `json:"metadata,omitempty"`
+	CallID     string          `json:"call_id"`
+	FromNodeID string          `json:"from_node_id"`
+	FromLabel  string          `json:"from_label"`
+	CallType   string          `json:"call_type"`
+	Metadata   json.RawMessage `json:"metadata,omitempty"`
 }
 
 type CallAcceptPayload struct {
@@ -84,6 +84,14 @@ type CallEndPayload struct {
 	CallID string `json:"call_id"`
 	NodeID string `json:"node_id"`
 	Reason string `json:"reason,omitempty"` // "hangup", "timeout", "error"
+}
+
+type CallTransferPayload struct {
+	CallID         string `json:"call_id"`
+	FromNodeID     string `json:"from_node_id"`
+	TargetNodeID   string `json:"target_node_id"`
+	TargetUserID   string `json:"target_user_id,omitempty"`
+	TargetUserName string `json:"target_user_name,omitempty"`
 }
 
 type CallStatusPayload struct {
@@ -105,11 +113,11 @@ type ErrorPayload struct {
 // --- WebRTC signaling ---
 
 type WebRTCSignalPayload struct {
-	CallID       string `json:"call_id"`
-	FromNodeID   string `json:"from_node_id"`
-	ToNodeID     string `json:"to_node_id"`
-	SignalType   string `json:"signal_type"` // "offer", "answer", "ice-candidate"
-	Data         any    `json:"data"`        // SDP or ICE candidate object
+	CallID     string `json:"call_id"`
+	FromNodeID string `json:"from_node_id"`
+	ToNodeID   string `json:"to_node_id"`
+	SignalType string `json:"signal_type"` // "offer", "answer", "ice-candidate"
+	Data       any    `json:"data"`        // SDP or ICE candidate object
 }
 
 // --- User presence ---
@@ -120,8 +128,8 @@ type UserPresenceEntry struct {
 }
 
 type UsersUpdatePayload struct {
-	NodeID string               `json:"node_id"`
-	Users  []UserPresenceEntry  `json:"users"`
+	NodeID string              `json:"node_id"`
+	Users  []UserPresenceEntry `json:"users"`
 }
 
 type UsersQueryPayload struct {
@@ -129,25 +137,26 @@ type UsersQueryPayload struct {
 }
 
 type UsersListPayload struct {
-	NodeID string               `json:"node_id"`
-	Users  []UserPresenceEntry  `json:"users"`
-	Ref    string               `json:"ref,omitempty"` // message ID this responds to
+	NodeID string              `json:"node_id"`
+	Users  []UserPresenceEntry `json:"users"`
+	Ref    string              `json:"ref,omitempty"` // message ID this responds to
 }
 
 // --- Message types ---
 
 const (
-	TypeHello      = "hello"
-	TypeAuthResult = "auth.result"
-	TypeHeartbeat  = "heartbeat"
+	TypeHello        = "hello"
+	TypeAuthResult   = "auth.result"
+	TypeHeartbeat    = "heartbeat"
 	TypeHeartbeatAck = "heartbeat.ack"
 
-	TypeCallRequest = "call.request"
-	TypeCallInvite  = "call.invite"
-	TypeCallAccept  = "call.accept"
-	TypeCallReject  = "call.reject"
-	TypeCallEnd     = "call.end"
-	TypeCallStatus  = "call.status"
+	TypeCallRequest  = "call.request"
+	TypeCallInvite   = "call.invite"
+	TypeCallAccept   = "call.accept"
+	TypeCallReject   = "call.reject"
+	TypeCallEnd      = "call.end"
+	TypeCallTransfer = "call.transfer"
+	TypeCallStatus   = "call.status"
 
 	TypeWebRTCSignal = "webrtc.signal"
 
@@ -161,15 +170,15 @@ const (
 // --- Error codes ---
 
 const (
-	ErrCodeBadRequest     = 4000
-	ErrCodeUnauthorized   = 4001
-	ErrCodeForbidden      = 4003
-	ErrCodeNodeOffline    = 4004
-	ErrCodeRateLimited    = 4029
-	ErrCodeInternal       = 5000
-	ErrCodeNotFound       = 4040
-	ErrCodeCallTimeout    = 4008
-	ErrCodeLimitExceeded  = 4009
+	ErrCodeBadRequest      = 4000
+	ErrCodeUnauthorized    = 4001
+	ErrCodeForbidden       = 4003
+	ErrCodeNodeOffline     = 4004
+	ErrCodeRateLimited     = 4029
+	ErrCodeInternal        = 5000
+	ErrCodeNotFound        = 4040
+	ErrCodeCallTimeout     = 4008
+	ErrCodeLimitExceeded   = 4009
 	ErrCodeVersionMismatch = 4010
 	ErrCodeSIPUnavailable  = 4051 // SIP phone not registered or unreachable
 )

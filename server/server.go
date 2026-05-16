@@ -346,6 +346,8 @@ func (s *Server) readLoop(sess *hub.Session) {
 			s.handleCallReject(sess, env)
 		case protocol.TypeCallEnd:
 			s.handleCallEnd(sess, env)
+		case protocol.TypeCallTransfer:
+			s.handleCallTransfer(sess, env)
 		case protocol.TypeWebRTCSignal:
 			s.handleWebRTCSignal(sess, env)
 		case protocol.TypeUsersUpdate:
@@ -512,7 +514,22 @@ func (s *Server) handleCallAccept(sess *hub.Session, env *protocol.Envelope) {
 	invitedNodes := s.calls.Invitees(payload.CallID)
 	c, ok := s.calls.Accept(payload.CallID, sess.NodeID)
 	if !ok {
-		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found or not ringing")
+		// Active SIP bridge calls may be answered by a transfer target. In that
+		// case the external/SIP leg stays up and only the browser participant
+		// changes.
+		c, previousNode, transferred := s.calls.AcceptTransfer(payload.CallID, sess.NodeID)
+		if !transferred {
+			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found or not ringing")
+			return
+		}
+
+		answeredBy := payload.AnsweredByUserID
+		s.store.WriteAudit(sess.AccountID, sess.NodeID, "call_transfer_accepted", "call="+payload.CallID, sess.RemoteIP)
+		s.log.Info("call transfer accepted", map[string]any{"call_id": payload.CallID, "answered_by": sess.NodeID})
+		s.notifyCallStatusToNode(sess.NodeID, c, string(calls.StateActive), "", answeredBy)
+		if previousNode != "" && previousNode != sess.NodeID {
+			s.notifyCallStatusToNode(previousNode, c, string(calls.StateEnded), "transferred", answeredBy)
+		}
 		return
 	}
 
@@ -572,6 +589,18 @@ func (s *Server) handleCallReject(sess *hub.Session, env *protocol.Envelope) {
 	}
 	if !existing.CanNodeAnswer(sess.NodeID) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "not the call target")
+		return
+	}
+
+	if existing.State == calls.StateActive && sess.NodeID != existing.FromNode && sess.NodeID != existing.ToNode {
+		c, ok := s.calls.RemoveInvitee(payload.CallID, sess.NodeID)
+		if !ok {
+			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found")
+			return
+		}
+		s.store.WriteAudit(sess.AccountID, sess.NodeID, "call_transfer_rejected", "call="+payload.CallID+" reason="+payload.Reason, sess.RemoteIP)
+		s.log.Info("call transfer rejected", map[string]any{"call_id": payload.CallID, "node_id": sess.NodeID})
+		s.notifyCallStatusToNode(sess.NodeID, c, string(calls.StateEnded), "rejected", "")
 		return
 	}
 
@@ -645,6 +674,85 @@ func (s *Server) handleCallEnd(sess *hub.Session, env *protocol.Envelope) {
 	s.log.Info("call ended", map[string]any{"call_id": payload.CallID, "reason": reason})
 
 	s.notifyCallStatus(c)
+}
+
+// --- Call Transfer ---
+
+func (s *Server) handleCallTransfer(sess *hub.Session, env *protocol.Envelope) {
+	payload, err := protocol.DecodePayload[protocol.CallTransferPayload](env)
+	if err != nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "invalid call.transfer payload")
+		return
+	}
+
+	callID := strings.TrimSpace(payload.CallID)
+	targetNodeID := strings.TrimSpace(payload.TargetNodeID)
+	if callID == "" || targetNodeID == "" {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "call_id and target_node_id are required")
+		return
+	}
+	if payload.FromNodeID != "" && payload.FromNodeID != sess.NodeID {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "from_node_id mismatch")
+		return
+	}
+
+	c := s.calls.Get(callID)
+	if c == nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found")
+		return
+	}
+	if c.State != calls.StateActive || c.SIPBridgeID == "" {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "only active SIP/gateway calls can be transferred")
+		return
+	}
+	if c.FromNode != sess.NodeID && c.ToNode != sess.NodeID {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "not a call participant")
+		return
+	}
+
+	targetSess := s.hub.Get(targetNodeID)
+	if targetSess == nil || targetSess.AccountID != sess.AccountID {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNodeOffline, "target node is offline")
+		return
+	}
+	if len(s.calls.ActiveByNode(targetNodeID)) > 0 {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeLimitExceeded, "target node is busy")
+		return
+	}
+	if _, ok := s.calls.AddInvitee(callID, targetNodeID); !ok {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found")
+		return
+	}
+
+	remoteNode := c.FromNode
+	if remoteNode == sess.NodeID {
+		remoteNode = c.ToNode
+	}
+	meta, _ := json.Marshal(map[string]any{
+		"sip_bridge_id":    c.SIPBridgeID,
+		"transfer":         true,
+		"transfer_from":    sess.NodeID,
+		"target_user_id":   strings.TrimSpace(payload.TargetUserID),
+		"target_user_name": strings.TrimSpace(payload.TargetUserName),
+	})
+	invite := protocol.NewEnvelope(protocol.TypeCallInvite, protocol.CallInvitePayload{
+		CallID:     c.ID,
+		FromNodeID: remoteNode,
+		FromLabel:  "Transferred call",
+		CallType:   c.CallType,
+		Metadata:   json.RawMessage(meta),
+	})
+	data, _ := invite.Encode()
+	if err := targetSess.Send(data); err != nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "failed to reach transfer target")
+		return
+	}
+
+	s.store.WriteAudit(sess.AccountID, sess.NodeID, "call_transfer",
+		fmt.Sprintf("call=%s target=%s", callID, targetNodeID), sess.RemoteIP)
+	s.log.Info("call transfer invite sent", map[string]any{
+		"call_id": callID, "from": sess.NodeID, "target": targetNodeID,
+	})
 }
 
 // --- WebRTC Signal Relay ---

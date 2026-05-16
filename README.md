@@ -66,6 +66,7 @@ All messages are JSON envelopes:
 | `call.accept` | Node → Server | Target accepts the call |
 | `call.reject` | Node → Server | Target rejects the call |
 | `call.end` | Node → Server | Either party hangs up |
+| `call.transfer` | Node → Server | Transfer an active SIP/gateway bridge call to another node/user |
 | `call.status` | Server → Node | Status update to both parties |
 | `error` | Server → Node | Error response |
 

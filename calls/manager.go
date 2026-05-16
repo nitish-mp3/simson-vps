@@ -1,6 +1,7 @@
 package calls
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -87,6 +88,67 @@ func (m *Manager) Accept(callID, answeredByNode string) (*Call, bool) {
 	return c, true
 }
 
+// AddInvitee adds a node that may answer an active/ringing call.
+func (m *Manager) AddInvitee(callID, nodeID string) (*Call, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.calls[callID]
+	if !ok || nodeID == "" || c.State == StateEnded || c.State == StateFailed {
+		return nil, false
+	}
+	if c.CanNodeAnswer(nodeID) {
+		return c, true
+	}
+	c.InviteNodes = append(c.InviteNodes, nodeID)
+	return c, true
+}
+
+// RemoveInvitee removes a pending invited node without changing call state.
+func (m *Manager) RemoveInvitee(callID, nodeID string) (*Call, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.calls[callID]
+	if !ok || nodeID == "" {
+		return nil, false
+	}
+	remaining := c.InviteNodes[:0]
+	for _, invited := range c.InviteNodes {
+		if invited != nodeID {
+			remaining = append(remaining, invited)
+		}
+	}
+	c.InviteNodes = remaining
+	return c, true
+}
+
+// AcceptTransfer moves the HA/browser participant of an active SIP bridge call
+// to answeredByNode. It returns the node that should be dismissed locally.
+func (m *Manager) AcceptTransfer(callID, answeredByNode string) (*Call, string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.calls[callID]
+	if !ok || c.State != StateActive || c.SIPBridgeID == "" || !c.CanNodeAnswer(answeredByNode) {
+		return nil, "", false
+	}
+
+	previousNode := c.ToNode
+	if !strings.HasPrefix(strings.ToLower(c.FromNode), "sip:") {
+		previousNode = c.FromNode
+		c.FromNode = answeredByNode
+	} else {
+		c.ToNode = answeredByNode
+	}
+
+	remaining := c.InviteNodes[:0]
+	for _, invited := range c.InviteNodes {
+		if invited != answeredByNode {
+			remaining = append(remaining, invited)
+		}
+	}
+	c.InviteNodes = remaining
+	return c, previousNode, true
+}
+
 // DeclineByNode records that one invited node declined a ringing call.
 // It returns continueRinging=true when other invited nodes can still answer.
 func (m *Manager) DeclineByNode(callID, nodeID, reason string) (*Call, bool, bool) {
@@ -118,7 +180,7 @@ func (m *Manager) DeclineByNode(callID, nodeID, reason string) (*Call, bool, boo
 	}
 
 	switch reason {
-	case "error", "timeout", "phone_unavailable", "originate_failed":
+	case "error", "timeout", "phone_unavailable", "gateway_unavailable", "originate_failed":
 		c.State = StateFailed
 	default:
 		c.State = StateEnded
@@ -140,7 +202,7 @@ func (m *Manager) End(callID, reason string) (*Call, bool) {
 		return c, false
 	}
 	switch reason {
-	case "error", "timeout", "phone_unavailable", "originate_failed":
+	case "error", "timeout", "phone_unavailable", "gateway_unavailable", "originate_failed":
 		c.State = StateFailed
 	default:
 		c.State = StateEnded
