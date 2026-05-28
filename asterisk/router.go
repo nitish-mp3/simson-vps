@@ -36,9 +36,10 @@ type Router struct {
 	OnOriginateResult func(callID string, ok bool, reason string) // async Originate outcome
 
 	// call tracking
-	mu           sync.RWMutex
-	chanToCallID map[string]string // asterisk channel → simson call ID
-	callIDToChan map[string]string // simson call ID  → asterisk channel
+	mu                    sync.RWMutex
+	chanToCallID          map[string]string   // asterisk channel → simson call ID
+	callIDToChan          map[string]string   // simson call ID  → asterisk channel
+	callIDToChannelPrefix map[string][]string // simson call ID → probable ringing channel prefixes
 
 	// async originate tracking
 	originateMu      sync.Mutex
@@ -49,11 +50,12 @@ type Router struct {
 // event handler. The AMI client must not be started yet.
 func NewRouter(ami *AMIClient, log *logging.Logger) *Router {
 	r := &Router{
-		ami:              ami,
-		log:              log,
-		chanToCallID:     make(map[string]string),
-		callIDToChan:     make(map[string]string),
-		actionIDToCallID: make(map[string]string),
+		ami:                   ami,
+		log:                   log,
+		chanToCallID:          make(map[string]string),
+		callIDToChan:          make(map[string]string),
+		callIDToChannelPrefix: make(map[string][]string),
+		actionIDToCallID:      make(map[string]string),
 	}
 	ami.OnEvent(r.onEvent)
 	return r
@@ -93,6 +95,22 @@ func (r *Router) TrackCall(callID, channel string) {
 	r.callIDToChan[callID] = channel
 }
 
+func (r *Router) TrackPendingPrefix(callID, prefix string) {
+	callID = strings.TrimSpace(callID)
+	prefix = normalizeChannel(prefix)
+	if callID == "" || prefix == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, existing := range r.callIDToChannelPrefix[callID] {
+		if existing == prefix {
+			return
+		}
+	}
+	r.callIDToChannelPrefix[callID] = append(r.callIDToChannelPrefix[callID], prefix)
+}
+
 // UntrackCall removes tracking for a Simson call ID.
 func (r *Router) UntrackCall(callID string) {
 	r.mu.Lock()
@@ -103,6 +121,7 @@ func (r *Router) UntrackCall(callID string) {
 		}
 	}
 	delete(r.callIDToChan, callID)
+	delete(r.callIDToChannelPrefix, callID)
 }
 
 // ChannelForCall returns the Asterisk channel for a Simson call ID.
@@ -138,6 +157,15 @@ func (r *Router) ChannelsForCall(callID string) []string {
 	return channels
 }
 
+func (r *Router) PendingPrefixesForCall(callID string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	prefixes := r.callIDToChannelPrefix[callID]
+	out := make([]string, len(prefixes))
+	copy(out, prefixes)
+	return out
+}
+
 // CallIDForChannel returns the Simson call ID for an Asterisk channel.
 func (r *Router) CallIDForChannel(channel string) (string, bool) {
 	channel = normalizeChannel(channel)
@@ -153,6 +181,7 @@ func (r *Router) CallIDForChannel(channel string) (string, bool) {
 func (r *Router) OriginateToExtension(extension, context, bridgeExt, callerID, callID, fromNode string, timeoutSec int) (string, error) {
 	channel := fmt.Sprintf("PJSIP/%s", extension)
 	actionID := uuid.NewString()
+	r.TrackPendingPrefix(callID, channel+"-")
 
 	// Register before sending Originate so very fast OriginateResponse events
 	// (for immediate failures) cannot race ahead of tracking.
@@ -182,6 +211,7 @@ func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, brid
 	// real outbound PJSIP leg and bridge/hang it up cleanly.
 	channel := fmt.Sprintf("Local/%s@%s/n", number, outContext)
 	actionID := uuid.NewString()
+	r.TrackPendingPrefix(callID, fmt.Sprintf("Local/%s@%s-", number, outContext))
 
 	r.originateMu.Lock()
 	r.actionIDToCallID[actionID] = callID
@@ -209,17 +239,121 @@ func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, brid
 // HangupCall hangs up the Asterisk channel mapped to a Simson call ID.
 // Silently succeeds if no channel is tracked.
 func (r *Router) HangupCall(callID string) error {
+	return r.hangupCall(callID, "")
+}
+
+// HangupCallExcept hangs up all channels for a Simson call except the supplied
+// channel. This is useful from hangup callbacks where Asterisk already removed
+// the channel that emitted the event.
+func (r *Router) HangupCallExcept(callID, exceptChannel string) error {
+	return r.hangupCall(callID, exceptChannel)
+}
+
+func (r *Router) hangupCall(callID, exceptChannel string) error {
+	exceptChannel = normalizeChannel(exceptChannel)
 	channels := r.ChannelsForCall(callID)
+	for _, ch := range r.channelsWithCallID(callID) {
+		found := false
+		for _, existing := range channels {
+			if existing == ch {
+				found = true
+				break
+			}
+		}
+		if !found {
+			channels = append(channels, ch)
+		}
+	}
+	for _, ch := range r.channelsWithPendingPrefixes(callID) {
+		found := false
+		for _, existing := range channels {
+			if existing == ch {
+				found = true
+				break
+			}
+		}
+		if !found {
+			channels = append(channels, ch)
+		}
+	}
 	if len(channels) == 0 {
 		return nil
 	}
 	var firstErr error
 	for _, ch := range channels {
+		if exceptChannel != "" && normalizeChannel(ch) == exceptChannel {
+			continue
+		}
 		if err := r.ami.HangupChannel(ch); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
+}
+
+func (r *Router) channelsWithCallID(callID string) []string {
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return nil
+	}
+	out, err := r.ami.RunCommand("core show channels concise")
+	if err != nil {
+		r.log.Warn("could not inspect channels for call cleanup",
+			map[string]any{"call_id": callID, "err": err.Error()})
+		return nil
+	}
+
+	var channels []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, callID) {
+			continue
+		}
+		parts := strings.Split(line, "!")
+		if len(parts) == 0 {
+			continue
+		}
+		if ch := normalizeChannel(parts[0]); ch != "" {
+			channels = append(channels, ch)
+		}
+	}
+	return channels
+}
+
+func (r *Router) channelsWithPendingPrefixes(callID string) []string {
+	prefixes := r.PendingPrefixesForCall(callID)
+	if len(prefixes) == 0 {
+		return nil
+	}
+	out, err := r.ami.RunCommand("core show channels concise")
+	if err != nil {
+		r.log.Warn("could not inspect channels for pending call cleanup",
+			map[string]any{"call_id": callID, "err": err.Error()})
+		return nil
+	}
+
+	var channels []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "!")
+		if len(parts) == 0 {
+			continue
+		}
+		ch := normalizeChannel(parts[0])
+		if ch == "" {
+			continue
+		}
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(ch, prefix) {
+				channels = append(channels, ch)
+				break
+			}
+		}
+	}
+	return channels
 }
 
 // HangupChannel hangs up an Asterisk channel directly by name.
@@ -410,6 +544,13 @@ func normalizeChannel(channel string) string {
 func (r *Router) findCallByChannelLocked(channel string) (callID string, trackedChannel string, ok bool) {
 	if id, found := r.chanToCallID[channel]; found {
 		return id, channel, true
+	}
+
+	// PJSIP channel names are unique call legs. Falling back to a base key like
+	// PJSIP/anonymous would collapse unrelated gateway retries/legs into the
+	// active call and can end the real call when a duplicate leg hangs up.
+	if strings.HasPrefix(channel, "PJSIP/") {
+		return "", "", false
 	}
 
 	base := channelBaseKey(channel)

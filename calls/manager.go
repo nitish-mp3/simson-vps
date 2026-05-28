@@ -25,6 +25,7 @@ type Call struct {
 	AccountID   string
 	CallType    string
 	SIPBridgeID string
+	CallerID    string
 	State       State
 	CreatedAt   time.Time
 	AnsweredAt  time.Time
