@@ -701,12 +701,17 @@ func (s *Server) handleCallTransfer(sess *hub.Session, env *protocol.Envelope) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found")
 		return
 	}
-	if c.State != calls.StateActive || c.SIPBridgeID == "" {
-		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "only active SIP/gateway calls can be transferred")
+	if (c.State != calls.StateActive && c.State != calls.StateRinging) || c.SIPBridgeID == "" {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "only active/ringing SIP gateway calls can be transferred")
 		return
 	}
 	if c.FromNode != sess.NodeID && c.ToNode != sess.NodeID {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "not a call participant")
+		return
+	}
+
+	if strings.HasPrefix(strings.ToLower(targetNodeID), "sip:") {
+		s.handleSIPBridgeTransfer(sess, env, c, strings.TrimPrefix(targetNodeID, "sip:"))
 		return
 	}
 
@@ -752,6 +757,68 @@ func (s *Server) handleCallTransfer(sess *hub.Session, env *protocol.Envelope) {
 		fmt.Sprintf("call=%s target=%s", callID, targetNodeID), sess.RemoteIP)
 	s.log.Info("call transfer invite sent", map[string]any{
 		"call_id": callID, "from": sess.NodeID, "target": targetNodeID,
+	})
+}
+
+func (s *Server) handleSIPBridgeTransfer(sess *hub.Session, env *protocol.Envelope, c *calls.Call, ext string) {
+	if s.asterisk == nil || !s.asterisk.Connected() {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "central Asterisk AMI is not connected")
+		return
+	}
+
+	ext = strings.TrimSpace(ext)
+	if ext == "" || isExternalDialString(ext) || !isLikelyInternalExtension(ext) {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "invalid SIP extension transfer target")
+		return
+	}
+
+	ep, err := s.store.GetSIPEndpointByExtension(ext)
+	if err != nil {
+		s.log.Error("db error looking up transfer SIP endpoint", map[string]any{"err": err.Error(), "ext": ext})
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "internal error")
+		return
+	}
+	if ep == nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "SIP extension not found: "+ext)
+		return
+	}
+	if ep.AccountID != sess.AccountID {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "SIP extension belongs to a different account")
+		return
+	}
+	if !ep.Enabled {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "SIP extension is disabled")
+		return
+	}
+	if !s.asterisk.EndpointHasContacts(ext) {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeSIPUnavailable,
+			fmt.Sprintf("SIP phone %q is not registered. Check the phone's SIP account settings.", ext))
+		return
+	}
+
+	callerID := fmt.Sprintf("\"Transferred call\" <%s>", ext)
+	if node, _ := s.store.GetNode(sess.NodeID); node != nil && node.Label != "" {
+		callerID = fmt.Sprintf("\"%s\" <100>", node.Label)
+	}
+
+	_, err = s.asterisk.OriginateToExtension(
+		ext,
+		s.cfg.Asterisk.NodeContext,
+		c.SIPBridgeID,
+		callerID,
+		c.ID,
+		sess.NodeID,
+		s.cfg.CallTimeoutSec,
+	)
+	if err != nil {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "AMI originate failed: "+err.Error())
+		return
+	}
+
+	s.store.WriteAudit(sess.AccountID, sess.NodeID, "sip_bridge_transfer",
+		fmt.Sprintf("call=%s ext=%s", c.ID, ext), sess.RemoteIP)
+	s.log.Info("SIP bridge transfer originated", map[string]any{
+		"call_id": c.ID, "from": sess.NodeID, "ext": ext,
 	})
 }
 
@@ -1394,8 +1461,15 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 	} else {
 		// Map Asterisk reason code to a descriptive end reason.
 		endReason := "no_answer"
-		if c := s.calls.Get(callID); c != nil && isExternalDialString(strings.TrimPrefix(c.ToNode, "sip:")) {
-			endReason = "gateway_unavailable"
+		if c := s.calls.Get(callID); c != nil {
+			if strings.HasPrefix(strings.ToLower(c.FromNode), "sip:") && c.State == calls.StateRinging {
+				s.log.Info("SIP bridge add-on leg did not answer; keeping original incoming call alive",
+					map[string]any{"call_id": callID, "reason": reason})
+				return
+			}
+			if isExternalDialString(strings.TrimPrefix(c.ToNode, "sip:")) {
+				endReason = "gateway_unavailable"
+			}
 		}
 		switch reason {
 		case "4", "17":
