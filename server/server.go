@@ -1372,6 +1372,10 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 	if !ok {
 		return
 	}
+	if err := s.asterisk.HangupCall(callID); err != nil {
+		s.log.Warn("failed to hang up remaining SIP bridge legs",
+			map[string]any{"call_id": callID, "channel": channel, "err": err.Error()})
+	}
 	s.asterisk.UntrackCall(callID)
 	s.log.Info("SIP call ended by channel hangup", map[string]any{"call_id": callID, "channel": channel})
 	s.notifyCallStatus(c)
