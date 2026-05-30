@@ -580,6 +580,14 @@ exten => s,1,NoOp(Simson originate leg)
  same  => n,Wait(${SIMSON_WAIT_TIMEOUT:=120})
  same  => n,Hangup()
 
+[from-simson-extension]
+; VPS-originated calls/transfers to onsite SIP phones.
+; The Local channel answers only when the SIP phone answers, then AMI places
+; that Local leg into the requested Simson ConfBridge room.
+exten => _X.,1,NoOp(Simson dial SIP endpoint ${EXTEN})
+ same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=120},rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))
+ same  => n,Hangup()
+
 [%s]
 ; Configured outbound landline/PSTN targets.
 ; The VPS originates Local/<number>@%s and passes SIMSON_TRUNK.

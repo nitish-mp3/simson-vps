@@ -179,9 +179,10 @@ func (r *Router) CallIDForChannel(channel string) (string, bool) {
 // bridgeExt is the extension in nodeCtx that answered SIP legs are sent to.
 // Returns the AMI ActionID that can be used to match the async OriginateResponse event.
 func (r *Router) OriginateToExtension(extension, context, bridgeExt, callerID, callID, fromNode string, timeoutSec int) (string, error) {
-	channel := fmt.Sprintf("PJSIP/%s", extension)
+	channel := fmt.Sprintf("Local/%s@from-simson-extension/n", extension)
 	actionID := uuid.NewString()
-	r.TrackPendingPrefix(callID, channel+"-")
+	r.TrackPendingPrefix(callID, fmt.Sprintf("Local/%s@from-simson-extension-", extension))
+	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", extension))
 
 	// Register before sending Originate so very fast OriginateResponse events
 	// (for immediate failures) cannot race ahead of tracking.
@@ -189,7 +190,14 @@ func (r *Router) OriginateToExtension(extension, context, bridgeExt, callerID, c
 	r.actionIDToCallID[actionID] = callID
 	r.originateMu.Unlock()
 
-	_, err := r.ami.OriginateWithActionID(channel, context, bridgeExt, callerID, callID, fromNode, timeoutSec*1000, actionID)
+	vars := map[string]string{
+		"SIMSON_CALL_ID":      callID,
+		"__SIMSON_CALL_ID":    callID,
+		"SIMSON_FROM_NODE":    fromNode,
+		"__SIMSON_FROM_NODE":  fromNode,
+		"SIMSON_WAIT_TIMEOUT": fmt.Sprintf("%d", timeoutSec),
+	}
+	_, err := r.ami.OriginateWithVars(channel, context, bridgeExt, callerID, timeoutSec*1000, actionID, vars)
 	if err != nil {
 		r.originateMu.Lock()
 		delete(r.actionIDToCallID, actionID)
