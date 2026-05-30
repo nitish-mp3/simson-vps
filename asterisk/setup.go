@@ -221,11 +221,23 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 	sb.WriteString("\n")
 
 	// ── Global settings ──────────────────────────────────────────────────────
+	trustedGatewayIPs := normalizeIPList(cfg.TrustedGatewayIPs)
+	noAuthInbound := stringSet(cfg.NoAuthInboundExtensions)
+	enableAnonymousIngress := len(noAuthInbound) > 0 && len(trustedGatewayIPs) == 0
+
 	// Prefer username matching first so registered phones authenticate normally.
-	// Unmatched INVITEs can fall through to the locked-down anonymous context
-	// below; we intentionally avoid IP identification because gateways behind the
-	// same NAT can otherwise hijack REGISTER requests for unrelated accounts.
-	sb.WriteString("[global]\ntype=global\nmax_initial_qualify_time=60\nendpoint_identifier_order=username,anonymous\n\n")
+	// Trusted gateway IP matching handles Synway-style inbound INVITEs that
+	// cannot digest-auth. Only fall back to anonymous when no trusted gateway IP
+	// is configured, because public anonymous REGISTER floods otherwise spam
+	// Asterisk and waste SIP worker time.
+	endpointOrder := "username"
+	if len(trustedGatewayIPs) > 0 {
+		endpointOrder += ",ip"
+	}
+	if enableAnonymousIngress {
+		endpointOrder += ",anonymous"
+	}
+	sb.WriteString("[global]\ntype=global\nmax_initial_qualify_time=60\nendpoint_identifier_order=" + endpointOrder + "\n\n")
 
 	// ── Endpoint template (shared settings for all Simson phones) ─────────────
 	sipContext := cfg.InContext
@@ -265,8 +277,7 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 			"media_encryption=no\n" +
 			"dtmf_mode=rfc4733\n\n",
 	)
-	noAuthInbound := stringSet(cfg.NoAuthInboundExtensions)
-	if len(noAuthInbound) > 0 {
+	if enableAnonymousIngress {
 		sb.WriteString(
 			"[anonymous]\ntype=endpoint\n" +
 				"transport=simson-udp\n" +
@@ -361,7 +372,6 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 		fmt.Fprintf(&sb, "[%s](simson-aor-tpl)\n\n", aorName)
 	}
 
-	trustedGatewayIPs := normalizeIPList(cfg.TrustedGatewayIPs)
 	if len(trustedGatewayIPs) > 0 {
 		aors := gatewayAORList(endpoints)
 		if aors != "" {

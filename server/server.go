@@ -1099,6 +1099,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 	}
 	if ep == nil && trunk != "" {
 		rawDigits := digitsOnly(ext)
+		rawDigits = stripOutboundTrunkPrefix(rawDigits, trunk)
 		ext = normalizePSTNDigits(rawDigits, trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
 		dialCandidates = outboundGatewayDialCandidates(rawDigits, ext)
 	}
@@ -1427,7 +1428,7 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 	// Desk/SIP phones should control the PSTN dial string. Do not apply the
 	// HAOS-card trunk normalization here as the first attempt. Keep alternates
 	// ready so callback formats can recover from gateway/operator differences.
-	number := digitsOnly(in.Extension)
+	number := stripOutboundTrunkPrefix(digitsOnly(in.Extension), trunk)
 	numbers := sipOutboundDialCandidates(number)
 	if len(numbers) == 0 || !isSafeDialNumber(numbers[0]) || !isSafeAsteriskName(trunk) {
 		s.log.Warn("rejecting unsafe SIP-phone outbound gateway dial",
@@ -1659,6 +1660,14 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 			map[string]any{"call_id": callID, "channel": channel, "state": call.State})
 		return
 	}
+	if call != nil && s.isInboundSIPBridgeCall(call) && s.isSecondarySIPEndpointChannel(channel, call) {
+		// A routed SIP desk-phone leg can fail or be cancelled after the HAOS
+		// browser has already answered. That leg must not tear down the original
+		// gateway caller, otherwise answered calls drop within a second.
+		s.log.Info("secondary SIP bridge leg hung up; keeping original incoming call alive",
+			map[string]any{"call_id": callID, "channel": channel, "state": call.State})
+		return
+	}
 	if call != nil && call.State == calls.StateRinging && s.isOutboundGatewayCall(call) && strings.HasPrefix(channel, "PJSIP/") {
 		callerExt := strings.TrimPrefix(call.FromNode, "sip:")
 		trunk := strings.TrimSpace(s.cfg.Asterisk.DefaultPSTNTrunk)
@@ -1721,11 +1730,9 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 					return
 				}
 			}
-			if strings.HasPrefix(strings.ToLower(c.FromNode), "sip:") &&
-				!strings.HasPrefix(strings.ToLower(c.ToNode), "sip:") &&
-				c.State == calls.StateRinging {
+			if s.isInboundSIPBridgeCall(c) {
 				s.log.Info("SIP bridge add-on leg did not answer; keeping original incoming call alive",
-					map[string]any{"call_id": callID, "reason": reason})
+					map[string]any{"call_id": callID, "reason": reason, "state": c.State})
 				return
 			}
 			if isExternalDialString(strings.TrimPrefix(c.ToNode, "sip:")) {
@@ -1819,6 +1826,34 @@ func (s *Server) isOutboundGatewayCall(c *calls.Call) bool {
 	return isExternalDialString(to)
 }
 
+func (s *Server) isInboundSIPBridgeCall(c *calls.Call) bool {
+	if c == nil || c.CallType != "sip" || c.SIPBridgeID == "" {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(c.FromNode), "sip:") &&
+		!strings.HasPrefix(strings.ToLower(c.ToNode), "sip:")
+}
+
+func (s *Server) isSecondarySIPEndpointChannel(channel string, c *calls.Call) bool {
+	endpoint := extractEndpointFromChannel(channel)
+	if endpoint == "" || c == nil {
+		return false
+	}
+
+	lowerEndpoint := strings.ToLower(endpoint)
+	if lowerEndpoint == "anonymous" || lowerEndpoint == "simson-trusted-gateway-in" || lowerEndpoint == "webrtc-pool" {
+		return false
+	}
+
+	sourceExt := strings.TrimPrefix(strings.ToLower(c.FromNode), "sip:")
+	if sourceExt != "" && lowerEndpoint == sourceExt {
+		return false
+	}
+
+	ep, err := s.store.GetSIPEndpointByExtension(endpoint)
+	return err == nil && ep != nil
+}
+
 func digitsOnly(value string) string {
 	var b strings.Builder
 	for _, ch := range value {
@@ -1891,6 +1926,19 @@ func outboundGatewayDialCandidates(rawDigits, preferred string) []string {
 		add(v)
 	}
 	return candidates
+}
+
+func stripOutboundTrunkPrefix(digits, trunk string) string {
+	digits = digitsOnly(digits)
+	trunk = digitsOnly(trunk)
+	if digits == "" || trunk == "" || !strings.HasPrefix(digits, trunk) {
+		return digits
+	}
+	rest := strings.TrimPrefix(digits, trunk)
+	if len(rest) >= 7 && len(rest) <= 15 {
+		return rest
+	}
+	return digits
 }
 
 func normalizePSTNDigits(digits, trunk, defaultTrunk string) string {
