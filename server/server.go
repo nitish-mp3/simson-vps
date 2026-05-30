@@ -1932,11 +1932,41 @@ func stripOutboundTrunkPrefix(digits, trunk string) string {
 	digits = digitsOnly(digits)
 	trunk = digitsOnly(trunk)
 	if digits == "" || trunk == "" || !strings.HasPrefix(digits, trunk) {
-		return digits
+		return stripCommonDialAccessPrefix(digits)
 	}
 	rest := strings.TrimPrefix(digits, trunk)
 	if len(rest) >= 7 && len(rest) <= 15 {
-		return rest
+		return stripCommonDialAccessPrefix(rest)
+	}
+	return stripCommonDialAccessPrefix(digits)
+}
+
+func stripCommonDialAccessPrefix(digits string) string {
+	digits = digitsOnly(digits)
+	if len(digits) == 11 && strings.HasPrefix(digits, "0") {
+		return digits[1:]
+	}
+	if len(digits) == 13 && strings.HasPrefix(digits, "091") {
+		return digits[1:]
+	}
+	if len(digits) > 11 && strings.HasPrefix(digits, "00") {
+		rest := digits[2:]
+		if len(rest) >= 7 && len(rest) <= 15 {
+			return rest
+		}
+	}
+	// Many PBX handsets use a single outside-line access digit. Keep this
+	// conservative so normal E.164/country-code numbers are not mangled.
+	for _, prefix := range []string{"9", "8", "6"} {
+		if len(digits) == 12 && strings.HasPrefix(digits, "91") {
+			break
+		}
+		if strings.HasPrefix(digits, prefix) {
+			rest := digits[1:]
+			if len(rest) >= 10 && len(rest) <= 12 {
+				return stripCommonDialAccessPrefix(rest)
+			}
+		}
 	}
 	return digits
 }

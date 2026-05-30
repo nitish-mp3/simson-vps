@@ -257,10 +257,12 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 			"identify_by=auth_username,username\n" +
 			"ice_support=no\n" +
 			"media_encryption=no\n" +
-			"dtmf_mode=rfc4733\n\n",
+			"dtmf_mode=rfc4733\n" +
+			"timers=no\n" +
+			"100rel=no\n\n",
 	)
 	sb.WriteString("[simson-auth-tpl](!)\ntype=auth\nauth_type=userpass\n\n")
-	sb.WriteString("[simson-aor-tpl](!)\ntype=aor\nmax_contacts=2\nremove_existing=yes\nqualify_frequency=0\n\n")
+	sb.WriteString("[simson-aor-tpl](!)\ntype=aor\nmax_contacts=1\nremove_existing=yes\nqualify_frequency=30\n\n")
 	sb.WriteString(
 		"[simson-gateway-in-tpl](!)\ntype=endpoint\n" +
 			"transport=simson-udp\n" +
