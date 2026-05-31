@@ -8,13 +8,13 @@
 #
 # Examples:
 #   # Use a pre-built binary from GitHub Releases (fast — seconds, not minutes):
-#   ./deploy.sh simson-vps.niti.life "" https://github.com/nitish-mp3/simson-vps.git v1.0.0
+#   ./deploy.sh simson-vps.vipsy.in "" https://github.com/nitish-mp3/simson-vps.git v1.0.0
 #
 #   # Auto-detect latest release:
-#   ./deploy.sh simson-vps.niti.life "" https://github.com/nitish-mp3/simson-vps.git
+#   ./deploy.sh simson-vps.vipsy.in "" https://github.com/nitish-mp3/simson-vps.git
 #
 #   # Build from source (slow — 10-20 min due to sqlite compilation):
-#   SIMSON_BUILD_FROM_SOURCE=1 ./deploy.sh simson-vps.niti.life "" https://github.com/nitish-mp3/simson-vps.git
+#   SIMSON_BUILD_FROM_SOURCE=1 ./deploy.sh simson-vps.vipsy.in "" https://github.com/nitish-mp3/simson-vps.git
 #
 set -euo pipefail
 

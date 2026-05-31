@@ -124,13 +124,13 @@ scp deploy/deploy.sh root@your-vps:/opt/simson/
 ssh root@your-vps
 cd /opt/simson
 chmod +x deploy.sh
-./deploy.sh simson-vps.niti.life
+./deploy.sh simson-vps.vipsy.in
 ```
 
 ### 3. Create Your First Account & Node
 
 ```bash
-DOMAIN="simson-vps.niti.life"
+DOMAIN="simson-vps.vipsy.in"
 TOKEN="the-admin-token-from-deploy-output"
 
 # Create account

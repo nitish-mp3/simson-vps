@@ -17,7 +17,7 @@
     "user": "simson",
     "secret": "changeme",
     "auto_configure": true,
-    "sip_domain": "simson-vps.niti.life",
+    "sip_domain": "simson-vps.vipsy.in",
     "external_ip": "",
     "in_context": "from-simson-sip",
     "node_context": "from-simson-node",
@@ -39,7 +39,7 @@
       "stun:stun1.l.google.com:19302"
     ],
     "turn_enabled": false,
-    "turn_urls": ["turn:simson-vps.niti.life:3478"],
+    "turn_urls": ["turn:simson-vps.vipsy.in:3478"],
     "turn_username": "simson",
     "turn_secret": ""
   }

@@ -4,7 +4,7 @@
 	}
 }
 
-simson-vps.niti.life {
+simson-vps.vipsy.in {
 	# Simson control-plane WebSocket
 	handle /ws {
 		reverse_proxy localhost:8080
@@ -27,7 +27,7 @@ simson-vps.niti.life {
 
 	# Asterisk SIP-over-WebSocket for browser SIP.js clients.
 	# Caddy provides valid TLS; Asterisk listens plain WS on port 8088.
-	# Browsers connect to wss://simson-vps.niti.life/sip/ws
+	# Browsers connect to wss://simson-vps.vipsy.in/sip/ws
 	# Strip the /sip prefix so Asterisk sees /ws (its registered endpoint).
 	handle /sip/ws* {
 		uri strip_prefix /sip

@@ -8,7 +8,7 @@ param(
     
     [hashtable]$Params = @{},
     
-    [string]$VpsUrl = "https://simson-vps.niti.life",
+    [string]$VpsUrl = "https://simson-vps.vipsy.in",
     [string]$AdminToken = $env:SIMSON_ADMIN_TOKEN
 )
 

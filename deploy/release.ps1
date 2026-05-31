@@ -82,7 +82,7 @@ $releaseArgs = @(
     $OutBin,
     "--repo", $Repo,
     "--title", "Simson VPS $Tag",
-    "--notes", "Control plane release $Tag.`n`nDeploy:`n``````bash`n./deploy.sh simson-vps.niti.life `"`" https://github.com/$Repo.git $Tag`n``````"
+    "--notes", "Control plane release $Tag.`n`nDeploy:`n``````bash`n./deploy.sh simson-vps.vipsy.in `"`" https://github.com/$Repo.git $Tag`n``````"
 )
 if ($DraftRelease) {
     $releaseArgs += "--draft"
@@ -93,6 +93,6 @@ Write-Host ""
 Write-Host "=== Release complete! ===" -ForegroundColor Green
 Write-Host ""
 Write-Host "Deploy to VPS:" -ForegroundColor Cyan
-Write-Host "  ./deploy.sh simson-vps.niti.life `"`" https://github.com/$Repo.git $Tag"
+Write-Host "  ./deploy.sh simson-vps.vipsy.in `"`" https://github.com/$Repo.git $Tag"
 Write-Host ""
 Write-Host "The deploy script will download the binary directly - no compilation on VPS."
