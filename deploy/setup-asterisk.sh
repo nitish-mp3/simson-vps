@@ -5,6 +5,7 @@
 # Installs and configures:
 #   • Asterisk 20 LTS  (SIP + WebSocket for phones / browser)
 #   • coturn           (STUN + TURN — fixes audio with symmetric NAT / HTTPS)
+#   • fail2ban         (rate-limits unauthenticated public SIP scanners)
 #
 # Run as root (sudo) on a fresh Ubuntu/Debian VPS BEFORE starting
 # simson-server for the first time.
@@ -61,7 +62,8 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     asterisk-modules \
     asterisk-config \
     asterisk-core-sounds-en \
-    coturn
+    coturn \
+    fail2ban
 
 # ── Generate credentials ─────────────────────────────────────
 section "Generating credentials"
@@ -202,6 +204,33 @@ LREOF
 sed -i 's/^messages => .*/messages => warning,error/; s/^full => .*/full => warning,error/' \
     /etc/asterisk/logger.conf 2>/dev/null || true
 asterisk -rx "logger reload" >/dev/null 2>&1 || true
+
+# Public SIP ports are required for independently deployed homes and gateways,
+# but they attract constant credential scanners. Asterisk rejection notices are
+# emitted through journald, so use the systemd backend instead of the reduced
+# on-disk warning/error log configured above.
+cat > /etc/fail2ban/filter.d/simson-asterisk.conf <<'F2BFILTER'
+[Definition]
+failregex = ^.*log_failed_request.*failed for '<HOST>:[0-9]+'.* - (?:No matching endpoint found|Failed to authenticate)\s*$
+ignoreregex =
+journalmatch = _SYSTEMD_UNIT=asterisk.service
+F2BFILTER
+
+cat > /etc/fail2ban/jail.d/simson-asterisk.local <<'F2BJAIL'
+[asterisk]
+enabled = true
+port = 5060,5061,15060
+protocol = all
+filter = simson-asterisk
+backend = systemd
+maxretry = 8
+findtime = 10m
+bantime = 1h
+F2BJAIL
+
+systemctl enable fail2ban
+systemctl restart fail2ban
+info "fail2ban SIP scanner jail enabled"
 
 # Ensure minimal manager.conf if missing
 MANAGER_CONF=/etc/asterisk/manager.conf

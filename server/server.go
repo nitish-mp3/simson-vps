@@ -41,6 +41,12 @@ type Server struct {
 
 	sipOutboundMu      sync.Mutex
 	sipOutboundRetries map[string]*sipOutboundRetry
+
+	// sipBridgeTransfers makes SIP bridge handoffs idempotent. A reconnect,
+	// duplicated addon timer, or replayed authenticated WSS message must never
+	// originate a second desk-phone leg for the same live bridge.
+	sipBridgeTransfersMu sync.Mutex
+	sipBridgeTransfers   map[string]time.Time
 }
 
 type sipOutboundRetry struct {
@@ -64,6 +70,7 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 		log:                log,
 		recentSIPInvites:   make(map[string]time.Time),
 		sipOutboundRetries: make(map[string]*sipOutboundRetry),
+		sipBridgeTransfers: make(map[string]time.Time),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -824,6 +831,11 @@ func (s *Server) handleSIPBridgeTransfer(sess *hub.Session, env *protocol.Envelo
 			fmt.Sprintf("SIP phone %q is not registered. Check the phone's SIP account settings.", ext))
 		return
 	}
+	if !s.reserveSIPBridgeTransfer(c.SIPBridgeID, ext) {
+		s.log.Warn("suppressing duplicate SIP bridge transfer",
+			map[string]any{"call_id": c.ID, "bridge": c.SIPBridgeID, "ext": ext, "node_id": sess.NodeID})
+		return
+	}
 
 	callerID := formatSIPCallerID("Transferred call", ext)
 	if strings.TrimSpace(c.CallerID) != "" {
@@ -842,6 +854,7 @@ func (s *Server) handleSIPBridgeTransfer(sess *hub.Session, env *protocol.Envelo
 		s.cfg.CallTimeoutSec,
 	)
 	if err != nil {
+		s.releaseSIPBridgeTransfer(c.SIPBridgeID, ext)
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "AMI originate failed: "+err.Error())
 		return
 	}
@@ -851,6 +864,43 @@ func (s *Server) handleSIPBridgeTransfer(sess *hub.Session, env *protocol.Envelo
 	s.log.Info("SIP bridge transfer originated", map[string]any{
 		"call_id": c.ID, "from": sess.NodeID, "ext": ext,
 	})
+}
+
+func (s *Server) reserveSIPBridgeTransfer(bridgeID, ext string) bool {
+	bridgeID = strings.TrimSpace(bridgeID)
+	ext = strings.TrimSpace(ext)
+	if bridgeID == "" || ext == "" {
+		return false
+	}
+
+	now := time.Now().UTC()
+	key := strings.ToLower(bridgeID + "|" + ext)
+
+	s.sipBridgeTransfersMu.Lock()
+	defer s.sipBridgeTransfersMu.Unlock()
+
+	// Bridge IDs are unique per call. Opportunistic cleanup keeps the replay
+	// guard bounded without allowing a long-running call to ring repeatedly.
+	for existing, createdAt := range s.sipBridgeTransfers {
+		if now.Sub(createdAt) > 24*time.Hour {
+			delete(s.sipBridgeTransfers, existing)
+		}
+	}
+	if _, exists := s.sipBridgeTransfers[key]; exists {
+		return false
+	}
+	s.sipBridgeTransfers[key] = now
+	return true
+}
+
+func (s *Server) releaseSIPBridgeTransfer(bridgeID, ext string) {
+	key := strings.ToLower(strings.TrimSpace(bridgeID) + "|" + strings.TrimSpace(ext))
+	if key == "|" {
+		return
+	}
+	s.sipBridgeTransfersMu.Lock()
+	delete(s.sipBridgeTransfers, key)
+	s.sipBridgeTransfersMu.Unlock()
 }
 
 // --- WebRTC Signal Relay ---
