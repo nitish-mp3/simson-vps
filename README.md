@@ -102,6 +102,19 @@ Caller Node          VPS               Target Node
 - **Systemd hardening** — `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`
 - **Payload size limits** — configurable max message size
 
+## Door Camera SIP Bridge
+
+Face-recognition mismatch automations use `POST /node/door-events`. The onsite
+addon authenticates with its account ID, node ID, and install token. The VPS
+accepts only registered SIP endpoints owned by that same account, rate-limits
+repeat events, and rejects endpoints that have not explicitly enabled H.264
+video support.
+
+The outdoor station must auto-answer callback calls and expose its camera media
+on that answered SIP leg. Simson then rings the configured indoor SIP phone
+through a native `Dial` bridge so compatible devices negotiate live audio and
+H.264 video without changing the existing browser or gateway audio paths.
+
 ## Quick Start
 
 ### 1. Build

@@ -47,6 +47,9 @@ type Server struct {
 	// originate a second desk-phone leg for the same live bridge.
 	sipBridgeTransfersMu sync.Mutex
 	sipBridgeTransfers   map[string]time.Time
+
+	doorEventMu   sync.Mutex
+	doorEventLast map[string]time.Time
 }
 
 type sipOutboundRetry struct {
@@ -71,6 +74,7 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 		recentSIPInvites:   make(map[string]time.Time),
 		sipOutboundRetries: make(map[string]*sipOutboundRetry),
 		sipBridgeTransfers: make(map[string]time.Time),
+		doorEventLast:      make(map[string]time.Time),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -113,37 +117,11 @@ func (s *Server) Asterisk() *asterisk.Router { return s.asterisk }
 // Asterisk ConfBridge without users manually copying SIP passwords into each
 // addon instance.
 func (s *Server) HandleNodeWebRTCConfig(w http.ResponseWriter, r *http.Request) {
-	accountID := strings.TrimSpace(r.Header.Get("X-Simson-Account-ID"))
-	nodeID := strings.TrimSpace(r.Header.Get("X-Simson-Node-ID"))
-	token := strings.TrimSpace(r.Header.Get("X-Simson-Install-Token"))
-	if accountID == "" {
-		accountID = strings.TrimSpace(r.URL.Query().Get("account_id"))
-	}
-	if nodeID == "" {
-		nodeID = strings.TrimSpace(r.URL.Query().Get("node_id"))
-	}
-	if token == "" {
-		token = strings.TrimSpace(r.URL.Query().Get("install_token"))
-	}
-	if accountID == "" || nodeID == "" || token == "" {
-		http.Error(w, "missing node credentials", http.StatusUnauthorized)
+	node, ok := s.authenticateNodeRequest(w, r, "webrtc-config")
+	if !ok {
 		return
 	}
-
-	node, err := s.store.GetNode(nodeID)
-	if err != nil {
-		s.log.Error("node webrtc-config lookup failed", map[string]any{"err": err.Error(), "node_id": nodeID})
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	if node == nil ||
-		node.AccountID != accountID ||
-		!node.Enabled ||
-		subtle.ConstantTimeCompare([]byte(node.AuthToken), []byte(token)) != 1 {
-		s.log.Warn("node webrtc-config auth failed", map[string]any{"node_id": nodeID, "account": accountID, "ip": extractIP(r)})
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
+	_ = node
 
 	iceServers := []map[string]any{}
 	for _, stun := range s.cfg.ICE.STUNServers {
@@ -171,11 +149,163 @@ func (s *Server) HandleNodeWebRTCConfig(w http.ResponseWriter, r *http.Request) 
 		"ws_url":   sipWSURL(s.cfg.Asterisk.SIPDomain, wsPath),
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	writeNodeJSON(w, http.StatusOK, map[string]any{
 		"ice_servers": iceServers,
 		"sip":         sipConfig,
 	})
+}
+
+func (s *Server) authenticateNodeRequest(w http.ResponseWriter, r *http.Request, purpose string) (*store.Node, bool) {
+	accountID := strings.TrimSpace(r.Header.Get("X-Simson-Account-ID"))
+	nodeID := strings.TrimSpace(r.Header.Get("X-Simson-Node-ID"))
+	token := strings.TrimSpace(r.Header.Get("X-Simson-Install-Token"))
+	if accountID == "" {
+		accountID = strings.TrimSpace(r.URL.Query().Get("account_id"))
+	}
+	if nodeID == "" {
+		nodeID = strings.TrimSpace(r.URL.Query().Get("node_id"))
+	}
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("install_token"))
+	}
+	if accountID == "" || nodeID == "" || token == "" {
+		http.Error(w, "missing node credentials", http.StatusUnauthorized)
+		return nil, false
+	}
+
+	node, err := s.store.GetNode(nodeID)
+	if err != nil {
+		s.log.Error("node request lookup failed", map[string]any{"purpose": purpose, "err": err.Error(), "node_id": nodeID})
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return nil, false
+	}
+	if node == nil ||
+		node.AccountID != accountID ||
+		!node.Enabled ||
+		subtle.ConstantTimeCompare([]byte(node.AuthToken), []byte(token)) != 1 {
+		s.log.Warn("node request auth failed", map[string]any{"purpose": purpose, "node_id": nodeID, "account": accountID, "ip": extractIP(r)})
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil, false
+	}
+	return node, true
+}
+
+// HandleNodeDoorEvent starts a tenant-scoped outdoor camera SIP bridge from an
+// authenticated addon. The webhook-facing addon chooses only saved presets;
+// this endpoint independently verifies the node token and endpoint ownership.
+func (s *Server) HandleNodeDoorEvent(w http.ResponseWriter, r *http.Request) {
+	node, ok := s.authenticateNodeRequest(w, r, "door-event")
+	if !ok {
+		return
+	}
+	if s.asterisk == nil || !s.asterisk.Connected() {
+		writeNodeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Asterisk integration unavailable"})
+		return
+	}
+	var body struct {
+		SourceExtension string `json:"source_extension"`
+		TargetExtension string `json:"target_extension"`
+		CallerID        string `json:"caller_id"`
+		TriggerID       string `json:"trigger_id"`
+		TimeoutSec      int    `json:"timeout_sec"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+	source := strings.TrimSpace(body.SourceExtension)
+	target := strings.TrimSpace(body.TargetExtension)
+	if !isSafeDoorSIPExtension(source) || !isSafeDoorSIPExtension(target) || source == target {
+		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "source_extension and target_extension must be different numeric SIP extensions"})
+		return
+	}
+	sourceEP, err := s.store.GetSIPEndpointByExtension(source)
+	if err != nil {
+		s.log.Error("door source lookup failed", map[string]any{"err": err.Error()})
+		writeNodeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	targetEP, err := s.store.GetSIPEndpointByExtension(target)
+	if err != nil {
+		s.log.Error("door target lookup failed", map[string]any{"err": err.Error()})
+		writeNodeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	if sourceEP == nil || targetEP == nil || sourceEP.AccountID != node.AccountID || targetEP.AccountID != node.AccountID {
+		writeNodeJSON(w, http.StatusNotFound, map[string]any{"error": "door station or indoor SIP target not found for this site"})
+		return
+	}
+	if !sourceEP.VideoEnabled || !targetEP.VideoEnabled {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "enable Video capable device for both door station and indoor SIP target"})
+		return
+	}
+	if !s.asterisk.EndpointHasContacts(source) {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "door station is not registered"})
+		return
+	}
+	if !s.asterisk.EndpointHasContacts(target) {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "indoor SIP target is not registered"})
+		return
+	}
+	timeoutSec := body.TimeoutSec
+	if timeoutSec == 0 {
+		timeoutSec = 30
+	}
+	if timeoutSec < 5 || timeoutSec > 120 {
+		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "timeout_sec must be between 5 and 120"})
+		return
+	}
+	key := node.AccountID + ":" + source + ":" + target
+	s.doorEventMu.Lock()
+	last := s.doorEventLast[key]
+	if !last.IsZero() && time.Since(last) < 5*time.Second {
+		s.doorEventMu.Unlock()
+		writeNodeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "door event rate limited"})
+		return
+	}
+	s.doorEventLast[key] = time.Now()
+	s.doorEventMu.Unlock()
+
+	callerID := strings.TrimSpace(body.CallerID)
+	if callerID == "" {
+		callerID = "\"Door Station\" <" + source + ">"
+	}
+	callID := "door-" + uuid.NewString()
+	if _, err := s.asterisk.OriginateDoorStationCall(source, target, callerID, callID, timeoutSec); err != nil {
+		s.doorEventMu.Lock()
+		delete(s.doorEventLast, key)
+		s.doorEventMu.Unlock()
+		s.log.Error("node door station originate failed", map[string]any{"err": err.Error(), "source": source, "target": target})
+		writeNodeJSON(w, http.StatusBadGateway, map[string]any{"error": "could not start door station call"})
+		return
+	}
+	s.store.WriteAudit(node.AccountID, node.ID, "door_event_call", "trigger="+strings.TrimSpace(body.TriggerID)+" source="+source+" target="+target, extractIP(r))
+	s.log.Info("node door station call started", map[string]any{"account_id": node.AccountID, "node_id": node.ID, "call_id": callID, "source": source, "target": target})
+	writeNodeJSON(w, http.StatusAccepted, map[string]any{
+		"call_id":          callID,
+		"status":           "calling_door_station",
+		"source_extension": source,
+		"target_extension": target,
+	})
+}
+
+func isSafeDoorSIPExtension(extension string) bool {
+	if len(extension) < 2 || len(extension) > 12 {
+		return false
+	}
+	for _, ch := range extension {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func writeNodeJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 // HandleWS is the HTTP handler for WebSocket upgrades at /ws.
@@ -2118,11 +2248,12 @@ func (s *Server) configureAsteriskFromStore() {
 	defs := make([]asterisk.SIPEndpointDef, 0, len(endpoints))
 	for _, ep := range endpoints {
 		defs = append(defs, asterisk.SIPEndpointDef{
-			ID:        ep.ID,
-			Extension: ep.Extension,
-			Username:  ep.Username,
-			Password:  ep.Password,
-			Enabled:   ep.Enabled,
+			ID:           ep.ID,
+			Extension:    ep.Extension,
+			Username:     ep.Username,
+			Password:     ep.Password,
+			VideoEnabled: ep.VideoEnabled,
+			Enabled:      ep.Enabled,
 		})
 	}
 

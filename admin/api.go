@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nitish-mp3/simson-vps/asterisk"
@@ -25,11 +27,13 @@ type API struct {
 	calls    *calls.Manager
 	log      *logging.Logger
 	asterisk *asterisk.Router // nil when Asterisk disabled
+	doorMu   sync.Mutex
+	doorLast map[string]time.Time
 }
 
 // New creates an admin API.
 func New(cfg *config.Config, st *store.Store, h *hub.Hub, cm *calls.Manager, log *logging.Logger) *API {
-	return &API{cfg: cfg, store: st, hub: h, calls: cm, log: log}
+	return &API{cfg: cfg, store: st, hub: h, calls: cm, log: log, doorLast: make(map[string]time.Time)}
 }
 
 // SetAsterisk injects the AMI router so admin endpoints can trigger reloads.
@@ -70,6 +74,7 @@ func (a *API) Router() http.Handler {
 	mux.HandleFunc("GET /admin/sip-endpoints/{id}", a.auth(a.handleGetSIPEndpoint))
 	mux.HandleFunc("PUT /admin/sip-endpoints/{id}", a.auth(a.handleUpdateSIPEndpoint))
 	mux.HandleFunc("DELETE /admin/sip-endpoints/{id}", a.auth(a.handleDeleteSIPEndpoint))
+	mux.HandleFunc("POST /admin/accounts/{accountId}/door-events", a.auth(a.handleDoorEvent))
 
 	// Asterisk management
 	mux.HandleFunc("POST /admin/asterisk/reload-sip", a.auth(a.handleAsteriskReloadSIP))
@@ -426,12 +431,13 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Extension   string `json:"extension"`
-		Username    string `json:"username"`
-		Password    string `json:"password"`
-		Description string `json:"description"`
-		RouteTo     string `json:"route_to"`
-		Enabled     *bool  `json:"enabled"`
+		Extension    string `json:"extension"`
+		Username     string `json:"username"`
+		Password     string `json:"password"`
+		Description  string `json:"description"`
+		RouteTo      string `json:"route_to"`
+		VideoEnabled *bool  `json:"video_enabled"`
+		Enabled      *bool  `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -445,18 +451,23 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if body.Enabled != nil {
 		enabled = *body.Enabled
 	}
+	videoEnabled := false
+	if body.VideoEnabled != nil {
+		videoEnabled = *body.VideoEnabled
+	}
 	// Generate a random ID
 	idb := make([]byte, 16)
 	rand.Read(idb) //nolint:errcheck
 	ep := store.SIPEndpoint{
-		ID:          hex.EncodeToString(idb),
-		AccountID:   accountID,
-		Extension:   body.Extension,
-		Username:    body.Username,
-		Password:    body.Password,
-		Description: body.Description,
-		RouteTo:     body.RouteTo,
-		Enabled:     enabled,
+		ID:           hex.EncodeToString(idb),
+		AccountID:    accountID,
+		Extension:    body.Extension,
+		Username:     body.Username,
+		Password:     body.Password,
+		Description:  body.Description,
+		RouteTo:      body.RouteTo,
+		VideoEnabled: videoEnabled,
+		Enabled:      enabled,
 	}
 	if err := a.store.CreateSIPEndpoint(ep); err != nil {
 		a.log.Error("create sip endpoint", map[string]any{"err": err.Error()})
@@ -510,10 +521,11 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Description *string `json:"description"`
-		Password    *string `json:"password"`
-		RouteTo     *string `json:"route_to"`
-		Enabled     *bool   `json:"enabled"`
+		Description  *string `json:"description"`
+		Password     *string `json:"password"`
+		RouteTo      *string `json:"route_to"`
+		VideoEnabled *bool   `json:"video_enabled"`
+		Enabled      *bool   `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -528,10 +540,13 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if body.RouteTo != nil {
 		ep.RouteTo = *body.RouteTo
 	}
+	if body.VideoEnabled != nil {
+		ep.VideoEnabled = *body.VideoEnabled
+	}
 	if body.Enabled != nil {
 		ep.Enabled = *body.Enabled
 	}
-	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.Enabled); err != nil {
+	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.VideoEnabled, ep.Enabled); err != nil {
 		a.log.Error("update sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
@@ -549,6 +564,133 @@ func (a *API) handleDeleteSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	a.reconfigureAsterisk()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleDoorEvent starts a native SIP-to-SIP door camera bridge. The source
+// door station must be configured to auto-answer SIP callbacks. Both endpoints
+// are resolved from the same account so one site cannot ring another site's
+// devices even if an extension is guessed.
+func (a *API) handleDoorEvent(w http.ResponseWriter, r *http.Request) {
+	if a.asterisk == nil || !a.asterisk.Connected() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Asterisk integration unavailable"})
+		return
+	}
+
+	accountID := strings.TrimSpace(r.PathValue("accountId"))
+	var body struct {
+		SourceExtension string `json:"source_extension"`
+		TargetExtension string `json:"target_extension"`
+		CallerID        string `json:"caller_id"`
+		TriggerID       string `json:"trigger_id"`
+		TimeoutSec      int    `json:"timeout_sec"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+	source := strings.TrimSpace(body.SourceExtension)
+	target := strings.TrimSpace(body.TargetExtension)
+	if accountID == "" || !isSafeSIPExtension(source) || !isSafeSIPExtension(target) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "account, source_extension, and target_extension are required numeric SIP extensions"})
+		return
+	}
+	if source == target {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "door station and indoor target must be different SIP extensions"})
+		return
+	}
+
+	sourceEP, err := a.store.GetSIPEndpointByExtension(source)
+	if err != nil {
+		a.log.Error("door source lookup failed", map[string]any{"err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	targetEP, err := a.store.GetSIPEndpointByExtension(target)
+	if err != nil {
+		a.log.Error("door target lookup failed", map[string]any{"err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	if sourceEP == nil || targetEP == nil || sourceEP.AccountID != accountID || targetEP.AccountID != accountID {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "door station or indoor SIP target not found for this site"})
+		return
+	}
+	if !sourceEP.VideoEnabled || !targetEP.VideoEnabled {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "enable Video capable device for both door station and indoor SIP target"})
+		return
+	}
+	if !a.asterisk.EndpointHasContacts(source) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "door station is not registered"})
+		return
+	}
+	if !a.asterisk.EndpointHasContacts(target) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "indoor SIP target is not registered"})
+		return
+	}
+
+	timeoutSec := body.TimeoutSec
+	if timeoutSec == 0 {
+		timeoutSec = 30
+	}
+	if timeoutSec < 5 || timeoutSec > 120 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "timeout_sec must be between 5 and 120"})
+		return
+	}
+	key := accountID + ":" + source + ":" + target
+	a.doorMu.Lock()
+	last := a.doorLast[key]
+	if elapsed := time.Since(last); !last.IsZero() && elapsed < 5*time.Second {
+		retryAfter := int((5*time.Second - elapsed).Seconds()) + 1
+		a.doorMu.Unlock()
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "door event rate limited", "retry_after": retryAfter})
+		return
+	}
+	a.doorLast[key] = time.Now()
+	a.doorMu.Unlock()
+
+	callerID := strings.TrimSpace(body.CallerID)
+	if callerID == "" {
+		callerID = "\"Door Station\" <" + source + ">"
+	}
+	callID := "door-" + randomHexID(16)
+	if _, err := a.asterisk.OriginateDoorStationCall(source, target, callerID, callID, timeoutSec); err != nil {
+		a.doorMu.Lock()
+		delete(a.doorLast, key)
+		a.doorMu.Unlock()
+		a.log.Error("door station originate failed", map[string]any{"err": err.Error(), "source": source, "target": target})
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "could not start door station call"})
+		return
+	}
+
+	a.store.WriteAudit(accountID, "", "door_event_call", "trigger="+strings.TrimSpace(body.TriggerID)+" source="+source+" target="+target, r.RemoteAddr)
+	a.log.Info("door station call started", map[string]any{"account_id": accountID, "call_id": callID, "source": source, "target": target})
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"call_id":          callID,
+		"status":           "calling_door_station",
+		"source_extension": source,
+		"target_extension": target,
+	})
+}
+
+func isSafeSIPExtension(extension string) bool {
+	if len(extension) < 2 || len(extension) > 12 {
+		return false
+	}
+	for _, ch := range extension {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func randomHexID(bytes int) string {
+	value := make([]byte, bytes)
+	if _, err := rand.Read(value); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(value)
 }
 
 // --- Asterisk management ---
@@ -675,11 +817,12 @@ func (a *API) reconfigureAsterisk() {
 	defs := make([]asterisk.SIPEndpointDef, 0, len(endpoints))
 	for _, ep := range endpoints {
 		defs = append(defs, asterisk.SIPEndpointDef{
-			ID:        ep.ID,
-			Extension: ep.Extension,
-			Username:  ep.Username,
-			Password:  ep.Password,
-			Enabled:   ep.Enabled,
+			ID:           ep.ID,
+			Extension:    ep.Extension,
+			Username:     ep.Username,
+			Password:     ep.Password,
+			VideoEnabled: ep.VideoEnabled,
+			Enabled:      ep.Enabled,
 		})
 	}
 
@@ -691,15 +834,17 @@ func (a *API) reconfigureAsterisk() {
 	}
 
 	if err := asterisk.Setup(asterisk.SetupConfig{
-		AmiUser:     a.cfg.Asterisk.User,
-		AmiSecret:   a.cfg.Asterisk.Secret,
-		SIPDomain:   a.cfg.Asterisk.SIPDomain,
-		ExternalIP:  a.cfg.Asterisk.ExternalIP,
-		InContext:   a.cfg.Asterisk.InContext,
-		NodeContext: a.cfg.Asterisk.NodeContext,
-		OutContext:  a.cfg.Asterisk.OutContext,
-		WebRTCUser:  webrtcUser,
-		WebRTCPass:  webrtcPass,
+		AmiUser:                 a.cfg.Asterisk.User,
+		AmiSecret:               a.cfg.Asterisk.Secret,
+		SIPDomain:               a.cfg.Asterisk.SIPDomain,
+		ExternalIP:              a.cfg.Asterisk.ExternalIP,
+		InContext:               a.cfg.Asterisk.InContext,
+		NodeContext:             a.cfg.Asterisk.NodeContext,
+		OutContext:              a.cfg.Asterisk.OutContext,
+		TrustedGatewayIPs:       a.cfg.Asterisk.TrustedGatewayIPs,
+		NoAuthInboundExtensions: a.cfg.Asterisk.NoAuthInboundExtensions,
+		WebRTCUser:              webrtcUser,
+		WebRTCPass:              webrtcPass,
 	}, defs, a.log); err != nil {
 		a.log.Error("Asterisk auto-configure failed", map[string]any{"err": err.Error()})
 		return

@@ -33,11 +33,12 @@ type SetupConfig struct {
 // SIPEndpointDef is a minimal view of a SIP endpoint used when writing pjsip.conf.
 // It mirrors store.SIPEndpoint but avoids an import cycle.
 type SIPEndpointDef struct {
-	ID        string
-	Extension string
-	Username  string
-	Password  string
-	Enabled   bool
+	ID           string
+	Extension    string
+	Username     string
+	Password     string
+	VideoEnabled bool
+	Enabled      bool
 }
 
 // Setup writes all Asterisk config files needed by the Simson VPS and reloads
@@ -359,6 +360,9 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 		}
 
 		fmt.Fprintf(&sb, "[%s](simson-ep-tpl)\nauth=%s-auth\noutbound_auth=%s-auth\naors=%s\n", endpointID, endpointID, endpointID, aorName)
+		if ep.VideoEnabled {
+			sb.WriteString("allow=h264\n")
+		}
 		if _, ok := noAuthInbound[endpointID]; ok {
 			sb.WriteString(
 				"; Synway/GSM gateway compatibility: avoid dynamic RTP payloads\n" +
@@ -586,6 +590,17 @@ exten => s,1,NoOp(Simson originate leg)
 ; that Local leg into the requested Simson ConfBridge room.
 exten => _X.,1,NoOp(Simson dial SIP endpoint ${EXTEN})
  same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=120},rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))
+ same  => n,Hangup()
+
+[from-simson-door]
+; Face-recognition webhook callback: call the outdoor SIP station first. The
+; station must auto-answer callback calls so its camera media becomes the first
+; bridge leg. Once answered, ring the configured indoor SIP phone directly.
+; This is intentionally a plain Dial bridge rather than ConfBridge so H.264
+; video can negotiate end-to-end between compatible SIP devices.
+exten => _X.,1,NoOp(Simson door camera bridge to SIP endpoint ${EXTEN})
+ same  => n,Set(__SIMSON_CALL_ID=${SIMSON_CALL_ID})
+ same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},rT)
  same  => n,Hangup()
 
 [%s]

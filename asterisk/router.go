@@ -208,6 +208,45 @@ func (r *Router) OriginateToExtension(extension, context, bridgeExt, callerID, c
 	return actionID, nil
 }
 
+// OriginateDoorStationCall calls an outdoor SIP station first and, once that
+// device auto-answers, dials the selected indoor SIP extension through a plain
+// Asterisk Dial bridge. Keeping this path outside ConfBridge preserves native
+// SIP video negotiation for camera door stations without changing browser or
+// gateway audio behavior.
+func (r *Router) OriginateDoorStationCall(sourceExtension, targetExtension, callerID, callID string, timeoutSec int) (string, error) {
+	channel := fmt.Sprintf("PJSIP/%s", sourceExtension)
+	actionID := uuid.NewString()
+	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", sourceExtension))
+	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", targetExtension))
+
+	r.originateMu.Lock()
+	r.actionIDToCallID[actionID] = callID
+	r.originateMu.Unlock()
+
+	vars := map[string]string{
+		"SIMSON_CALL_ID":      callID,
+		"__SIMSON_CALL_ID":    callID,
+		"SIMSON_WAIT_TIMEOUT": fmt.Sprintf("%d", timeoutSec),
+	}
+	_, err := r.ami.OriginateWithVars(
+		channel,
+		"from-simson-door",
+		targetExtension,
+		callerID,
+		timeoutSec*1000,
+		actionID,
+		vars,
+	)
+	if err != nil {
+		r.originateMu.Lock()
+		delete(r.actionIDToCallID, actionID)
+		r.originateMu.Unlock()
+		return "", err
+	}
+
+	return actionID, nil
+}
+
 // OriginateToTrunk dials an external number through an existing PJSIP trunk and
 // then sends the answered leg into the same ConfBridge extension used by SIP
 // phone calls.

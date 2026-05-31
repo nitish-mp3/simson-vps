@@ -74,23 +74,26 @@ func main() {
 			defs := make([]asterisk.SIPEndpointDef, len(eps))
 			for i, ep := range eps {
 				defs[i] = asterisk.SIPEndpointDef{
-					ID:        ep.ID,
-					Extension: ep.Extension,
-					Username:  ep.Username,
-					Password:  ep.Password,
-					Enabled:   ep.Enabled,
+					ID:           ep.ID,
+					Extension:    ep.Extension,
+					Username:     ep.Username,
+					Password:     ep.Password,
+					VideoEnabled: ep.VideoEnabled,
+					Enabled:      ep.Enabled,
 				}
 			}
 			scfg := asterisk.SetupConfig{
-				AmiUser:     cfg.Asterisk.User,
-				AmiSecret:   cfg.Asterisk.Secret,
-				SIPDomain:   cfg.Asterisk.SIPDomain,
-				ExternalIP:  cfg.Asterisk.ExternalIP,
-				InContext:   cfg.Asterisk.InContext,
-				NodeContext: cfg.Asterisk.NodeContext,
-				OutContext:  cfg.Asterisk.OutContext,
-				WebRTCUser:  cfg.Asterisk.SIPWebRTC.Username,
-				WebRTCPass:  cfg.Asterisk.SIPWebRTC.Password,
+				AmiUser:                 cfg.Asterisk.User,
+				AmiSecret:               cfg.Asterisk.Secret,
+				SIPDomain:               cfg.Asterisk.SIPDomain,
+				ExternalIP:              cfg.Asterisk.ExternalIP,
+				InContext:               cfg.Asterisk.InContext,
+				NodeContext:             cfg.Asterisk.NodeContext,
+				OutContext:              cfg.Asterisk.OutContext,
+				TrustedGatewayIPs:       cfg.Asterisk.TrustedGatewayIPs,
+				NoAuthInboundExtensions: cfg.Asterisk.NoAuthInboundExtensions,
+				WebRTCUser:              cfg.Asterisk.SIPWebRTC.Username,
+				WebRTCPass:              cfg.Asterisk.SIPWebRTC.Password,
 			}
 			if err := asterisk.Setup(scfg, defs, log); err != nil {
 				log.Warn("asterisk auto-configure failed (continuing)", map[string]any{"err": err.Error()})
@@ -114,6 +117,7 @@ func main() {
 	// WebSocket endpoint.
 	mux.HandleFunc("/ws", srv.HandleWS)
 	mux.HandleFunc("/node/webrtc-config", srv.HandleNodeWebRTCConfig)
+	mux.HandleFunc("/node/door-events", srv.HandleNodeDoorEvent)
 
 	// Admin endpoints.
 	adminRouter := adminAPI.Router()
