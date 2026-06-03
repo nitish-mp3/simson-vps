@@ -259,7 +259,10 @@ func (s *Server) HandleNodeDoorEvent(w http.ResponseWriter, r *http.Request) {
 	key := node.AccountID + ":" + source + ":" + target
 	s.doorEventMu.Lock()
 	last := s.doorEventLast[key]
-	if !last.IsZero() && time.Since(last) < 5*time.Second {
+	// Panels commonly repeat the same unknown-face callback while the visitor
+	// remains in frame. Suppress duplicates for the configured ring window so
+	// one visitor cannot create overlapping calls to the real SIP devices.
+	if !last.IsZero() && time.Since(last) < time.Duration(timeoutSec)*time.Second {
 		s.doorEventMu.Unlock()
 		writeNodeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "door event rate limited"})
 		return

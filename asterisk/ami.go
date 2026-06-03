@@ -227,11 +227,29 @@ func (a *AMIClient) OriginateWithActionID(channel, context, exten, callerID, cal
 }
 
 func (a *AMIClient) OriginateWithVars(channel, context, exten, callerID string, timeoutMs int, actionID string, variables map[string]string) (string, error) {
+	return a.OriginateWithVarsAndCodecs(channel, context, exten, callerID, timeoutMs, actionID, variables, "")
+}
+
+// OriginateWithVarsAndCodecs seeds the media topology for calls that need
+// codecs beyond the default audio offer, such as an H.264 door-station bridge.
+func (a *AMIClient) OriginateWithVarsAndCodecs(channel, context, exten, callerID string, timeoutMs int, actionID string, variables map[string]string, codecs string) (string, error) {
+	action := buildOriginateAction(channel, context, exten, callerID, timeoutMs, actionID, variables, codecs)
+	actionID, resp, err := a.sendAction(action)
+	if err != nil {
+		return "", err
+	}
+	if resp["Response"] != "Success" {
+		return "", fmt.Errorf("originate failed: %s", resp["Message"])
+	}
+	return actionID, nil
+}
+
+func buildOriginateAction(channel, context, exten, callerID string, timeoutMs int, actionID string, variables map[string]string, codecs string) map[string]string {
 	varPairs := make([]string, 0, len(variables))
 	for k, v := range variables {
 		varPairs = append(varPairs, fmt.Sprintf("%s=%s", k, v))
 	}
-	actionID, resp, err := a.sendAction(map[string]string{
+	action := map[string]string{
 		"Action":   "Originate",
 		"ActionID": actionID,
 		"Channel":  channel,
@@ -243,14 +261,11 @@ func (a *AMIClient) OriginateWithVars(channel, context, exten, callerID string, 
 		// comma-joined variables — Asterisk Originate supports KEY=VAL,KEY2=VAL2
 		"Variable": strings.Join(varPairs, ","),
 		"Async":    "true",
-	})
-	if err != nil {
-		return "", err
 	}
-	if resp["Response"] != "Success" {
-		return "", fmt.Errorf("originate failed: %s", resp["Message"])
+	if codecs != "" {
+		action["Codecs"] = codecs
 	}
-	return actionID, nil
+	return action
 }
 
 // HangupChannel hangs up a specific Asterisk channel.

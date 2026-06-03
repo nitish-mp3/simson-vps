@@ -228,7 +228,7 @@ func (r *Router) OriginateDoorStationCall(sourceExtension, targetExtension, call
 		"__SIMSON_CALL_ID":    callID,
 		"SIMSON_WAIT_TIMEOUT": fmt.Sprintf("%d", timeoutSec),
 	}
-	_, err := r.ami.OriginateWithVars(
+	_, err := r.ami.OriginateWithVarsAndCodecs(
 		channel,
 		"from-simson-door",
 		targetExtension,
@@ -236,6 +236,7 @@ func (r *Router) OriginateDoorStationCall(sourceExtension, targetExtension, call
 		timeoutSec*1000,
 		actionID,
 		vars,
+		"ulaw,alaw,h264",
 	)
 	if err != nil {
 		r.originateMu.Lock()
