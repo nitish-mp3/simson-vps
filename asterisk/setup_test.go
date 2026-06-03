@@ -43,6 +43,69 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	}
 }
 
+func TestStockAsteriskSamplesAreNeutralized(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "pjsip.conf"), []byte(`
+[1001]
+type=endpoint
+context=default
+disallow=all
+allow=opus,ulaw
+auth=1001
+aors=1001
+webrtc=yes
+
+[1001]
+type=auth
+auth_type=userpass
+username=1001
+password=1234
+
+[1001]
+type=aor
+max_contacts=1
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "extensions.conf"), []byte(`
+[default]
+exten => 1001,1,Answer()
+ same => n,Playback(hello-world)
+ same => n,Hangup()
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writePJSIPConf(root, SetupConfig{SIPDomain: "simson-vps.vipsy.in"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDialplanConf(root, "from-simson-sip", "from-simson-node", "from-simson-out", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	pjsipBase := readTestFile(t, filepath.Join(root, "pjsip.conf"))
+	if strings.Contains(pjsipBase, "[1001]") || strings.Contains(pjsipBase, "password=1234") {
+		t.Fatal("stock pjsip sample endpoint was not neutralized")
+	}
+	if !strings.Contains(pjsipBase, "#include pjsip.d/*.conf") {
+		t.Fatal("minimal pjsip base does not include Simson snippets")
+	}
+	if _, err := os.Stat(filepath.Join(root, "pjsip.conf.simson-sample.bak")); err != nil {
+		t.Fatalf("stock pjsip backup missing: %v", err)
+	}
+
+	extensionsBase := readTestFile(t, filepath.Join(root, "extensions.conf"))
+	if strings.Contains(extensionsBase, "Playback(hello-world)") {
+		t.Fatal("stock demo dialplan was not neutralized")
+	}
+	if !strings.Contains(extensionsBase, "#include extensions.d/*.conf") {
+		t.Fatal("minimal extensions base does not include Simson snippets")
+	}
+	if _, err := os.Stat(filepath.Join(root, "extensions.conf.simson-sample.bak")); err != nil {
+		t.Fatalf("stock extensions backup missing: %v", err)
+	}
+}
+
 func readTestFile(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)

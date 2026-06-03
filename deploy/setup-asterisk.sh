@@ -184,6 +184,30 @@ if ! grep -qE '^[[:space:]]*#include[[:space:]]+http\.conf\.d/\*\.conf' /etc/ast
     printf '\n; Added by Simson VPS server\n#include http.conf.d/*.conf\n' >> /etc/asterisk/http.conf
 fi
 
+neutralize_stock_asterisk_sample() {
+    local conf_file="$1"
+    local include_glob="$2"
+    local marker="$3"
+    local extra_marker="$4"
+    local path="/etc/asterisk/${conf_file}"
+    if [[ ! -f "$path" ]]; then
+        printf '; Simson-managed minimal Asterisk base config.\n#include %s\n' "$include_glob" > "$path"
+        return
+    fi
+    if grep -q "$marker" "$path" && grep -q "$extra_marker" "$path"; then
+        local ts
+        ts="$(date -u +%Y%m%dT%H%M%SZ)"
+        cp "$path" "${path}.simson-sample.bak-${ts}"
+        printf '; Simson-managed minimal Asterisk base config.\n; Stock sample backed up with timestamp %s.\n#include %s\n' "$ts" "$include_glob" > "$path"
+        info "Neutralized stock Asterisk sample config: ${conf_file}"
+    elif ! grep -qE "^[[:space:]]*#include[[:space:]]+${include_glob//\*/\\*}" "$path" 2>/dev/null; then
+        printf '\n; Added by Simson VPS server\n#include %s\n' "$include_glob" >> "$path"
+    fi
+}
+
+neutralize_stock_asterisk_sample "pjsip.conf" "pjsip.d/*.conf" "password=1234" "webrtc=yes"
+neutralize_stock_asterisk_sample "extensions.conf" "extensions.d/*.conf" "exten => 1001,1,Answer()" "Playback(hello-world)"
+
 # Public SIP receives constant scanner traffic. Keep logs useful without
 # letting notices/debug output fill the disk and take calls down.
 cat > /etc/logrotate.d/asterisk <<'LREOF'

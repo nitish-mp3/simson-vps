@@ -114,6 +114,49 @@ func ensureInclude(confFile, glob string) error {
 	return err
 }
 
+func ensureSimsonIncludeBase(root, confFile, snippetDir string) error {
+	confPath := filepath.Join(root, confFile)
+	includeGlob := snippetDir + "/*.conf"
+	data, _ := os.ReadFile(confPath)
+	content := string(data)
+	if isStockAsteriskSampleConfig(confFile, content) {
+		backupPath := confPath + ".simson-sample.bak"
+		if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+			if err := os.WriteFile(backupPath, data, 0644); err != nil {
+				return err
+			}
+		}
+		minimal := fmt.Sprintf(
+			`; Simson-managed minimal Asterisk base config.
+; The stock sample config was backed up to %s.
+; Real Simson configuration lives in the snippet directory below.
+#include %s
+`,
+			filepath.Base(backupPath),
+			includeGlob,
+		)
+		return os.WriteFile(confPath, []byte(minimal), 0644)
+	}
+	return ensureInclude(confPath, includeGlob)
+}
+
+func isStockAsteriskSampleConfig(confFile, content string) bool {
+	switch confFile {
+	case "pjsip.conf":
+		return strings.Contains(content, "[1001]") &&
+			strings.Contains(content, "context=default") &&
+			strings.Contains(content, "username=1001") &&
+			strings.Contains(content, "password=1234") &&
+			strings.Contains(content, "webrtc=yes")
+	case "extensions.conf":
+		return strings.Contains(content, "[default]") &&
+			strings.Contains(content, "exten => 1001,1,Answer()") &&
+			strings.Contains(content, "Playback(hello-world)")
+	default:
+		return false
+	}
+}
+
 // detectSnippetDirName picks the snippet dir already included by a base conf.
 // Falls back to fallbackDir when no include is present.
 func detectSnippetDirName(root, confFile string, candidates []string, fallbackDir string) string {
@@ -172,10 +215,7 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	if err := ensureInclude(
-		filepath.Join(root, "pjsip.conf"),
-		dirName+"/*.conf",
-	); err != nil {
+	if err := ensureSimsonIncludeBase(root, "pjsip.conf", dirName); err != nil {
 		return err
 	}
 
@@ -528,10 +568,7 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx string, noAuthInboundExtensi
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	if err := ensureInclude(
-		filepath.Join(root, "extensions.conf"),
-		dirName+"/*.conf",
-	); err != nil {
+	if err := ensureSimsonIncludeBase(root, "extensions.conf", dirName); err != nil {
 		return err
 	}
 

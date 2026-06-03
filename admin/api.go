@@ -639,8 +639,8 @@ func (a *API) handleDoorEvent(w http.ResponseWriter, r *http.Request) {
 	key := accountID + ":" + source + ":" + target
 	a.doorMu.Lock()
 	last := a.doorLast[key]
-	if elapsed := time.Since(last); !last.IsZero() && elapsed < 5*time.Second {
-		retryAfter := int((5*time.Second - elapsed).Seconds()) + 1
+	if elapsed := time.Since(last); !last.IsZero() && elapsed < time.Duration(timeoutSec)*time.Second {
+		retryAfter := int((time.Duration(timeoutSec)*time.Second - elapsed).Seconds()) + 1
 		a.doorMu.Unlock()
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "door event rate limited", "retry_after": retryAfter})

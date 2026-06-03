@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -262,9 +263,11 @@ func (s *Server) HandleNodeDoorEvent(w http.ResponseWriter, r *http.Request) {
 	// Panels commonly repeat the same unknown-face callback while the visitor
 	// remains in frame. Suppress duplicates for the configured ring window so
 	// one visitor cannot create overlapping calls to the real SIP devices.
-	if !last.IsZero() && time.Since(last) < time.Duration(timeoutSec)*time.Second {
+	if elapsed := time.Since(last); !last.IsZero() && elapsed < time.Duration(timeoutSec)*time.Second {
+		retryAfter := int((time.Duration(timeoutSec)*time.Second - elapsed).Seconds()) + 1
 		s.doorEventMu.Unlock()
-		writeNodeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "door event rate limited"})
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		writeNodeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "door event rate limited", "retry_after": retryAfter})
 		return
 	}
 	s.doorEventLast[key] = time.Now()
