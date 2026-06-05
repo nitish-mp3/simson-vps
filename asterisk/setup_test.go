@@ -22,7 +22,7 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	if err := writePJSIPConf(root, cfg, endpoints); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, nil, endpoints); err != nil {
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, "7009", nil, endpoints); err != nil {
 		t.Fatal(err)
 	}
 
@@ -52,6 +52,9 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	}
 	if strings.Contains(dialplan, "exten => 1025,1,NoOp(Simson direct SIP-video endpoint") {
 		t.Fatal("audio-only SIP endpoint unexpectedly got direct video route")
+	}
+	if !strings.Contains(dialplan, "Dial(PJSIP/${EXTEN}@7009") || !strings.Contains(dialplan, "Dial(PJSIP/${EXTEN:2}@7009") {
+		t.Fatal("SIP-phone PSTN fallback routes missing")
 	}
 }
 
@@ -91,7 +94,7 @@ exten => 1001,1,Answer()
 	if err := writePJSIPConf(root, SetupConfig{SIPDomain: "simson-vps.vipsy.in"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeDialplanConf(root, "from-simson-sip", "from-simson-node", "from-simson-out", nil, nil); err != nil {
+	if err := writeDialplanConf(root, "from-simson-sip", "from-simson-node", "from-simson-out", "", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

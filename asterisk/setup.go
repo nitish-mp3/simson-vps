@@ -22,6 +22,7 @@ type SetupConfig struct {
 	InContext               string   // dialplan context for incoming SIP calls ("from-simson-sip")
 	NodeContext             string   // dialplan context for node-callback channels ("from-simson-node")
 	OutContext              string   // dialplan context for configured outbound trunk/landline calls
+	DefaultPSTNTrunk        string   // registered gateway endpoint for SIP-phone outside dialing
 	TrustedGatewayIPs       []string // trusted SIP gateway public IPs for inbound INVITEs that cannot digest-auth
 	NoAuthInboundExtensions []string // gateway extensions that cannot digest-auth inbound INVITEs
 	// Shared SIP-over-WebSocket endpoint for browser SIP.js clients.
@@ -67,7 +68,7 @@ func Setup(cfg SetupConfig, endpoints []SIPEndpointDef, log *logging.Logger) err
 	if err := writeConfBridgeConf(root); err != nil {
 		return fmt.Errorf("confbridge.conf: %w", err)
 	}
-	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, cfg.NoAuthInboundExtensions, endpoints); err != nil {
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, cfg.DefaultPSTNTrunk, cfg.NoAuthInboundExtensions, endpoints); err != nil {
 		return fmt.Errorf("extensions.conf: %w", err)
 	}
 
@@ -562,7 +563,7 @@ func localIPForICE() string {
 
 // ---- extensions.conf --------------------------------------------------------
 
-func writeDialplanConf(root, inCtx, nodeCtx, outCtx string, noAuthInboundExtensions []string, endpoints []SIPEndpointDef) error {
+func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, noAuthInboundExtensions []string, endpoints []SIPEndpointDef) error {
 	dirName := detectSnippetDirName(root, "extensions.conf", []string{"extensions.d", "extensions.conf.d"}, "extensions.d")
 	dir := filepath.Join(root, dirName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -584,6 +585,7 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx string, noAuthInboundExtensi
 	}
 
 	directVideoRoutes := buildDirectVideoEndpointDialplan(endpoints)
+	sipPhoneOutboundRoutes := buildSIPPhoneOutboundDialplan(defaultPSTNTrunk)
 	anonymousRoutes := buildAnonymousInboundDialplan(noAuthInboundExtensions)
 
 	content := fmt.Sprintf(
@@ -604,10 +606,13 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx string, noAuthInboundExtensi
 ; Simson ConfBridge/browser path would drop H.264 video because that path is
 ; intentionally audio-only.
 %s
+; Direct SIP-phone outside dialing via the default gateway trunk.
+; This keeps desk-phone callbacks fast and independent of HAOS/card state.
+%s
 ; Catch-all: route every incoming SIP call to the Simson control plane.
 exten => _X.,1,NoOp(Simson: incoming call to ${EXTEN} from ${CALLERID(num)})
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
- same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
+ same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
  same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
  same  => n,Hangup()
 
@@ -673,7 +678,7 @@ exten => s,1,NoOp(Mark Simson outbound child channel ${ARG1})
 exten => _X.,1,Hangup(21)
 exten => i,1,Hangup(21)
 exten => t,1,Hangup(16)
-`, inCtx, nodeCtx, outCtx, inCtx, directVideoRoutes, nodeCtx, outCtx, outCtx, anonymousRoutes)
+`, inCtx, nodeCtx, outCtx, inCtx, directVideoRoutes, sipPhoneOutboundRoutes, nodeCtx, outCtx, outCtx, anonymousRoutes)
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(content), 0640)
 }
@@ -829,10 +834,34 @@ func buildAnonymousInboundDialplan(extensions []string) string {
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson anonymous gateway call to ${EXTEN} from ${CALLERID(num)})\n", ext)
 		sb.WriteString(" same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})\n")
-		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
+		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
 		sb.WriteString(" same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)\n")
 		sb.WriteString(" same  => n,Hangup()\n")
 	}
+	return sb.String()
+}
+
+func buildSIPPhoneOutboundDialplan(defaultTrunk string) string {
+	trunk := sanitizeID(defaultTrunk)
+	if trunk == "" {
+		return "; No default PSTN trunk configured.\n"
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "exten => _%s91XXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk, trunk)
+	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN:%d}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", len(trunk)+2, trunk)
+	sb.WriteString(" same  => n,Hangup()\n")
+	fmt.Fprintf(&sb, "exten => _%sXXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk, trunk)
+	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN:%d}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", len(trunk), trunk)
+	sb.WriteString(" same  => n,Hangup()\n")
+	fmt.Fprintf(&sb, "exten => _91XXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk)
+	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN:2}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", trunk)
+	sb.WriteString(" same  => n,Hangup()\n")
+	fmt.Fprintf(&sb, "exten => _0XXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk)
+	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN:1}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", trunk)
+	sb.WriteString(" same  => n,Hangup()\n")
+	fmt.Fprintf(&sb, "exten => _XXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk)
+	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", trunk)
+	sb.WriteString(" same  => n,Hangup()\n")
 	return sb.String()
 }
 

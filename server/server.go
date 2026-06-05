@@ -1418,19 +1418,16 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		// from the Asterisk channel name (e.g. "PJSIP/7001-00000001" → ext
 		// "7001"). For gateway-style endpoints, RouteTo on the caller endpoint
 		// is the preferred destination for PSTN/GSM calls forwarded into Simson.
-		callerExt := extractEndpointFromChannel(in.Channel)
-		if callerExt == "" {
-			s.log.Warn("cannot identify caller for unknown extension",
-				map[string]any{"extension": in.Extension, "channel": in.Channel})
-			if s.asterisk != nil {
-				s.hangupAsteriskChannelAsync(in.Channel, "cannot identify SIP caller")
-			}
-			return
-		}
-		callerEP, cerr := s.store.GetSIPEndpointByExtension(callerExt)
-		if cerr != nil || callerEP == nil {
+		callerExt, callerEP := s.resolveIncomingSIPCallerEndpoint(in)
+		if callerEP == nil {
 			s.log.Warn("caller endpoint not found — hanging up",
-				map[string]any{"caller_ext": callerExt, "extension": in.Extension})
+				map[string]any{
+					"caller_ext":      callerExt,
+					"caller_id":       in.CallerID,
+					"caller_endpoint": in.CallerEndpoint,
+					"extension":       in.Extension,
+					"channel":         in.Channel,
+				})
 			if s.asterisk != nil {
 				s.hangupAsteriskChannelAsync(in.Channel, "caller endpoint not found")
 			}
@@ -1600,6 +1597,35 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	s.log.Info("SIP invite dispatched", map[string]any{
 		"call_id": callID, "extension": in.Extension, "targets": sentCount,
 	})
+}
+
+func (s *Server) resolveIncomingSIPCallerEndpoint(in asterisk.IncomingSIPCall) (string, *store.SIPEndpoint) {
+	candidates := []string{
+		strings.TrimSpace(in.CallerEndpoint),
+		extractEndpointFromChannel(in.Channel),
+		digitsOnly(in.CallerID),
+	}
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		ep, err := s.store.GetSIPEndpointByExtension(candidate)
+		if err != nil {
+			s.log.Error("db error looking up SIP caller endpoint",
+				map[string]any{"candidate": candidate, "err": err.Error()})
+			continue
+		}
+		if ep != nil && ep.Enabled {
+			return candidate, ep
+		}
+	}
+	return "", nil
 }
 
 func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, callerEP *store.SIPEndpoint) {
@@ -2278,6 +2304,7 @@ func (s *Server) configureAsteriskFromStore() {
 		InContext:               s.cfg.Asterisk.InContext,
 		NodeContext:             s.cfg.Asterisk.NodeContext,
 		OutContext:              s.cfg.Asterisk.OutContext,
+		DefaultPSTNTrunk:        s.cfg.Asterisk.DefaultPSTNTrunk,
 		TrustedGatewayIPs:       s.cfg.Asterisk.TrustedGatewayIPs,
 		NoAuthInboundExtensions: s.cfg.Asterisk.NoAuthInboundExtensions,
 		WebRTCUser:              webrtcUser,

@@ -12,11 +12,12 @@ import (
 // IncomingSIPCall describes an inbound call that Asterisk has received from a
 // SIP phone and delegated to the Simson routing layer.
 type IncomingSIPCall struct {
-	Channel   string // Asterisk channel (e.g. PJSIP/phone1-00000001)
-	Extension string // extension that was dialled (e.g. "1001")
-	CallerID  string // caller number / display name
-	UniqueID  string // Asterisk unique call ID
-	BridgeID  string // ConfBridge room the SIP channel is already parked in
+	Channel        string // Asterisk channel (e.g. PJSIP/phone1-00000001)
+	Extension      string // extension that was dialled (e.g. "1001")
+	CallerID       string // caller number / display name
+	CallerEndpoint string // PJSIP endpoint that Asterisk matched, when available
+	UniqueID       string // Asterisk unique call ID
+	BridgeID       string // ConfBridge room the SIP channel is already parked in
 }
 
 // Router orchestrates call routing between VPS Asterisk (via AMI) and the
@@ -491,6 +492,7 @@ func (r *Router) handleSimsonRoute(ev Event) {
 	channel := ev.Fields["Channel"]
 	extension := strings.TrimSpace(ev.Fields["Extension"])
 	callerID := strings.TrimSpace(ev.Fields["Caller"])
+	callerEndpoint := strings.TrimSpace(ev.Fields["CallerEndpoint"])
 	uniqueID := ev.Fields["UniqueID"]
 	bridgeID := ev.Fields["Bridge"]
 
@@ -502,18 +504,20 @@ func (r *Router) handleSimsonRoute(ev Event) {
 	}
 
 	r.log.Info("incoming SIP call via AMI", map[string]any{
-		"channel":   channel,
-		"extension": extension,
-		"caller_id": callerID,
+		"channel":         channel,
+		"extension":       extension,
+		"caller_id":       callerID,
+		"caller_endpoint": callerEndpoint,
 	})
 
 	if r.OnIncomingCall != nil {
 		r.OnIncomingCall(IncomingSIPCall{
-			Channel:   channel,
-			Extension: extension,
-			CallerID:  callerID,
-			UniqueID:  uniqueID,
-			BridgeID:  bridgeID,
+			Channel:        channel,
+			Extension:      extension,
+			CallerID:       callerID,
+			CallerEndpoint: callerEndpoint,
+			UniqueID:       uniqueID,
+			BridgeID:       bridgeID,
 		})
 	}
 }

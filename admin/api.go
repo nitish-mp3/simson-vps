@@ -910,6 +910,7 @@ func (a *API) reconfigureAsterisk() {
 		InContext:               a.cfg.Asterisk.InContext,
 		NodeContext:             a.cfg.Asterisk.NodeContext,
 		OutContext:              a.cfg.Asterisk.OutContext,
+		DefaultPSTNTrunk:        a.cfg.Asterisk.DefaultPSTNTrunk,
 		TrustedGatewayIPs:       a.cfg.Asterisk.TrustedGatewayIPs,
 		NoAuthInboundExtensions: a.cfg.Asterisk.NoAuthInboundExtensions,
 		WebRTCUser:              webrtcUser,
