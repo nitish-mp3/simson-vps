@@ -67,7 +67,7 @@ func Setup(cfg SetupConfig, endpoints []SIPEndpointDef, log *logging.Logger) err
 	if err := writeConfBridgeConf(root); err != nil {
 		return fmt.Errorf("confbridge.conf: %w", err)
 	}
-	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, cfg.NoAuthInboundExtensions); err != nil {
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, cfg.NoAuthInboundExtensions, endpoints); err != nil {
 		return fmt.Errorf("extensions.conf: %w", err)
 	}
 
@@ -562,7 +562,7 @@ func localIPForICE() string {
 
 // ---- extensions.conf --------------------------------------------------------
 
-func writeDialplanConf(root, inCtx, nodeCtx, outCtx string, noAuthInboundExtensions []string) error {
+func writeDialplanConf(root, inCtx, nodeCtx, outCtx string, noAuthInboundExtensions []string, endpoints []SIPEndpointDef) error {
 	dirName := detectSnippetDirName(root, "extensions.conf", []string{"extensions.d", "extensions.conf.d"}, "extensions.d")
 	dir := filepath.Join(root, dirName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -583,6 +583,7 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx string, noAuthInboundExtensi
 		outCtx = "from-simson-out"
 	}
 
+	directVideoRoutes := buildDirectVideoEndpointDialplan(endpoints)
 	anonymousRoutes := buildAnonymousInboundDialplan(noAuthInboundExtensions)
 
 	content := fmt.Sprintf(
@@ -597,6 +598,12 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx string, noAuthInboundExtensi
 ;   [%s]  — Simson-originated PSTN/landline calls through SIMSON_TRUNK
 ;
 [%s]
+; Direct SIP-video endpoint routes.
+; If a registered video-capable SIP device dials another video-capable endpoint
+; by extension, keep it in a native PJSIP bridge. Sending these calls into the
+; Simson ConfBridge/browser path would drop H.264 video because that path is
+; intentionally audio-only.
+%s
 ; Catch-all: route every incoming SIP call to the Simson control plane.
 exten => _X.,1,NoOp(Simson: incoming call to ${EXTEN} from ${CALLERID(num)})
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
@@ -637,7 +644,9 @@ exten => _X.,1,NoOp(Simson dial SIP endpoint ${EXTEN})
 ; video can negotiate end-to-end between compatible SIP devices.
 exten => _X.,1,NoOp(Simson door camera bridge to SIP endpoint ${EXTEN})
  same  => n,Set(__SIMSON_CALL_ID=${SIMSON_CALL_ID})
- same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},rT)
+ ; Do not force local ringback here. Door stations and video monitors may use
+ ; SIP early media / video preview; the "r" Dial option suppresses that path.
+ same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},T)
  same  => n,Hangup()
 
 [%s]
@@ -664,7 +673,7 @@ exten => s,1,NoOp(Mark Simson outbound child channel ${ARG1})
 exten => _X.,1,Hangup(21)
 exten => i,1,Hangup(21)
 exten => t,1,Hangup(16)
-`, inCtx, nodeCtx, outCtx, inCtx, nodeCtx, outCtx, outCtx, anonymousRoutes)
+`, inCtx, nodeCtx, outCtx, inCtx, directVideoRoutes, nodeCtx, outCtx, outCtx, anonymousRoutes)
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(content), 0640)
 }
@@ -822,6 +831,28 @@ func buildAnonymousInboundDialplan(extensions []string) string {
 		sb.WriteString(" same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})\n")
 		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
 		sb.WriteString(" same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)\n")
+		sb.WriteString(" same  => n,Hangup()\n")
+	}
+	return sb.String()
+}
+
+func buildDirectVideoEndpointDialplan(endpoints []SIPEndpointDef) string {
+	seen := map[string]struct{}{}
+	var sb strings.Builder
+	for _, ep := range endpoints {
+		if !ep.Enabled || !ep.VideoEnabled {
+			continue
+		}
+		ext := sanitizeID(strings.TrimSpace(ep.Extension))
+		if ext == "" {
+			continue
+		}
+		if _, ok := seen[ext]; ok {
+			continue
+		}
+		seen[ext] = struct{}{}
+		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP-video endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
+		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},T)\n")
 		sb.WriteString(" same  => n,Hangup()\n")
 	}
 	return sb.String()

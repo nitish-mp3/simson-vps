@@ -384,6 +384,14 @@ func (s *Store) GetSIPEndpointByExtension(extension string) (*SIPEndpoint, error
 	return scanSIPEndpoint(row)
 }
 
+// GetSIPEndpointByUsername returns the endpoint using this SIP auth username, or nil.
+func (s *Store) GetSIPEndpointByUsername(username string) (*SIPEndpoint, error) {
+	row := s.db.QueryRow(
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, enabled, created_at, updated_at
+		 FROM sip_endpoints WHERE username = ? LIMIT 1`, username)
+	return scanSIPEndpoint(row)
+}
+
 // ListSIPEndpoints returns all endpoints for an account.
 func (s *Store) ListSIPEndpoints(accountID string) ([]SIPEndpoint, error) {
 	rows, err := s.db.Query(

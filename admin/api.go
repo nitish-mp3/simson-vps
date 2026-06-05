@@ -425,7 +425,7 @@ func (a *API) handleAudit(w http.ResponseWriter, r *http.Request) {
 // --- SIP Endpoints ---
 
 func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
-	accountID := r.PathValue("accountId")
+	accountID := strings.TrimSpace(r.PathValue("accountId"))
 	if accountID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing accountId"})
 		return
@@ -443,8 +443,53 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
 		return
 	}
+	body.Extension = strings.TrimSpace(body.Extension)
+	body.Username = strings.TrimSpace(body.Username)
+	body.Password = strings.TrimSpace(body.Password)
+	body.Description = strings.TrimSpace(body.Description)
+	body.RouteTo = strings.TrimSpace(body.RouteTo)
 	if body.Extension == "" || body.Username == "" || body.Password == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "extension, username, and password are required"})
+		return
+	}
+	if !isSafeSIPExtension(body.Extension) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "extension must be 2-12 digits"})
+		return
+	}
+	existing, err := a.store.GetSIPEndpointByUsername(body.Username)
+	if err != nil {
+		a.log.Error("lookup sip endpoint by username", map[string]any{"err": err.Error(), "username": body.Username})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	if existing != nil {
+		status := http.StatusConflict
+		message := "SIP username already exists"
+		if existing.AccountID == accountID {
+			message = "SIP phone already exists for this site. Refresh the list and edit the existing endpoint instead of creating it again."
+		}
+		writeJSON(w, status, map[string]any{
+			"error":             message,
+			"existing_endpoint": existing,
+		})
+		return
+	}
+	if eps, err := a.store.ListSIPEndpoints(accountID); err != nil {
+		a.log.Error("list sip endpoints before create", map[string]any{"err": err.Error(), "account_id": accountID})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	} else {
+		for _, existing := range eps {
+			if existing.Extension == body.Extension {
+				writeJSON(w, http.StatusConflict, map[string]any{
+					"error":             "SIP extension already exists for this site. Refresh the list and edit the existing endpoint instead of creating it again.",
+					"existing_endpoint": existing,
+				})
+				return
+			}
+		}
+	}
+	if !a.validRouteToNode(w, accountID, body.RouteTo) {
 		return
 	}
 	enabled := true
@@ -538,7 +583,10 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		ep.Password = *body.Password
 	}
 	if body.RouteTo != nil {
-		ep.RouteTo = *body.RouteTo
+		ep.RouteTo = strings.TrimSpace(*body.RouteTo)
+		if !a.validRouteToNode(w, ep.AccountID, ep.RouteTo) {
+			return
+		}
 	}
 	if body.VideoEnabled != nil {
 		ep.VideoEnabled = *body.VideoEnabled
@@ -681,6 +729,27 @@ func isSafeSIPExtension(extension string) bool {
 		if ch < '0' || ch > '9' {
 			return false
 		}
+	}
+	return true
+}
+
+func (a *API) validRouteToNode(w http.ResponseWriter, accountID, routeTo string) bool {
+	routeTo = strings.TrimSpace(routeTo)
+	if routeTo == "" {
+		return true
+	}
+	node, err := a.store.GetNode(routeTo)
+	if err != nil {
+		a.log.Error("lookup route_to node", map[string]any{"err": err.Error(), "route_to": routeTo, "account_id": accountID})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return false
+	}
+	if node == nil || node.AccountID != accountID || !node.Enabled {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":    "route_to must be blank or an enabled HAOS node in this same site/account",
+			"route_to": routeTo,
+		})
+		return false
 	}
 	return true
 }

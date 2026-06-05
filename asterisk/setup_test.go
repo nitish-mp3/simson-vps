@@ -22,11 +22,14 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	if err := writePJSIPConf(root, cfg, endpoints); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, nil); err != nil {
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, nil, endpoints); err != nil {
 		t.Fatal(err)
 	}
 
 	pjsip := readTestFile(t, filepath.Join(root, "pjsip.d", "simson.conf"))
+	if strings.Contains(section(pjsip, "[simson-ep-tpl](!)", "[simson-auth-tpl](!)"), "transport=") {
+		t.Fatal("SIP phone template should allow the registered contact transport")
+	}
 	if !strings.Contains(section(pjsip, "[1101](simson-ep-tpl)", "[1101-auth]"), "allow=h264") {
 		t.Fatal("video-capable door endpoint does not opt into H.264")
 	}
@@ -40,6 +43,15 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
 	if !strings.Contains(dialplan, "[from-simson-door]") || !strings.Contains(dialplan, "Dial(PJSIP/${EXTEN}") {
 		t.Fatal("native door station bridge dialplan missing")
+	}
+	if strings.Contains(section(dialplan, "[from-simson-door]", "[from-simson-out]"), "Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},r") {
+		t.Fatal("door station bridge should not force local ringback because it suppresses early media/video preview")
+	}
+	if !strings.Contains(dialplan, "exten => 1101,1,NoOp(Simson direct SIP-video endpoint") {
+		t.Fatal("video-capable SIP endpoint direct route missing")
+	}
+	if strings.Contains(dialplan, "exten => 1025,1,NoOp(Simson direct SIP-video endpoint") {
+		t.Fatal("audio-only SIP endpoint unexpectedly got direct video route")
 	}
 }
 
@@ -79,7 +91,7 @@ exten => 1001,1,Answer()
 	if err := writePJSIPConf(root, SetupConfig{SIPDomain: "simson-vps.vipsy.in"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeDialplanConf(root, "from-simson-sip", "from-simson-node", "from-simson-out", nil); err != nil {
+	if err := writeDialplanConf(root, "from-simson-sip", "from-simson-node", "from-simson-out", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
