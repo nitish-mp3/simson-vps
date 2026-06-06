@@ -310,12 +310,13 @@ func (s *Server) HandleNodeDoorNodeEvent(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var body struct {
-		SourceExtension string   `json:"source_extension"`
-		TargetNodeID    string   `json:"target_node_id"`
-		TargetNodeIDs   []string `json:"target_node_ids"`
-		CallerID        string   `json:"caller_id"`
-		TriggerID       string   `json:"trigger_id"`
-		TimeoutSec      int      `json:"timeout_sec"`
+		SourceExtension     string   `json:"source_extension"`
+		TargetNodeID        string   `json:"target_node_id"`
+		TargetNodeIDs       []string `json:"target_node_ids"`
+		TargetSIPExtensions []string `json:"target_sip_extensions"`
+		CallerID            string   `json:"caller_id"`
+		TriggerID           string   `json:"trigger_id"`
+		TimeoutSec          int      `json:"timeout_sec"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -360,11 +361,6 @@ func (s *Server) HandleNodeDoorNodeEvent(w http.ResponseWriter, r *http.Request)
 	for _, id := range body.TargetNodeIDs {
 		appendTarget(id)
 	}
-	if len(targetNodeIDs) == 0 {
-		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "target_node_id is required"})
-		return
-	}
-
 	onlineTargets := make([]string, 0, len(targetNodeIDs))
 	for _, targetNodeID := range targetNodeIDs {
 		targetNode, err := s.store.GetNode(targetNodeID)
@@ -381,8 +377,45 @@ func (s *Server) HandleNodeDoorNodeEvent(w http.ResponseWriter, r *http.Request)
 			onlineTargets = append(onlineTargets, targetNodeID)
 		}
 	}
-	if len(onlineTargets) == 0 {
-		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "no selected HAOS node is online"})
+	targetSIPExtensions := make([]string, 0, len(body.TargetSIPExtensions))
+	for _, ext := range body.TargetSIPExtensions {
+		ext = strings.TrimSpace(ext)
+		if ext == "" {
+			continue
+		}
+		if !isSafeDoorSIPExtension(ext) || ext == source {
+			writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "target_sip_extensions must contain numeric SIP extensions different from source_extension"})
+			return
+		}
+		already := false
+		for _, existing := range targetSIPExtensions {
+			if existing == ext {
+				already = true
+				break
+			}
+		}
+		if already {
+			continue
+		}
+		ep, err := s.store.GetSIPEndpointByExtension(ext)
+		if err != nil {
+			s.log.Error("door SIP fanout target lookup failed", map[string]any{"err": err.Error(), "ext": ext})
+			writeNodeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+			return
+		}
+		if ep == nil || ep.AccountID != node.AccountID || !ep.Enabled {
+			writeNodeJSON(w, http.StatusNotFound, map[string]any{"error": "SIP fanout target not found for this site", "target_extension": ext})
+			return
+		}
+		if !s.asterisk.EndpointHasContacts(ext) {
+			writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "SIP fanout target is not registered", "target_extension": ext})
+			return
+		}
+		targetSIPExtensions = append(targetSIPExtensions, ext)
+	}
+
+	if len(onlineTargets) == 0 && len(targetSIPExtensions) == 0 {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "no selected HAOS node is online and no SIP fanout target is registered"})
 		return
 	}
 
@@ -395,7 +428,9 @@ func (s *Server) HandleNodeDoorNodeEvent(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	key := node.AccountID + ":" + source + ":haos:" + strings.Join(onlineTargets, ",")
+	keyParts := append([]string{}, onlineTargets...)
+	keyParts = append(keyParts, targetSIPExtensions...)
+	key := node.AccountID + ":" + source + ":shared:" + strings.Join(keyParts, ",")
 	s.doorEventMu.Lock()
 	last := s.doorEventLast[key]
 	if elapsed := time.Since(last); !last.IsZero() && elapsed < time.Duration(timeoutSec)*time.Second {
@@ -417,7 +452,7 @@ func (s *Server) HandleNodeDoorNodeEvent(w http.ResponseWriter, r *http.Request)
 	c := &calls.Call{
 		ID:          callID,
 		FromNode:    "sip:" + source,
-		ToNode:      onlineTargets[0],
+		ToNode:      firstNonEmpty(onlineTargets, targetSIPExtensions),
 		InviteNodes: append([]string(nil), onlineTargets...),
 		AccountID:   node.AccountID,
 		CallType:    "sip",
@@ -464,15 +499,47 @@ func (s *Server) HandleNodeDoorNodeEvent(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	s.store.WriteAudit(node.AccountID, node.ID, "door_event_haos_call", "trigger="+strings.TrimSpace(body.TriggerID)+" source="+source+" targets="+strings.Join(onlineTargets, ","), extractIP(r))
-	s.log.Info("node door station HAOS bridge started", map[string]any{"account_id": node.AccountID, "node_id": node.ID, "call_id": callID, "source": source, "targets": onlineTargets, "bridge": bridgeID})
+	originatedSIPExtensions := make([]string, 0, len(targetSIPExtensions))
+	for _, ext := range targetSIPExtensions {
+		if !s.reserveSIPBridgeTransfer(bridgeID, ext) {
+			continue
+		}
+		if _, err := s.asterisk.OriginateToExtension(
+			ext,
+			s.cfg.Asterisk.NodeContext,
+			bridgeID,
+			callerID,
+			callID,
+			node.ID,
+			timeoutSec,
+		); err != nil {
+			s.releaseSIPBridgeTransfer(bridgeID, ext)
+			s.log.Warn("door SIP fanout target originate failed", map[string]any{"call_id": callID, "ext": ext, "err": err.Error()})
+			continue
+		}
+		originatedSIPExtensions = append(originatedSIPExtensions, ext)
+	}
+
+	s.store.WriteAudit(node.AccountID, node.ID, "door_event_shared_call", "trigger="+strings.TrimSpace(body.TriggerID)+" source="+source+" haos="+strings.Join(onlineTargets, ",")+" sip="+strings.Join(originatedSIPExtensions, ","), extractIP(r))
+	s.log.Info("node door station shared bridge started", map[string]any{"account_id": node.AccountID, "node_id": node.ID, "call_id": callID, "source": source, "haos_targets": onlineTargets, "sip_targets": originatedSIPExtensions, "bridge": bridgeID})
 	writeNodeJSON(w, http.StatusAccepted, map[string]any{
-		"call_id":          callID,
-		"sip_bridge_id":    bridgeID,
-		"status":           "calling_door_station",
-		"source_extension": source,
-		"target_node_ids":  onlineTargets,
+		"call_id":               callID,
+		"sip_bridge_id":         bridgeID,
+		"status":                "calling_door_station",
+		"source_extension":      source,
+		"target_node_ids":       onlineTargets,
+		"target_sip_extensions": originatedSIPExtensions,
 	})
+}
+
+func firstNonEmpty(primary, secondary []string) string {
+	if len(primary) > 0 && strings.TrimSpace(primary[0]) != "" {
+		return primary[0]
+	}
+	if len(secondary) > 0 && strings.TrimSpace(secondary[0]) != "" {
+		return "sip:" + strings.TrimSpace(secondary[0])
+	}
+	return ""
 }
 
 func isSafeDoorSIPExtension(extension string) bool {
