@@ -249,6 +249,45 @@ func (r *Router) OriginateDoorStationCall(sourceExtension, targetExtension, call
 	return actionID, nil
 }
 
+// OriginateDoorStationToBridge calls an outdoor SIP station and parks it in a
+// ConfBridge room so HAOS/browser cards can join the same SIP media bridge via
+// WebRTC. Native SIP-to-SIP video calls should keep using OriginateDoorStationCall.
+func (r *Router) OriginateDoorStationToBridge(sourceExtension, bridgeExt, callerID, callID string, timeoutSec int) (string, error) {
+	channel := fmt.Sprintf("PJSIP/%s", sourceExtension)
+	actionID := uuid.NewString()
+	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", sourceExtension))
+
+	r.originateMu.Lock()
+	r.actionIDToCallID[actionID] = callID
+	r.originateMu.Unlock()
+
+	vars := map[string]string{
+		"SIMSON_CALL_ID":      callID,
+		"__SIMSON_CALL_ID":    callID,
+		"SIMSON_BRIDGE_ID":    bridgeExt,
+		"__SIMSON_BRIDGE_ID":  bridgeExt,
+		"SIMSON_WAIT_TIMEOUT": fmt.Sprintf("%d", timeoutSec),
+	}
+	_, err := r.ami.OriginateWithVarsAndCodecs(
+		channel,
+		"from-simson-node",
+		bridgeExt,
+		callerID,
+		timeoutSec*1000,
+		actionID,
+		vars,
+		"ulaw,alaw",
+	)
+	if err != nil {
+		r.originateMu.Lock()
+		delete(r.actionIDToCallID, actionID)
+		r.originateMu.Unlock()
+		return "", err
+	}
+
+	return actionID, nil
+}
+
 // OriginateToTrunk dials an external number through an existing PJSIP trunk and
 // then sends the answered leg into the same ConfBridge extension used by SIP
 // phone calls.

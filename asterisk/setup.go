@@ -847,11 +847,23 @@ func buildSIPPhoneOutboundDialplan(defaultTrunk string) string {
 		return "; No default PSTN trunk configured.\n"
 	}
 	var sb strings.Builder
+	fmt.Fprintf(&sb, "exten => _+%s91XXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk, trunk)
+	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN:%d}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", len(trunk)+3, trunk)
+	sb.WriteString(" same  => n,Hangup()\n")
+	fmt.Fprintf(&sb, "exten => _+%sXXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk, trunk)
+	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN:%d}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", len(trunk)+1, trunk)
+	sb.WriteString(" same  => n,Hangup()\n")
 	fmt.Fprintf(&sb, "exten => _%s91XXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk, trunk)
 	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN:%d}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", len(trunk)+2, trunk)
 	sb.WriteString(" same  => n,Hangup()\n")
 	fmt.Fprintf(&sb, "exten => _%sXXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk, trunk)
 	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN:%d}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", len(trunk), trunk)
+	sb.WriteString(" same  => n,Hangup()\n")
+	fmt.Fprintf(&sb, "exten => _+91XXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk)
+	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN:3}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", trunk)
+	sb.WriteString(" same  => n,Hangup()\n")
+	fmt.Fprintf(&sb, "exten => _+XXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk)
+	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN:1}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", trunk)
 	sb.WriteString(" same  => n,Hangup()\n")
 	fmt.Fprintf(&sb, "exten => _91XXXXXXXXXX,1,NoOp(SIP phone outside call ${CALLERID(num)} -> ${EXTEN} via %s)\n", trunk)
 	fmt.Fprintf(&sb, " same  => n,Dial(PJSIP/${EXTEN:2}@%s,${SIMSON_WAIT_TIMEOUT:=120},rT)\n", trunk)

@@ -296,6 +296,185 @@ func (s *Server) HandleNodeDoorEvent(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// HandleNodeDoorNodeEvent starts an audio bridge between a door SIP station and
+// one or more HAOS/browser nodes. This is intentionally separate from
+// HandleNodeDoorEvent: native SIP-to-SIP H.264 door video is preserved there,
+// while HAOS/browser cards join this ConfBridge-backed path via WebRTC audio.
+func (s *Server) HandleNodeDoorNodeEvent(w http.ResponseWriter, r *http.Request) {
+	node, ok := s.authenticateNodeRequest(w, r, "door-node-event")
+	if !ok {
+		return
+	}
+	if s.asterisk == nil || !s.asterisk.Connected() {
+		writeNodeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Asterisk integration unavailable"})
+		return
+	}
+	var body struct {
+		SourceExtension string   `json:"source_extension"`
+		TargetNodeID    string   `json:"target_node_id"`
+		TargetNodeIDs   []string `json:"target_node_ids"`
+		CallerID        string   `json:"caller_id"`
+		TriggerID       string   `json:"trigger_id"`
+		TimeoutSec      int      `json:"timeout_sec"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+
+	source := strings.TrimSpace(body.SourceExtension)
+	if !isSafeDoorSIPExtension(source) {
+		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "source_extension must be a numeric SIP extension"})
+		return
+	}
+	sourceEP, err := s.store.GetSIPEndpointByExtension(source)
+	if err != nil {
+		s.log.Error("door source lookup failed", map[string]any{"err": err.Error()})
+		writeNodeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	if sourceEP == nil || sourceEP.AccountID != node.AccountID {
+		writeNodeJSON(w, http.StatusNotFound, map[string]any{"error": "door station not found for this site"})
+		return
+	}
+	if !s.asterisk.EndpointHasContacts(source) {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "door station is not registered"})
+		return
+	}
+
+	targetNodeIDs := make([]string, 0, len(body.TargetNodeIDs)+1)
+	appendTarget := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		for _, existing := range targetNodeIDs {
+			if existing == id {
+				return
+			}
+		}
+		targetNodeIDs = append(targetNodeIDs, id)
+	}
+	appendTarget(body.TargetNodeID)
+	for _, id := range body.TargetNodeIDs {
+		appendTarget(id)
+	}
+	if len(targetNodeIDs) == 0 {
+		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "target_node_id is required"})
+		return
+	}
+
+	onlineTargets := make([]string, 0, len(targetNodeIDs))
+	for _, targetNodeID := range targetNodeIDs {
+		targetNode, err := s.store.GetNode(targetNodeID)
+		if err != nil {
+			s.log.Error("door HAOS target lookup failed", map[string]any{"err": err.Error(), "node_id": targetNodeID})
+			writeNodeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+			return
+		}
+		if targetNode == nil || targetNode.AccountID != node.AccountID || !targetNode.Enabled {
+			writeNodeJSON(w, http.StatusNotFound, map[string]any{"error": "target HAOS node not found for this site", "target_node_id": targetNodeID})
+			return
+		}
+		if targetSess := s.hub.Get(targetNodeID); targetSess != nil && targetSess.AccountID == node.AccountID {
+			onlineTargets = append(onlineTargets, targetNodeID)
+		}
+	}
+	if len(onlineTargets) == 0 {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "no selected HAOS node is online"})
+		return
+	}
+
+	timeoutSec := body.TimeoutSec
+	if timeoutSec == 0 {
+		timeoutSec = 30
+	}
+	if timeoutSec < 5 || timeoutSec > 120 {
+		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "timeout_sec must be between 5 and 120"})
+		return
+	}
+
+	key := node.AccountID + ":" + source + ":haos:" + strings.Join(onlineTargets, ",")
+	s.doorEventMu.Lock()
+	last := s.doorEventLast[key]
+	if elapsed := time.Since(last); !last.IsZero() && elapsed < time.Duration(timeoutSec)*time.Second {
+		retryAfter := int((time.Duration(timeoutSec)*time.Second - elapsed).Seconds()) + 1
+		s.doorEventMu.Unlock()
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		writeNodeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "door event rate limited", "retry_after": retryAfter})
+		return
+	}
+	s.doorEventLast[key] = time.Now()
+	s.doorEventMu.Unlock()
+
+	callerID := strings.TrimSpace(body.CallerID)
+	if callerID == "" {
+		callerID = "\"Door Station\" <" + source + ">"
+	}
+	callID := "call_" + uuid.NewString()
+	bridgeID := "bridge-" + strings.TrimPrefix(callID, "call_")
+	c := &calls.Call{
+		ID:          callID,
+		FromNode:    "sip:" + source,
+		ToNode:      onlineTargets[0],
+		InviteNodes: append([]string(nil), onlineTargets...),
+		AccountID:   node.AccountID,
+		CallType:    "sip",
+		SIPBridgeID: bridgeID,
+		CallerID:    callerID,
+	}
+	if !s.calls.Create(c) {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "duplicate call"})
+		return
+	}
+
+	meta, _ := json.Marshal(map[string]string{
+		"sip_bridge_id":         bridgeID,
+		"sip_caller_id":         callerID,
+		"sip_extension":         source,
+		"door_source_extension": source,
+		"door_trigger_id":       strings.TrimSpace(body.TriggerID),
+		"media_mode":            "webrtc-audio",
+	})
+	invite := protocol.NewEnvelope(protocol.TypeCallInvite, protocol.CallInvitePayload{
+		CallID:     callID,
+		FromNodeID: "sip:" + source,
+		FromLabel:  callerID,
+		CallType:   "sip",
+		Metadata:   json.RawMessage(meta),
+	})
+	inviteData, _ := invite.Encode()
+	for _, targetNodeID := range onlineTargets {
+		if targetSess := s.hub.Get(targetNodeID); targetSess != nil && targetSess.AccountID == node.AccountID {
+			targetSess.Send(inviteData)
+		}
+	}
+
+	if _, err := s.asterisk.OriginateDoorStationToBridge(source, bridgeID, callerID, callID, timeoutSec); err != nil {
+		if ended, ok := s.calls.End(callID, "originate_failed"); ok {
+			s.notifyCallStatus(ended)
+		}
+		s.asterisk.UntrackCall(callID)
+		s.doorEventMu.Lock()
+		delete(s.doorEventLast, key)
+		s.doorEventMu.Unlock()
+		s.log.Error("door station HAOS bridge originate failed", map[string]any{"err": err.Error(), "source": source, "targets": onlineTargets})
+		writeNodeJSON(w, http.StatusBadGateway, map[string]any{"error": "could not start door station HAOS bridge"})
+		return
+	}
+
+	s.store.WriteAudit(node.AccountID, node.ID, "door_event_haos_call", "trigger="+strings.TrimSpace(body.TriggerID)+" source="+source+" targets="+strings.Join(onlineTargets, ","), extractIP(r))
+	s.log.Info("node door station HAOS bridge started", map[string]any{"account_id": node.AccountID, "node_id": node.ID, "call_id": callID, "source": source, "targets": onlineTargets, "bridge": bridgeID})
+	writeNodeJSON(w, http.StatusAccepted, map[string]any{
+		"call_id":          callID,
+		"sip_bridge_id":    bridgeID,
+		"status":           "calling_door_station",
+		"source_extension": source,
+		"target_node_ids":  onlineTargets,
+	})
+}
+
 func isSafeDoorSIPExtension(extension string) bool {
 	if len(extension) < 2 || len(extension) > 12 {
 		return false

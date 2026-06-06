@@ -118,6 +118,7 @@ func main() {
 	mux.HandleFunc("/ws", srv.HandleWS)
 	mux.HandleFunc("/node/webrtc-config", srv.HandleNodeWebRTCConfig)
 	mux.HandleFunc("/node/door-events", srv.HandleNodeDoorEvent)
+	mux.HandleFunc("/node/door-node-events", srv.HandleNodeDoorNodeEvent)
 
 	// Admin endpoints.
 	adminRouter := adminAPI.Router()
