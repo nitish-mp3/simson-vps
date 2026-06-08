@@ -1879,14 +1879,12 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 		return
 	}
 
-	trunk := strings.TrimSpace(s.cfg.Asterisk.DefaultPSTNTrunk)
-	if trunk == "" {
-		trunk = "7009"
-	}
+	rawDigits := digitsOnly(in.Extension)
+	trunk := s.selectOutboundGatewayTrunk(callerEP.AccountID, rawDigits)
 	// Desk/SIP phones should control the PSTN dial string. Do not apply the
 	// HAOS-card trunk normalization here as the first attempt. Keep alternates
 	// ready so callback formats can recover from gateway/operator differences.
-	number := stripOutboundTrunkPrefix(digitsOnly(in.Extension), trunk)
+	number := stripOutboundTrunkPrefix(rawDigits, trunk)
 	numbers := sipOutboundDialCandidates(number)
 	if len(numbers) == 0 || !isSafeDialNumber(numbers[0]) || !isSafeAsteriskName(trunk) {
 		s.log.Warn("rejecting unsafe SIP-phone outbound gateway dial",
@@ -1943,6 +1941,49 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 	s.log.Info("SIP-phone outbound gateway call originated", map[string]any{
 		"call_id": callID, "caller_ext": callerEP.Extension, "number": numbers[0], "candidates": strings.Join(numbers, ","), "trunk": trunk,
 	})
+}
+
+func (s *Server) selectOutboundGatewayTrunk(accountID, rawDigits string) string {
+	endpoints, err := s.store.ListSIPEndpoints(accountID)
+	if err != nil {
+		s.log.Warn("failed to list SIP endpoints for gateway selection",
+			map[string]any{"account": accountID, "err": err.Error()})
+	}
+
+	defaultTrunk := strings.TrimSpace(s.cfg.Asterisk.DefaultPSTNTrunk)
+	if defaultTrunk == "" {
+		defaultTrunk = "7009"
+	}
+	var fallback string
+	fallbackRank := -1
+	var defaultAvailable string
+	for _, ep := range endpoints {
+		ext := strings.TrimSpace(ep.Extension)
+		if !ep.Enabled || !isGatewayLikeTrunk(ext, defaultTrunk) {
+			continue
+		}
+		if rawDigits != "" && strings.HasPrefix(rawDigits, ext) {
+			rest := strings.TrimPrefix(rawDigits, ext)
+			if len(rest) >= 7 && len(rest) <= 15 {
+				return ext
+			}
+		}
+		if ext == defaultTrunk {
+			defaultAvailable = ext
+		}
+		rank, _ := strconv.Atoi(digitsOnly(ext))
+		if fallback == "" || rank > fallbackRank {
+			fallback = ext
+			fallbackRank = rank
+		}
+	}
+	if defaultAvailable != "" {
+		return defaultAvailable
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return defaultTrunk
 }
 
 func (s *Server) setSIPOutboundRetry(callID string, retry *sipOutboundRetry) {
@@ -2128,11 +2169,8 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 	}
 	if call != nil && call.State == calls.StateRinging && s.isOutboundGatewayCall(call) && strings.HasPrefix(channel, "PJSIP/") {
 		callerExt := strings.TrimPrefix(call.FromNode, "sip:")
-		trunk := strings.TrimSpace(s.cfg.Asterisk.DefaultPSTNTrunk)
-		if trunk == "" {
-			trunk = "7009"
-		}
-		if strings.HasPrefix(channel, "PJSIP/"+trunk+"-") {
+		trunk := extractEndpointFromChannel(channel)
+		if isGatewayLikeTrunk(trunk, s.cfg.Asterisk.DefaultPSTNTrunk) {
 			// Let the OriginateResponse drive retry/exhaustion. Ending here can
 			// cut off the SIP phone before the alternate dial form is attempted.
 			s.log.Info("gateway leg hung up before answer; waiting for originate result",
@@ -2430,15 +2468,26 @@ func stripCommonDialAccessPrefix(digits string) string {
 }
 
 func normalizePSTNDigits(digits, trunk, defaultTrunk string) string {
+	if isGatewayLikeTrunk(trunk, defaultTrunk) && len(digits) == 12 && strings.HasPrefix(digits, "91") {
+		return digits[2:]
+	}
+	return digits
+}
+
+func isGatewayLikeTrunk(trunk, defaultTrunk string) bool {
 	trunk = strings.TrimSpace(trunk)
+	if trunk == "" {
+		return false
+	}
 	defaultTrunk = strings.TrimSpace(defaultTrunk)
 	if defaultTrunk == "" {
 		defaultTrunk = "7009"
 	}
-	if trunk == defaultTrunk && len(digits) == 12 && strings.HasPrefix(digits, "91") {
-		return digits[2:]
+	if trunk == defaultTrunk {
+		return true
 	}
-	return digits
+	digits := digitsOnly(trunk)
+	return digits == trunk && strings.HasPrefix(digits, "70") && len(digits) >= 3 && len(digits) <= 8
 }
 
 func isExternalDialString(value string) bool {

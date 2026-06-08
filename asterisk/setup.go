@@ -585,7 +585,6 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 	}
 
 	directVideoRoutes := buildDirectVideoEndpointDialplan(endpoints)
-	sipPhoneOutboundRoutes := buildSIPPhoneOutboundDialplan(defaultPSTNTrunk)
 	anonymousRoutes := buildAnonymousInboundDialplan(noAuthInboundExtensions)
 
 	content := fmt.Sprintf(
@@ -606,10 +605,16 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 ; Simson ConfBridge/browser path would drop H.264 video because that path is
 ; intentionally audio-only.
 %s
-; Direct SIP-phone outside dialing via the default gateway trunk.
-; This keeps desk-phone callbacks fast and independent of HAOS/card state.
-%s
+; SIP-phone outside dialing is intentionally routed through the catch-all
+; SimsonRoute event below. The VPS then chooses an enabled gateway trunk scoped
+; to the caller's account/site instead of hardwiring a global default trunk.
 ; Catch-all: route every incoming SIP call to the Simson control plane.
+exten => _+X.,1,NoOp(Simson: incoming E.164 SIP call to ${EXTEN} from ${CALLERID(num)})
+ same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
+ same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
+ same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
+ same  => n,Hangup()
+
 exten => _X.,1,NoOp(Simson: incoming call to ${EXTEN} from ${CALLERID(num)})
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
  same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
@@ -678,7 +683,7 @@ exten => s,1,NoOp(Mark Simson outbound child channel ${ARG1})
 exten => _X.,1,Hangup(21)
 exten => i,1,Hangup(21)
 exten => t,1,Hangup(16)
-`, inCtx, nodeCtx, outCtx, inCtx, directVideoRoutes, sipPhoneOutboundRoutes, nodeCtx, outCtx, outCtx, anonymousRoutes)
+`, inCtx, nodeCtx, outCtx, inCtx, directVideoRoutes, nodeCtx, outCtx, outCtx, anonymousRoutes)
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(content), 0640)
 }

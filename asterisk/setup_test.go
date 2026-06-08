@@ -53,8 +53,12 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	if strings.Contains(dialplan, "exten => 1025,1,NoOp(Simson direct SIP-video endpoint") {
 		t.Fatal("audio-only SIP endpoint unexpectedly got direct video route")
 	}
-	if !strings.Contains(dialplan, "Dial(PJSIP/${EXTEN}@7009") || !strings.Contains(dialplan, "Dial(PJSIP/${EXTEN:2}@7009") || !strings.Contains(dialplan, "Dial(PJSIP/${EXTEN:3}@7009") {
-		t.Fatal("SIP-phone PSTN fallback routes missing")
+	inboundSIP := section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n")
+	if strings.Contains(inboundSIP, "@7009") {
+		t.Fatal("SIP-phone PSTN calls should route through SimsonRoute, not a hardwired default trunk")
+	}
+	if !strings.Contains(inboundSIP, "UserEvent(SimsonRoute") {
+		t.Fatal("SIP-phone PSTN calls must reach SimsonRoute for per-account gateway selection")
 	}
 }
 
