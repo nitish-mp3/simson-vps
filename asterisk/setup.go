@@ -265,15 +265,15 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 	// ── Global settings ──────────────────────────────────────────────────────
 	trustedGatewayIPs := normalizeIPList(cfg.TrustedGatewayIPs)
 	noAuthInbound := stringSet(cfg.NoAuthInboundExtensions)
-	enableAnonymousIngress := len(noAuthInbound) > 0 && len(trustedGatewayIPs) == 0
+	enableAnonymousIngress := len(noAuthInbound) > 0
 
 	// Prefer username matching first so registered phones authenticate normally.
-	// Trusted gateway IP matching handles Synway-style inbound INVITEs that
-	// cannot digest-auth. Only fall back to anonymous when no trusted gateway IP
-	// is configured, because public anonymous REGISTER floods otherwise spam
-	// Asterisk and waste SIP worker time.
+	// A site often has gateways and desk phones behind the same public NAT IP.
+	// Broad IP identification would classify phone REGISTERs as the gateway
+	// endpoint and prevent normal registration, so no-auth gateway ingress uses
+	// the locked-down anonymous dialplan instead of an IP identify rule.
 	endpointOrder := "username"
-	if len(trustedGatewayIPs) > 0 {
+	if len(trustedGatewayIPs) > 0 && !enableAnonymousIngress {
 		endpointOrder += ",ip"
 	}
 	if enableAnonymousIngress {
@@ -419,7 +419,7 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 		fmt.Fprintf(&sb, "[%s](simson-aor-tpl)\n\n", aorName)
 	}
 
-	if len(trustedGatewayIPs) > 0 {
+	if len(trustedGatewayIPs) > 0 && !enableAnonymousIngress {
 		aors := gatewayAORList(endpoints)
 		if aors != "" {
 			sb.WriteString("[simson-trusted-gateway-in](simson-gateway-in-tpl)\n")

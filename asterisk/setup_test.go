@@ -125,6 +125,45 @@ exten => 1001,1,Answer()
 	}
 }
 
+func TestNoAuthGatewayDoesNotSwallowRegisteredPhonesBehindSameNAT(t *testing.T) {
+	root := t.TempDir()
+	cfg := SetupConfig{
+		SIPDomain:               "simson-vps.vipsy.in",
+		TrustedGatewayIPs:       []string{"122.176.123.212"},
+		NoAuthInboundExtensions: []string{"7009"},
+		InContext:               "from-simson-sip",
+		NodeContext:             "from-simson-node",
+		OutContext:              "from-simson-out",
+		DefaultPSTNTrunk:        "7009",
+	}
+	endpoints := []SIPEndpointDef{
+		{ID: "desk", Extension: "0001", Username: "0001", Password: "secret", Enabled: true},
+		{ID: "gateway", Extension: "7009", Username: "7009", Password: "secret", Enabled: true},
+	}
+	if err := writePJSIPConf(root, cfg, endpoints); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, cfg.DefaultPSTNTrunk, cfg.NoAuthInboundExtensions, endpoints); err != nil {
+		t.Fatal(err)
+	}
+
+	pjsip := readTestFile(t, filepath.Join(root, "pjsip.d", "simson.conf"))
+	if !strings.Contains(pjsip, "endpoint_identifier_order=username,anonymous") {
+		t.Fatal("no-auth gateway ingress must not use IP identify because phones can share the same public NAT IP")
+	}
+	if strings.Contains(pjsip, "simson-trusted-gateway-in-identify") || strings.Contains(pjsip, "match=122.176.123.212") {
+		t.Fatal("trusted gateway IP identify would swallow desk-phone REGISTERs from the same public NAT")
+	}
+	if !strings.Contains(pjsip, "[0001](simson-ep-tpl)") || !strings.Contains(pjsip, "username=0001") {
+		t.Fatal("leading-zero SIP endpoint was not generated as a normal registered phone")
+	}
+
+	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
+	if !strings.Contains(dialplan, "exten => 7009,1,NoOp(Simson anonymous gateway call") {
+		t.Fatal("no-auth gateway extension missing from locked-down anonymous dialplan")
+	}
+}
+
 func readTestFile(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)

@@ -1881,11 +1881,13 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 
 	rawDigits := digitsOnly(in.Extension)
 	trunk := s.selectOutboundGatewayTrunk(callerEP.AccountID, rawDigits)
-	// Desk/SIP phones should control the PSTN dial string. Do not apply the
-	// HAOS-card trunk normalization here as the first attempt. Keep alternates
-	// ready so callback formats can recover from gateway/operator differences.
+	// Desk/SIP phones should control the PSTN dial string, but Synway-style
+	// gateway trunks expect the same normalized form as HAOS-originated calls.
+	// Try that proven form first, then fall back to the handset's raw callback
+	// variants so redial formats can recover from gateway/operator differences.
 	number := stripOutboundTrunkPrefix(rawDigits, trunk)
-	numbers := sipOutboundDialCandidates(number)
+	preferred := normalizePSTNDigits(number, trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
+	numbers := outboundGatewayDialCandidates(number, preferred)
 	if len(numbers) == 0 || !isSafeDialNumber(numbers[0]) || !isSafeAsteriskName(trunk) {
 		s.log.Warn("rejecting unsafe SIP-phone outbound gateway dial",
 			map[string]any{"extension": in.Extension, "caller_ext": callerEP.Extension, "trunk": trunk})
@@ -2160,12 +2162,17 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 		return
 	}
 	if call != nil && s.isInboundSIPBridgeCall(call) && s.isSecondarySIPEndpointChannel(channel, call) {
-		// A routed SIP desk-phone leg can fail or be cancelled after the HAOS
-		// browser has already answered. That leg must not tear down the original
-		// gateway caller, otherwise answered calls drop within a second.
-		s.log.Info("secondary SIP bridge leg hung up; keeping original incoming call alive",
+		// Before answer, a routed SIP desk-phone leg can fail, be cancelled, or be
+		// retried without meaning the original gateway caller hung up. Once that
+		// leg has answered, its hangup is the user ending the bridged call and must
+		// clear the outside caller too.
+		if call.State != calls.StateActive || call.AnsweredAt.IsZero() {
+			s.log.Info("secondary SIP bridge leg hung up before answer; keeping original incoming call alive",
+				map[string]any{"call_id": callID, "channel": channel, "state": call.State})
+			return
+		}
+		s.log.Info("secondary SIP bridge leg hung up after answer; ending incoming bridge",
 			map[string]any{"call_id": callID, "channel": channel, "state": call.State})
-		return
 	}
 	if call != nil && call.State == calls.StateRinging && s.isOutboundGatewayCall(call) && strings.HasPrefix(channel, "PJSIP/") {
 		callerExt := strings.TrimPrefix(call.FromNode, "sip:")
