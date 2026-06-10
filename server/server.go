@@ -51,6 +51,8 @@ type Server struct {
 
 	doorEventMu   sync.Mutex
 	doorEventLast map[string]time.Time
+
+	asteriskStartupCleanupDone bool
 }
 
 type sipOutboundRetry struct {
@@ -1655,10 +1657,12 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 
 	var accountID string
 	var routeTo string
+	sourceExt := strings.TrimSpace(in.Extension)
 
 	if ep != nil {
 		accountID = ep.AccountID
 		routeTo = ep.RouteTo
+		sourceExt = ep.Extension
 	} else {
 		// Step 2: no matching dialled endpoint — identify the caller’s account
 		// from the Asterisk channel name (e.g. "PJSIP/7001-00000001" → ext
@@ -1708,11 +1712,12 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		}
 		accountID = callerEP.AccountID
 		routeTo = callerEP.RouteTo
+		sourceExt = callerEP.Extension
 	}
 
-	if s.shouldSuppressIncomingSIPInvite(accountID, in) {
+	if s.shouldSuppressIncomingSIPInvite(accountID, in, sourceExt) {
 		s.log.Warn("suppressing duplicate SIP incoming invite",
-			map[string]any{"extension": in.Extension, "caller_id": in.CallerID, "channel": in.Channel, "bridge": in.BridgeID})
+			map[string]any{"extension": in.Extension, "source_ext": sourceExt, "caller_id": in.CallerID, "channel": in.Channel, "bridge": in.BridgeID})
 		if s.asterisk != nil {
 			s.hangupAsteriskChannelAsync(in.Channel, "no route target")
 		}
@@ -1787,7 +1792,7 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	callID := "call_" + uuid.NewString()
 	c := &calls.Call{
 		ID:          callID,
-		FromNode:    "sip:" + in.Extension,
+		FromNode:    "sip:" + sourceExt,
 		ToNode:      primaryNode,
 		InviteNodes: append([]string(nil), targetNodeIDs...),
 		AccountID:   accountID,
@@ -1808,16 +1813,17 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	}
 
 	sipMeta, _ := json.Marshal(map[string]string{
-		"sip_channel":   in.Channel,
-		"sip_bridge_id": in.BridgeID,
-		"sip_caller_id": in.CallerID,
-		"sip_extension": in.Extension,
-		"sip_unique_id": in.UniqueID,
+		"sip_channel":          in.Channel,
+		"sip_bridge_id":        in.BridgeID,
+		"sip_caller_id":        in.CallerID,
+		"sip_extension":        in.Extension,
+		"sip_source_extension": sourceExt,
+		"sip_unique_id":        in.UniqueID,
 	})
 
 	invite := protocol.NewEnvelope(protocol.TypeCallInvite, protocol.CallInvitePayload{
 		CallID:     callID,
-		FromNodeID: "sip:" + in.Extension,
+		FromNodeID: "sip:" + sourceExt,
 		FromLabel:  callerDisplay,
 		CallType:   "sip",
 		Metadata:   json.RawMessage(sipMeta),
@@ -2088,9 +2094,12 @@ func (s *Server) trySIPPhoneOutboundGateway(callID string) bool {
 	return true
 }
 
-func (s *Server) shouldSuppressIncomingSIPInvite(accountID string, in asterisk.IncomingSIPCall) bool {
+func (s *Server) shouldSuppressIncomingSIPInvite(accountID string, in asterisk.IncomingSIPCall, sourceExt string) bool {
 	now := time.Now().UTC()
 	callerExt := extractEndpointFromChannel(in.Channel)
+	if strings.TrimSpace(sourceExt) == "" {
+		sourceExt = callerExt
+	}
 	key := strings.ToLower(strings.TrimSpace(accountID)) + "|" +
 		strings.ToLower(strings.TrimSpace(in.Extension)) + "|" +
 		strings.ToLower(strings.TrimSpace(callerExt)) + "|" +
@@ -2117,7 +2126,7 @@ func (s *Server) shouldSuppressIncomingSIPInvite(accountID string, in asterisk.I
 		if c.State != calls.StateRinging && c.State != calls.StateActive {
 			continue
 		}
-		if c.FromNode != "sip:"+in.Extension {
+		if c.FromNode != "sip:"+sourceExt {
 			continue
 		}
 		if in.BridgeID != "" && c.SIPBridgeID == in.BridgeID {
@@ -2540,6 +2549,14 @@ func (s *Server) asteriskConnectLoop() {
 		// This covers the case where auto-configure wrote configs but the
 		// CLI socket was unavailable for a reload.
 		s.reloadAsteriskViaAMI()
+		if !s.asteriskStartupCleanupDone {
+			s.asteriskStartupCleanupDone = true
+			if cleaned, err := s.asterisk.CleanupOrphanSimsonChannels(); err != nil {
+				s.log.Warn("Asterisk orphan bridge cleanup failed", map[string]any{"err": err.Error()})
+			} else if cleaned > 0 {
+				s.log.Warn("Asterisk orphan bridge cleanup completed", map[string]any{"channels": cleaned})
+			}
+		}
 		// Block until disconnected by sleeping in a check loop.
 		for s.asterisk.Connected() {
 			time.Sleep(5 * time.Second)

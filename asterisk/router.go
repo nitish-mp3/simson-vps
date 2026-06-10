@@ -337,6 +337,58 @@ func (r *Router) HangupCallExcept(callID, exceptChannel string) error {
 	return r.hangupCall(callID, exceptChannel)
 }
 
+// CleanupOrphanSimsonChannels clears media legs left behind after a control-plane
+// restart. Asterisk keeps ConfBridge channels alive independently of this process,
+// so without this cleanup stale WebRTC/CBAnn legs can build up and hurt audio.
+func (r *Router) CleanupOrphanSimsonChannels() (int, error) {
+	out, err := r.ami.RunCommand("core show channels concise")
+	if err != nil {
+		return 0, err
+	}
+
+	var firstErr error
+	cleaned := 0
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "!")
+		if len(parts) < 3 {
+			continue
+		}
+		channel := strings.TrimSpace(parts[0])
+		context := strings.TrimSpace(parts[1])
+		if channel == "" {
+			continue
+		}
+		if _, ok := seen[channel]; ok {
+			continue
+		}
+		seen[channel] = struct{}{}
+
+		isSimsonBridgeLeg := context == "from-simson-node" ||
+			strings.HasPrefix(channel, "CBAnn/bridge-")
+		if !isSimsonBridgeLeg {
+			continue
+		}
+		if err := r.ami.HangupChannel(channel); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "no such channel") {
+				continue
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			r.log.Warn("failed to clean orphan Simson channel",
+				map[string]any{"channel": channel, "err": err.Error()})
+			continue
+		}
+		cleaned++
+	}
+	return cleaned, firstErr
+}
+
 func (r *Router) hangupCall(callID, exceptChannel string) error {
 	exceptChannel = normalizeChannel(exceptChannel)
 	channels := r.ChannelsForCall(callID)
