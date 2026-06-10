@@ -47,11 +47,14 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	if strings.Contains(section(dialplan, "[from-simson-door]", "[from-simson-out]"), "Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},r") {
 		t.Fatal("door station bridge should not force local ringback because it suppresses early media/video preview")
 	}
-	if !strings.Contains(dialplan, "exten => 1101,1,NoOp(Simson direct SIP-video endpoint") {
+	if !strings.Contains(dialplan, "exten => 1101,1,NoOp(Simson direct SIP endpoint") {
 		t.Fatal("video-capable SIP endpoint direct route missing")
 	}
-	if strings.Contains(dialplan, "exten => 1025,1,NoOp(Simson direct SIP-video endpoint") {
-		t.Fatal("audio-only SIP endpoint unexpectedly got direct video route")
+	if !strings.Contains(dialplan, "exten => 1025,1,NoOp(Simson direct SIP endpoint") {
+		t.Fatal("audio-only SIP endpoint should still get a direct extension route")
+	}
+	if !strings.Contains(dialplan, "Set(JITTERBUFFER(adaptive)=default)") {
+		t.Fatal("generated dialplan should enable adaptive jitter buffering on bridge media paths")
 	}
 	inboundSIP := section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n")
 	if strings.Contains(inboundSIP, "@7009") {
@@ -138,7 +141,8 @@ func TestNoAuthGatewayDoesNotSwallowRegisteredPhonesBehindSameNAT(t *testing.T) 
 	}
 	endpoints := []SIPEndpointDef{
 		{ID: "desk", Extension: "0001", Username: "0001", Password: "secret", Enabled: true},
-		{ID: "gateway", Extension: "7009", Username: "7009", Password: "secret", Enabled: true},
+		{ID: "gateway", Extension: "7009", Username: "7009", Password: "secret", RouteTo: "office2", Enabled: true},
+		{ID: "new-gateway", Extension: "7010", Username: "7010", Password: "secret", Enabled: true},
 	}
 	if err := writePJSIPConf(root, cfg, endpoints); err != nil {
 		t.Fatal(err)
@@ -161,6 +165,12 @@ func TestNoAuthGatewayDoesNotSwallowRegisteredPhonesBehindSameNAT(t *testing.T) 
 	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
 	if !strings.Contains(dialplan, "exten => 7009,1,NoOp(Simson anonymous gateway call") {
 		t.Fatal("no-auth gateway extension missing from locked-down anonymous dialplan")
+	}
+	if strings.Contains(section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n"), "exten => 7009,1,NoOp(Simson direct SIP endpoint") {
+		t.Fatal("gateway/HAOS-routed endpoint must not be generated as a direct phone extension")
+	}
+	if strings.Contains(section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n"), "exten => 7010,1,NoOp(Simson direct SIP endpoint") {
+		t.Fatal("reserved 70xx gateway-style endpoint must not be generated as a direct phone extension")
 	}
 }
 

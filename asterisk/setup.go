@@ -38,6 +38,7 @@ type SIPEndpointDef struct {
 	Extension    string
 	Username     string
 	Password     string
+	RouteTo      string
 	VideoEnabled bool
 	Enabled      bool
 }
@@ -584,7 +585,7 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 		outCtx = "from-simson-out"
 	}
 
-	directVideoRoutes := buildDirectVideoEndpointDialplan(endpoints)
+	directEndpointRoutes := buildDirectEndpointDialplan(endpoints)
 	anonymousRoutes := buildAnonymousInboundDialplan(noAuthInboundExtensions)
 
 	content := fmt.Sprintf(
@@ -599,11 +600,10 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 ;   [%s]  — Simson-originated PSTN/landline calls through SIMSON_TRUNK
 ;
 [%s]
-; Direct SIP-video endpoint routes.
-; If a registered video-capable SIP device dials another video-capable endpoint
-; by extension, keep it in a native PJSIP bridge. Sending these calls into the
-; Simson ConfBridge/browser path would drop H.264 video because that path is
-; intentionally audio-only.
+; Direct registered SIP endpoint routes.
+; If a SIP endpoint has no RouteTo node, it behaves like a normal PBX extension:
+; a registered phone dialing it should ring that phone directly. Endpoints with
+; RouteTo set are ingress/routing endpoints and continue through SimsonRoute.
 %s
 ; SIP-phone outside dialing is intentionally routed through the catch-all
 ; SimsonRoute event below. The VPS then chooses an enabled gateway trunk scoped
@@ -611,12 +611,14 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 ; Catch-all: route every incoming SIP call to the Simson control plane.
 exten => _+X.,1,NoOp(Simson: incoming E.164 SIP call to ${EXTEN} from ${CALLERID(num)})
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
+ same  => n,Set(JITTERBUFFER(adaptive)=default)
  same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
  same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
  same  => n,Hangup()
 
 exten => _X.,1,NoOp(Simson: incoming call to ${EXTEN} from ${CALLERID(num)})
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
+ same  => n,Set(JITTERBUFFER(adaptive)=default)
  same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
  same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
  same  => n,Hangup()
@@ -629,12 +631,14 @@ exten => t,1,Hangup(16)
 ; Simson node SIP UA dials the bridge ID as the extension to join the audio path.
 exten => _bridge-.,1,NoOp(Simson node joining bridge ${EXTEN})
  same  => n,Answer()
+ same  => n,Set(JITTERBUFFER(adaptive)=default)
  same  => n,ConfBridge(${EXTEN},simson_bridge,simson_user)
  same  => n,Hangup()
 
 ; extension "s" — for Originate from VPS (answer + wait to be bridged)
 exten => s,1,NoOp(Simson originate leg)
  same  => n,Answer()
+ same  => n,Set(JITTERBUFFER(adaptive)=default)
  same  => n,Wait(${SIMSON_WAIT_TIMEOUT:=120})
  same  => n,Hangup()
 
@@ -664,6 +668,7 @@ exten => _X.,1,NoOp(Simson door camera bridge to SIP endpoint ${EXTEN})
 ; The VPS originates Local/<number>@%s and passes SIMSON_TRUNK.
 exten => _X.,1,NoOp(Simson outbound trunk call ${EXTEN} via ${SIMSON_TRUNK})
  same  => n,GotoIf($["${SIMSON_TRUNK}" = ""]?missing-trunk,1)
+ same  => n,Set(JITTERBUFFER(adaptive)=default)
  same  => n,Dial(PJSIP/${EXTEN}@${SIMSON_TRUNK},${SIMSON_WAIT_TIMEOUT:=120},rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))
  same  => n,Hangup()
 
@@ -674,6 +679,7 @@ exten => missing-trunk,1,NoOp(Simson outbound trunk call missing SIMSON_TRUNK)
 [simson-outbound-mark]
 exten => s,1,NoOp(Mark Simson outbound child channel ${ARG1})
  same  => n,Set(SIMSON_CALL_ID=${ARG1})
+ same  => n,Set(JITTERBUFFER(adaptive)=default)
  same  => n,Return()
 
 [from-simson-anonymous]
@@ -683,7 +689,7 @@ exten => s,1,NoOp(Mark Simson outbound child channel ${ARG1})
 exten => _X.,1,Hangup(21)
 exten => i,1,Hangup(21)
 exten => t,1,Hangup(16)
-`, inCtx, nodeCtx, outCtx, inCtx, directVideoRoutes, nodeCtx, outCtx, outCtx, anonymousRoutes)
+`, inCtx, nodeCtx, outCtx, inCtx, directEndpointRoutes, nodeCtx, outCtx, outCtx, anonymousRoutes)
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(content), 0640)
 }
@@ -882,26 +888,33 @@ func buildSIPPhoneOutboundDialplan(defaultTrunk string) string {
 	return sb.String()
 }
 
-func buildDirectVideoEndpointDialplan(endpoints []SIPEndpointDef) string {
+func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 	seen := map[string]struct{}{}
 	var sb strings.Builder
 	for _, ep := range endpoints {
-		if !ep.Enabled || !ep.VideoEnabled {
+		if !ep.Enabled || strings.TrimSpace(ep.RouteTo) != "" {
 			continue
 		}
 		ext := sanitizeID(strings.TrimSpace(ep.Extension))
 		if ext == "" {
 			continue
 		}
+		if isReservedGatewayExtension(ext) {
+			continue
+		}
 		if _, ok := seen[ext]; ok {
 			continue
 		}
 		seen[ext] = struct{}{}
-		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP-video endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
+		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
 		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},T)\n")
 		sb.WriteString(" same  => n,Hangup()\n")
 	}
 	return sb.String()
+}
+
+func isReservedGatewayExtension(ext string) bool {
+	return len(ext) == 4 && strings.HasPrefix(ext, "70")
 }
 
 // sanitizeID strips unsafe characters from an endpoint ID.

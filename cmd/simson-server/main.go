@@ -78,6 +78,7 @@ func main() {
 					Extension:    ep.Extension,
 					Username:     ep.Username,
 					Password:     ep.Password,
+					RouteTo:      ep.RouteTo,
 					VideoEnabled: ep.VideoEnabled,
 					Enabled:      ep.Enabled,
 				}
