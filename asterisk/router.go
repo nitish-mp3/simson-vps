@@ -20,6 +20,15 @@ type IncomingSIPCall struct {
 	BridgeID       string // ConfBridge room the SIP channel is already parked in
 }
 
+// ContactStatus describes the live PJSIP registration/contact state for an AoR.
+type ContactStatus struct {
+	Registered bool   `json:"registered"`
+	Status     string `json:"status,omitempty"`
+	URI        string `json:"uri,omitempty"`
+	Address    string `json:"address,omitempty"`
+	LatencyMS  string `json:"latency_ms,omitempty"`
+}
+
 // Router orchestrates call routing between VPS Asterisk (via AMI) and the
 // Simson WebSocket nodes.
 //
@@ -550,6 +559,59 @@ func (r *Router) EndpointHasContacts(ext string) bool {
 	return strings.Contains(out, ext+"/sip:") || strings.Contains(out, ext+"/sips:")
 }
 
+// ContactStatuses returns live PJSIP contact state keyed by AoR/username.
+func (r *Router) ContactStatuses() map[string]ContactStatus {
+	out, err := r.ami.RunCommand("pjsip show contacts")
+	if err != nil {
+		r.log.Warn("could not list PJSIP contacts via AMI", map[string]any{"err": err.Error()})
+		return map[string]ContactStatus{}
+	}
+	statuses := map[string]ContactStatus{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Contact:") {
+			continue
+		}
+		fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "Contact:")))
+		if len(fields) < 2 {
+			continue
+		}
+		aorURI := fields[0]
+		slash := strings.Index(aorURI, "/")
+		if slash <= 0 {
+			continue
+		}
+		aor := strings.TrimSpace(aorURI[:slash])
+		uri := strings.TrimSpace(aorURI[slash+1:])
+		if aor == "" || uri == "" {
+			continue
+		}
+		status := ""
+		latency := ""
+		for i := 1; i < len(fields); i++ {
+			f := strings.TrimSpace(fields[i])
+			switch f {
+			case "Avail", "Unavail", "Unknown", "Reachable", "NonQual":
+				status = f
+				if i+1 < len(fields) {
+					latency = strings.Trim(fields[i+1], "()")
+				}
+			}
+		}
+		if status == "" {
+			status = "Registered"
+		}
+		statuses[aor] = ContactStatus{
+			Registered: status == "Avail" || status == "Reachable" || status == "Registered",
+			Status:     status,
+			URI:        uri,
+			Address:    contactAddress(uri),
+			LatencyMS:  latency,
+		}
+	}
+	return statuses
+}
+
 // ---- AMI event dispatch -----------------------------------------------------
 
 func (r *Router) onEvent(ev Event) {
@@ -752,4 +814,17 @@ func isHexString(s string) bool {
 		return false
 	}
 	return true
+}
+
+func contactAddress(uri string) string {
+	value := strings.TrimSpace(uri)
+	value = strings.TrimPrefix(value, "sip:")
+	value = strings.TrimPrefix(value, "sips:")
+	if at := strings.LastIndex(value, "@"); at >= 0 && at+1 < len(value) {
+		value = value[at+1:]
+	}
+	if semi := strings.Index(value, ";"); semi >= 0 {
+		value = value[:semi]
+	}
+	return strings.TrimSpace(value)
 }

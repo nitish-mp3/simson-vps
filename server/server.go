@@ -2605,6 +2605,7 @@ func (s *Server) configureAsteriskFromStore() {
 			Password:     ep.Password,
 			RouteTo:      ep.RouteTo,
 			VideoEnabled: ep.VideoEnabled,
+			AutoAnswer:   ep.AutoAnswer,
 			Enabled:      ep.Enabled,
 		})
 	}

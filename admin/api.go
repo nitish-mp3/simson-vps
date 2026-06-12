@@ -437,6 +437,7 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		Description  string `json:"description"`
 		RouteTo      string `json:"route_to"`
 		VideoEnabled *bool  `json:"video_enabled"`
+		AutoAnswer   *bool  `json:"auto_answer"`
 		Enabled      *bool  `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -500,6 +501,10 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if body.VideoEnabled != nil {
 		videoEnabled = *body.VideoEnabled
 	}
+	autoAnswer := false
+	if body.AutoAnswer != nil {
+		autoAnswer = *body.AutoAnswer
+	}
 	// Generate a random ID
 	idb := make([]byte, 16)
 	rand.Read(idb) //nolint:errcheck
@@ -512,6 +517,7 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		Description:  body.Description,
 		RouteTo:      body.RouteTo,
 		VideoEnabled: videoEnabled,
+		AutoAnswer:   autoAnswer,
 		Enabled:      enabled,
 	}
 	if err := a.store.CreateSIPEndpoint(ep); err != nil {
@@ -535,7 +541,43 @@ func (a *API) handleListSIPEndpoints(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
 	}
-	writeJSON(w, http.StatusOK, eps)
+	writeJSON(w, http.StatusOK, a.enrichSIPEndpoints(eps))
+}
+
+func (a *API) enrichSIPEndpoints(eps []store.SIPEndpoint) []map[string]any {
+	contacts := map[string]asterisk.ContactStatus{}
+	if a.asterisk != nil && a.asterisk.Connected() {
+		contacts = a.asterisk.ContactStatuses()
+	}
+
+	out := make([]map[string]any, 0, len(eps))
+	for _, ep := range eps {
+		contact := contacts[ep.Username]
+		if !contact.Registered {
+			if byExt, ok := contacts[ep.Extension]; ok {
+				contact = byExt
+			}
+		}
+		out = append(out, map[string]any{
+			"id":                 ep.ID,
+			"account_id":         ep.AccountID,
+			"extension":          ep.Extension,
+			"username":           ep.Username,
+			"description":        ep.Description,
+			"route_to":           ep.RouteTo,
+			"video_enabled":      ep.VideoEnabled,
+			"auto_answer":        ep.AutoAnswer,
+			"enabled":            ep.Enabled,
+			"created_at":         ep.CreatedAt,
+			"updated_at":         ep.UpdatedAt,
+			"registered":         contact.Registered,
+			"contact_status":     contact.Status,
+			"contact_uri":        contact.URI,
+			"contact_address":    contact.Address,
+			"contact_latency_ms": contact.LatencyMS,
+		})
+	}
+	return out
 }
 
 func (a *API) handleGetSIPEndpoint(w http.ResponseWriter, r *http.Request) {
@@ -570,6 +612,7 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		Password     *string `json:"password"`
 		RouteTo      *string `json:"route_to"`
 		VideoEnabled *bool   `json:"video_enabled"`
+		AutoAnswer   *bool   `json:"auto_answer"`
 		Enabled      *bool   `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -591,10 +634,13 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if body.VideoEnabled != nil {
 		ep.VideoEnabled = *body.VideoEnabled
 	}
+	if body.AutoAnswer != nil {
+		ep.AutoAnswer = *body.AutoAnswer
+	}
 	if body.Enabled != nil {
 		ep.Enabled = *body.Enabled
 	}
-	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.VideoEnabled, ep.Enabled); err != nil {
+	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.VideoEnabled, ep.AutoAnswer, ep.Enabled); err != nil {
 		a.log.Error("update sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
@@ -892,6 +938,7 @@ func (a *API) reconfigureAsterisk() {
 			Password:     ep.Password,
 			RouteTo:      ep.RouteTo,
 			VideoEnabled: ep.VideoEnabled,
+			AutoAnswer:   ep.AutoAnswer,
 			Enabled:      ep.Enabled,
 		})
 	}

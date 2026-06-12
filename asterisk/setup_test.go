@@ -17,7 +17,7 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	}
 	endpoints := []SIPEndpointDef{
 		{ID: "door", Extension: "1101", Username: "door", Password: "secret", VideoEnabled: true, Enabled: true},
-		{ID: "desk", Extension: "1025", Username: "desk", Password: "secret", Enabled: true},
+		{ID: "desk", Extension: "1025", Username: "desk", Password: "secret", AutoAnswer: true, Enabled: true},
 	}
 	if err := writePJSIPConf(root, cfg, endpoints); err != nil {
 		t.Fatal(err)
@@ -52,6 +52,10 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	}
 	if !strings.Contains(dialplan, "exten => 1025,1,NoOp(Simson direct SIP endpoint") {
 		t.Fatal("audio-only SIP endpoint should still get a direct extension route")
+	}
+	if !strings.Contains(dialplan, "exten => 1025,1,NoOp(Simson dial auto-answer SIP endpoint") ||
+		!strings.Contains(dialplan, "Answer-Mode)=Auto") {
+		t.Fatal("auto-answer SIP endpoint dialplan headers missing")
 	}
 	if !strings.Contains(dialplan, "Set(JITTERBUFFER(adaptive)=default)") {
 		t.Fatal("generated dialplan should enable adaptive jitter buffering on bridge media paths")

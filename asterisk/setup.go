@@ -40,6 +40,7 @@ type SIPEndpointDef struct {
 	Password     string
 	RouteTo      string
 	VideoEnabled bool
+	AutoAnswer   bool
 	Enabled      bool
 }
 
@@ -586,6 +587,7 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 	}
 
 	directEndpointRoutes := buildDirectEndpointDialplan(endpoints)
+	autoAnswerExtensionRoutes := buildAutoAnswerExtensionDialplan(endpoints)
 	anonymousRoutes := buildAnonymousInboundDialplan(noAuthInboundExtensions)
 
 	content := fmt.Sprintf(
@@ -646,6 +648,7 @@ exten => s,1,NoOp(Simson originate leg)
 ; VPS-originated calls/transfers to onsite SIP phones.
 ; The Local channel answers only when the SIP phone answers, then AMI places
 ; that Local leg into the requested Simson ConfBridge room.
+%s
 exten => _X.,1,NoOp(Simson dial SIP endpoint ${EXTEN})
  same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=120},rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))
  same  => n,Hangup()
@@ -689,7 +692,7 @@ exten => s,1,NoOp(Mark Simson outbound child channel ${ARG1})
 exten => _X.,1,Hangup(21)
 exten => i,1,Hangup(21)
 exten => t,1,Hangup(16)
-`, inCtx, nodeCtx, outCtx, inCtx, directEndpointRoutes, nodeCtx, outCtx, outCtx, anonymousRoutes)
+`, inCtx, nodeCtx, outCtx, inCtx, directEndpointRoutes, nodeCtx, autoAnswerExtensionRoutes, outCtx, outCtx, anonymousRoutes)
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(content), 0640)
 }
@@ -890,6 +893,13 @@ func buildSIPPhoneOutboundDialplan(defaultTrunk string) string {
 
 func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 	seen := map[string]struct{}{}
+	autoAnswer := map[string]bool{}
+	for _, ep := range endpoints {
+		ext := sanitizeID(strings.TrimSpace(ep.Extension))
+		if ext != "" && ep.AutoAnswer {
+			autoAnswer[ext] = true
+		}
+	}
 	var sb strings.Builder
 	for _, ep := range endpoints {
 		if !ep.Enabled || strings.TrimSpace(ep.RouteTo) != "" {
@@ -907,8 +917,40 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		}
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
+		if autoAnswer[ext] {
+			appendAutoAnswerHeaders(&sb)
+		}
 		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},T)\n")
 		sb.WriteString(" same  => n,Hangup()\n")
+	}
+	return sb.String()
+}
+
+func appendAutoAnswerHeaders(sb *strings.Builder) {
+	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Alert-Info)=<http://www.notused.com>;info=alert-autoanswer)\n")
+	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Call-Info)=<sip:simson>;answer-after=0)\n")
+	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Answer-Mode)=Auto)\n")
+}
+
+func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
+	seen := map[string]struct{}{}
+	var sb strings.Builder
+	for _, ep := range endpoints {
+		if !ep.Enabled || !ep.AutoAnswer {
+			continue
+		}
+		ext := sanitizeID(strings.TrimSpace(ep.Extension))
+		if ext == "" || isReservedGatewayExtension(ext) {
+			continue
+		}
+		if _, ok := seen[ext]; ok {
+			continue
+		}
+		seen[ext] = struct{}{}
+		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson dial auto-answer SIP endpoint ${EXTEN})\n", ext)
+		appendAutoAnswerHeaders(&sb)
+		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=120},rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))\n")
+		sb.WriteString(" same  => n,Hangup()\n\n")
 	}
 	return sb.String()
 }
