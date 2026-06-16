@@ -132,6 +132,39 @@ exten => 1001,1,Answer()
 	}
 }
 
+func TestRouteSpecificAutoAnswerHeadersAreConditional(t *testing.T) {
+	root := t.TempDir()
+	cfg := SetupConfig{
+		SIPDomain:   "simson-vps.vipsy.in",
+		InContext:   "from-simson-sip",
+		NodeContext: "from-simson-node",
+		OutContext:  "from-simson-out",
+	}
+	endpoints := []SIPEndpointDef{
+		{ID: "caller", Extension: "1025", Username: "1025", Password: "secret", Enabled: true},
+		{ID: "target", Extension: "1603", Username: "1603", Password: "secret", AutoAnswer: true, AutoAnswerCallers: "1025", AutoSpeaker: true, Enabled: true},
+	}
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, "7009", nil, endpoints); err != nil {
+		t.Fatal(err)
+	}
+
+	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
+	target := section(dialplan, "exten => 1603,1,NoOp(Simson direct SIP endpoint", "exten => _+X.")
+	if !strings.Contains(target, `"${SIMSON_CALLER_ENDPOINT}" = "1025"`) {
+		t.Fatal("direct SIP route should condition auto-answer on the caller endpoint")
+	}
+	if !strings.Contains(target, "info=intercom") {
+		t.Fatal("auto-speaker route should include intercom/speaker hint headers")
+	}
+	if !strings.Contains(target, "Goto(simson-dial)") {
+		t.Fatal("route-specific auto-answer must fall through to a normal dial when caller does not match")
+	}
+	caller := section(dialplan, "exten => 1025,1,NoOp(Simson direct SIP endpoint", "exten => 1603,1,NoOp")
+	if strings.Contains(caller, "Answer-Mode)=Auto") {
+		t.Fatal("caller endpoint should not receive target endpoint auto-answer headers")
+	}
+}
+
 func TestNoAuthGatewayDoesNotSwallowRegisteredPhonesBehindSameNAT(t *testing.T) {
 	root := t.TempDir()
 	cfg := SetupConfig{

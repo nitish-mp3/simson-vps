@@ -2599,14 +2599,16 @@ func (s *Server) configureAsteriskFromStore() {
 	defs := make([]asterisk.SIPEndpointDef, 0, len(endpoints))
 	for _, ep := range endpoints {
 		defs = append(defs, asterisk.SIPEndpointDef{
-			ID:           ep.ID,
-			Extension:    ep.Extension,
-			Username:     ep.Username,
-			Password:     ep.Password,
-			RouteTo:      ep.RouteTo,
-			VideoEnabled: ep.VideoEnabled,
-			AutoAnswer:   ep.AutoAnswer,
-			Enabled:      ep.Enabled,
+			ID:                ep.ID,
+			Extension:         ep.Extension,
+			Username:          ep.Username,
+			Password:          ep.Password,
+			RouteTo:           ep.RouteTo,
+			VideoEnabled:      ep.VideoEnabled,
+			AutoAnswer:        ep.AutoAnswer,
+			AutoAnswerCallers: ep.AutoAnswerCallers,
+			AutoSpeaker:       ep.AutoSpeaker,
+			Enabled:           ep.Enabled,
 		})
 	}
 

@@ -41,7 +41,10 @@ type SIPEndpointDef struct {
 	RouteTo      string
 	VideoEnabled bool
 	AutoAnswer   bool
-	Enabled      bool
+	// AutoAnswerCallers is a comma-separated allowlist. Empty means any caller.
+	AutoAnswerCallers string
+	AutoSpeaker       bool
+	Enabled           bool
 }
 
 // Setup writes all Asterisk config files needed by the Simson VPS and reloads
@@ -893,11 +896,11 @@ func buildSIPPhoneOutboundDialplan(defaultTrunk string) string {
 
 func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 	seen := map[string]struct{}{}
-	autoAnswer := map[string]bool{}
+	autoAnswer := map[string]SIPEndpointDef{}
 	for _, ep := range endpoints {
 		ext := sanitizeID(strings.TrimSpace(ep.Extension))
 		if ext != "" && ep.AutoAnswer {
-			autoAnswer[ext] = true
+			autoAnswer[ext] = ep
 		}
 	}
 	var sb strings.Builder
@@ -917,8 +920,8 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		}
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
-		if autoAnswer[ext] {
-			appendAutoAnswerHeaders(&sb)
+		if aa, ok := autoAnswer[ext]; ok {
+			appendConditionalAutoAnswerHeaders(&sb, aa.AutoAnswerCallers, aa.AutoSpeaker)
 		}
 		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},T)\n")
 		sb.WriteString(" same  => n,Hangup()\n")
@@ -926,10 +929,35 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 	return sb.String()
 }
 
-func appendAutoAnswerHeaders(sb *strings.Builder) {
+func appendConditionalAutoAnswerHeaders(sb *strings.Builder, callers string, speaker bool) {
+	allowed := parseAutoAnswerCallers(callers)
+	if len(allowed) == 0 {
+		appendAutoAnswerHeaders(sb, speaker)
+		return
+	}
+
+	sb.WriteString(" same  => n,Set(SIMSON_CALLER_ENDPOINT=${CHANNEL(pjsip,endpoint)})\n")
+	sb.WriteString(" same  => n,Set(SIMSON_SOURCE_EXTENSION=${IF($[\"${SIMSON_SOURCE_EXTENSION}\" = \"\"]?${CALLERID(num)}:${SIMSON_SOURCE_EXTENSION})})\n")
+	for _, caller := range allowed {
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_CALLER_ENDPOINT}\" = \"%s\"]?simson-auto-answer)\n", caller)
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_SOURCE_EXTENSION}\" = \"%s\"]?simson-auto-answer)\n", caller)
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${CALLERID(num)}\" = \"%s\"]?simson-auto-answer)\n", caller)
+	}
+	sb.WriteString(" same  => n,Goto(simson-dial)\n")
+	sb.WriteString(" same  => n(simson-auto-answer),NoOp(Simson route-specific auto-answer matched caller ${SIMSON_CALLER_ENDPOINT}/${CALLERID(num)})\n")
+	appendAutoAnswerHeaders(sb, speaker)
+	sb.WriteString(" same  => n(simson-dial),NoOp(Simson normal SIP dial)\n")
+}
+
+func appendAutoAnswerHeaders(sb *strings.Builder, speaker bool) {
 	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Alert-Info)=<http://www.notused.com>;info=alert-autoanswer)\n")
 	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Call-Info)=<sip:simson>;answer-after=0)\n")
 	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Answer-Mode)=Auto)\n")
+	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Priv-Answer-Mode)=Auto)\n")
+	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,P-Auto-Answer)=normal)\n")
+	if speaker {
+		sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Alert-Info)=<http://www.notused.com>;info=intercom)\n")
+	}
 }
 
 func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
@@ -948,11 +976,31 @@ func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
 		}
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson dial auto-answer SIP endpoint ${EXTEN})\n", ext)
-		appendAutoAnswerHeaders(&sb)
+		appendConditionalAutoAnswerHeaders(&sb, ep.AutoAnswerCallers, ep.AutoSpeaker)
 		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=120},rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))\n")
 		sb.WriteString(" same  => n,Hangup()\n\n")
 	}
 	return sb.String()
+}
+
+func parseAutoAnswerCallers(callers string) []string {
+	parts := strings.FieldsFunc(callers, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
+	})
+	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		caller := sanitizeID(strings.TrimSpace(part))
+		if caller == "" {
+			continue
+		}
+		if _, ok := seen[caller]; ok {
+			continue
+		}
+		seen[caller] = struct{}{}
+		out = append(out, caller)
+	}
+	return out
 }
 
 func isReservedGatewayExtension(ext string) bool {

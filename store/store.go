@@ -63,9 +63,13 @@ type SIPEndpoint struct {
 	RouteTo      string // Simson node_id to ring; "" = ring all nodes in the account
 	VideoEnabled bool   // allow H.264 negotiation for camera/video SIP devices
 	AutoAnswer   bool   // send SIP auto-answer headers when this endpoint is dialed by Simson
-	Enabled      bool
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// AutoAnswerCallers is a comma-separated allowlist of caller extensions/usernames
+	// that may trigger auto-answer. Empty means any caller may trigger it.
+	AutoAnswerCallers string
+	AutoSpeaker       bool // request speaker/intercom mode where the SIP phone supports it
+	Enabled           bool
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // Open creates or opens the SQLite database and runs migrations.
@@ -135,6 +139,8 @@ func (s *Store) migrate() error {
 			route_to    TEXT NOT NULL DEFAULT '',
 			video_enabled INTEGER NOT NULL DEFAULT 0,
 			auto_answer INTEGER NOT NULL DEFAULT 0,
+			auto_answer_callers TEXT NOT NULL DEFAULT '',
+			auto_speaker INTEGER NOT NULL DEFAULT 0,
 			enabled     INTEGER NOT NULL DEFAULT 1,
 			created_at  DATETIME NOT NULL DEFAULT (datetime('now')),
 			updated_at  DATETIME NOT NULL DEFAULT (datetime('now'))
@@ -152,6 +158,12 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.ensureColumn("sip_endpoints", "auto_answer", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("sip_endpoints", "auto_answer_callers", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("sip_endpoints", "auto_speaker", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	return nil
@@ -365,10 +377,10 @@ func generateToken() (string, error) {
 // CreateSIPEndpoint inserts a new PJSIP endpoint record.
 func (s *Store) CreateSIPEndpoint(ep SIPEndpoint) error {
 	_, err := s.db.Exec(
-		`INSERT INTO sip_endpoints (id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, enabled)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sip_endpoints (id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, enabled)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ep.ID, ep.AccountID, ep.Extension, ep.Username, ep.Password,
-		ep.Description, ep.RouteTo, boolInt(ep.VideoEnabled), boolInt(ep.AutoAnswer), boolInt(ep.Enabled),
+		ep.Description, ep.RouteTo, boolInt(ep.VideoEnabled), boolInt(ep.AutoAnswer), ep.AutoAnswerCallers, boolInt(ep.AutoSpeaker), boolInt(ep.Enabled),
 	)
 	return err
 }
@@ -376,7 +388,7 @@ func (s *Store) CreateSIPEndpoint(ep SIPEndpoint) error {
 // GetSIPEndpoint returns a single endpoint by ID, or nil.
 func (s *Store) GetSIPEndpoint(id string) (*SIPEndpoint, error) {
 	row := s.db.QueryRow(
-		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, enabled, created_at, updated_at
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, enabled, created_at, updated_at
 		 FROM sip_endpoints WHERE id = ?`, id)
 	return scanSIPEndpoint(row)
 }
@@ -384,7 +396,7 @@ func (s *Store) GetSIPEndpoint(id string) (*SIPEndpoint, error) {
 // GetSIPEndpointByExtension returns the first enabled endpoint with this extension, or nil.
 func (s *Store) GetSIPEndpointByExtension(extension string) (*SIPEndpoint, error) {
 	row := s.db.QueryRow(
-		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, enabled, created_at, updated_at
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, enabled, created_at, updated_at
 		 FROM sip_endpoints WHERE extension = ? AND enabled = 1 LIMIT 1`, extension)
 	return scanSIPEndpoint(row)
 }
@@ -392,7 +404,7 @@ func (s *Store) GetSIPEndpointByExtension(extension string) (*SIPEndpoint, error
 // GetSIPEndpointByUsername returns the endpoint using this SIP auth username, or nil.
 func (s *Store) GetSIPEndpointByUsername(username string) (*SIPEndpoint, error) {
 	row := s.db.QueryRow(
-		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, enabled, created_at, updated_at
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, enabled, created_at, updated_at
 		 FROM sip_endpoints WHERE username = ? LIMIT 1`, username)
 	return scanSIPEndpoint(row)
 }
@@ -400,7 +412,7 @@ func (s *Store) GetSIPEndpointByUsername(username string) (*SIPEndpoint, error) 
 // ListSIPEndpoints returns all endpoints for an account.
 func (s *Store) ListSIPEndpoints(accountID string) ([]SIPEndpoint, error) {
 	rows, err := s.db.Query(
-		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, enabled, created_at, updated_at
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, enabled, created_at, updated_at
 		 FROM sip_endpoints WHERE account_id = ? ORDER BY extension`, accountID)
 	if err != nil {
 		return nil, err
@@ -421,7 +433,7 @@ func (s *Store) ListSIPEndpoints(accountID string) ([]SIPEndpoint, error) {
 // ListAllSIPEndpoints returns every endpoint (used for config generation).
 func (s *Store) ListAllSIPEndpoints() ([]SIPEndpoint, error) {
 	rows, err := s.db.Query(
-		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, enabled, created_at, updated_at
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, enabled, created_at, updated_at
 		 FROM sip_endpoints ORDER BY account_id, extension`)
 	if err != nil {
 		return nil, err
@@ -440,11 +452,11 @@ func (s *Store) ListAllSIPEndpoints() ([]SIPEndpoint, error) {
 }
 
 // UpdateSIPEndpoint updates mutable fields of a SIP endpoint.
-func (s *Store) UpdateSIPEndpoint(id, description, password, routeTo string, videoEnabled, autoAnswer, enabled bool) error {
+func (s *Store) UpdateSIPEndpoint(id, description, password, routeTo string, videoEnabled, autoAnswer bool, autoAnswerCallers string, autoSpeaker, enabled bool) error {
 	_, err := s.db.Exec(
-		`UPDATE sip_endpoints SET description = ?, password = ?, route_to = ?, video_enabled = ?, auto_answer = ?, enabled = ?,
+		`UPDATE sip_endpoints SET description = ?, password = ?, route_to = ?, video_enabled = ?, auto_answer = ?, auto_answer_callers = ?, auto_speaker = ?, enabled = ?,
 		 updated_at = datetime('now') WHERE id = ?`,
-		description, password, routeTo, boolInt(videoEnabled), boolInt(autoAnswer), boolInt(enabled), id,
+		description, password, routeTo, boolInt(videoEnabled), boolInt(autoAnswer), autoAnswerCallers, boolInt(autoSpeaker), boolInt(enabled), id,
 	)
 	return err
 }
@@ -463,10 +475,10 @@ type rowScanner interface {
 
 func scanSIPEndpoint(row rowScanner) (*SIPEndpoint, error) {
 	ep := &SIPEndpoint{}
-	var videoEnabled, autoAnswer, enabled int
+	var videoEnabled, autoAnswer, autoSpeaker, enabled int
 	err := row.Scan(
 		&ep.ID, &ep.AccountID, &ep.Extension, &ep.Username, &ep.Password,
-		&ep.Description, &ep.RouteTo, &videoEnabled, &autoAnswer, &enabled, &ep.CreatedAt, &ep.UpdatedAt,
+		&ep.Description, &ep.RouteTo, &videoEnabled, &autoAnswer, &ep.AutoAnswerCallers, &autoSpeaker, &enabled, &ep.CreatedAt, &ep.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -477,15 +489,16 @@ func scanSIPEndpoint(row rowScanner) (*SIPEndpoint, error) {
 	ep.Enabled = enabled == 1
 	ep.VideoEnabled = videoEnabled == 1
 	ep.AutoAnswer = autoAnswer == 1
+	ep.AutoSpeaker = autoSpeaker == 1
 	return ep, nil
 }
 
 func scanSIPEndpointRow(rows *sql.Rows) (*SIPEndpoint, error) {
 	ep := &SIPEndpoint{}
-	var videoEnabled, autoAnswer, enabled int
+	var videoEnabled, autoAnswer, autoSpeaker, enabled int
 	err := rows.Scan(
 		&ep.ID, &ep.AccountID, &ep.Extension, &ep.Username, &ep.Password,
-		&ep.Description, &ep.RouteTo, &videoEnabled, &autoAnswer, &enabled, &ep.CreatedAt, &ep.UpdatedAt,
+		&ep.Description, &ep.RouteTo, &videoEnabled, &autoAnswer, &ep.AutoAnswerCallers, &autoSpeaker, &enabled, &ep.CreatedAt, &ep.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -493,6 +506,7 @@ func scanSIPEndpointRow(rows *sql.Rows) (*SIPEndpoint, error) {
 	ep.Enabled = enabled == 1
 	ep.VideoEnabled = videoEnabled == 1
 	ep.AutoAnswer = autoAnswer == 1
+	ep.AutoSpeaker = autoSpeaker == 1
 	return ep, nil
 }
 
