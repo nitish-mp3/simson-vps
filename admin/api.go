@@ -431,17 +431,21 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Extension          string `json:"extension"`
-		Username           string `json:"username"`
-		Password           string `json:"password"`
-		Description        string `json:"description"`
-		RouteTo            string `json:"route_to"`
-		VideoEnabled       *bool  `json:"video_enabled"`
-		AutoAnswer         *bool  `json:"auto_answer"`
-		AutoAnswerCallers  string `json:"auto_answer_callers"`
-		AutoSpeaker        *bool  `json:"auto_speaker"`
-		AutoSpeakerCallers string `json:"auto_speaker_callers"`
-		Enabled            *bool  `json:"enabled"`
+		Extension                 string `json:"extension"`
+		Username                  string `json:"username"`
+		Password                  string `json:"password"`
+		Description               string `json:"description"`
+		RouteTo                   string `json:"route_to"`
+		VideoEnabled              *bool  `json:"video_enabled"`
+		AutoAnswer                *bool  `json:"auto_answer"`
+		AutoAnswerCallers         string `json:"auto_answer_callers"`
+		AutoSpeaker               *bool  `json:"auto_speaker"`
+		AutoSpeakerCallers        string `json:"auto_speaker_callers"`
+		CallbackBridge            *bool  `json:"callback_bridge"`
+		CallbackBridgeCallers     string `json:"callback_bridge_callers"`
+		CallbackCallerAutoAnswer  *bool  `json:"callback_caller_auto_answer"`
+		CallbackCallerAutoSpeaker *bool  `json:"callback_caller_auto_speaker"`
+		Enabled                   *bool  `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -460,6 +464,11 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	autoSpeakerCallers, ok := normalizeAutoAnswerCallersInput(body.AutoSpeakerCallers)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "auto_speaker_callers must contain only extension/user tokens separated by commas"})
+		return
+	}
+	callbackBridgeCallers, ok := normalizeAutoAnswerCallersInput(body.CallbackBridgeCallers)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "callback_bridge_callers must contain only extension/user tokens separated by commas"})
 		return
 	}
 	if body.Extension == "" || body.Username == "" || body.Password == "" {
@@ -522,23 +531,39 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if body.AutoSpeaker != nil {
 		autoSpeaker = *body.AutoSpeaker
 	}
+	callbackBridge := false
+	if body.CallbackBridge != nil {
+		callbackBridge = *body.CallbackBridge
+	}
+	callbackCallerAutoAnswer := false
+	if body.CallbackCallerAutoAnswer != nil {
+		callbackCallerAutoAnswer = *body.CallbackCallerAutoAnswer
+	}
+	callbackCallerAutoSpeaker := false
+	if body.CallbackCallerAutoSpeaker != nil {
+		callbackCallerAutoSpeaker = *body.CallbackCallerAutoSpeaker
+	}
 	// Generate a random ID
 	idb := make([]byte, 16)
 	rand.Read(idb) //nolint:errcheck
 	ep := store.SIPEndpoint{
-		ID:                 hex.EncodeToString(idb),
-		AccountID:          accountID,
-		Extension:          body.Extension,
-		Username:           body.Username,
-		Password:           body.Password,
-		Description:        body.Description,
-		RouteTo:            body.RouteTo,
-		VideoEnabled:       videoEnabled,
-		AutoAnswer:         autoAnswer,
-		AutoAnswerCallers:  autoAnswerCallers,
-		AutoSpeaker:        autoSpeaker,
-		AutoSpeakerCallers: autoSpeakerCallers,
-		Enabled:            enabled,
+		ID:                        hex.EncodeToString(idb),
+		AccountID:                 accountID,
+		Extension:                 body.Extension,
+		Username:                  body.Username,
+		Password:                  body.Password,
+		Description:               body.Description,
+		RouteTo:                   body.RouteTo,
+		VideoEnabled:              videoEnabled,
+		AutoAnswer:                autoAnswer,
+		AutoAnswerCallers:         autoAnswerCallers,
+		AutoSpeaker:               autoSpeaker,
+		AutoSpeakerCallers:        autoSpeakerCallers,
+		CallbackBridge:            callbackBridge,
+		CallbackBridgeCallers:     callbackBridgeCallers,
+		CallbackCallerAutoAnswer:  callbackCallerAutoAnswer,
+		CallbackCallerAutoSpeaker: callbackCallerAutoSpeaker,
+		Enabled:                   enabled,
 	}
 	if err := a.store.CreateSIPEndpoint(ep); err != nil {
 		a.log.Error("create sip endpoint", map[string]any{"err": err.Error()})
@@ -579,25 +604,29 @@ func (a *API) enrichSIPEndpoints(eps []store.SIPEndpoint) []map[string]any {
 			}
 		}
 		out = append(out, map[string]any{
-			"id":                   ep.ID,
-			"account_id":           ep.AccountID,
-			"extension":            ep.Extension,
-			"username":             ep.Username,
-			"description":          ep.Description,
-			"route_to":             ep.RouteTo,
-			"video_enabled":        ep.VideoEnabled,
-			"auto_answer":          ep.AutoAnswer,
-			"auto_answer_callers":  ep.AutoAnswerCallers,
-			"auto_speaker":         ep.AutoSpeaker,
-			"auto_speaker_callers": ep.AutoSpeakerCallers,
-			"enabled":              ep.Enabled,
-			"created_at":           ep.CreatedAt,
-			"updated_at":           ep.UpdatedAt,
-			"registered":           contact.Registered,
-			"contact_status":       contact.Status,
-			"contact_uri":          contact.URI,
-			"contact_address":      contact.Address,
-			"contact_latency_ms":   contact.LatencyMS,
+			"id":                           ep.ID,
+			"account_id":                   ep.AccountID,
+			"extension":                    ep.Extension,
+			"username":                     ep.Username,
+			"description":                  ep.Description,
+			"route_to":                     ep.RouteTo,
+			"video_enabled":                ep.VideoEnabled,
+			"auto_answer":                  ep.AutoAnswer,
+			"auto_answer_callers":          ep.AutoAnswerCallers,
+			"auto_speaker":                 ep.AutoSpeaker,
+			"auto_speaker_callers":         ep.AutoSpeakerCallers,
+			"callback_bridge":              ep.CallbackBridge,
+			"callback_bridge_callers":      ep.CallbackBridgeCallers,
+			"callback_caller_auto_answer":  ep.CallbackCallerAutoAnswer,
+			"callback_caller_auto_speaker": ep.CallbackCallerAutoSpeaker,
+			"enabled":                      ep.Enabled,
+			"created_at":                   ep.CreatedAt,
+			"updated_at":                   ep.UpdatedAt,
+			"registered":                   contact.Registered,
+			"contact_status":               contact.Status,
+			"contact_uri":                  contact.URI,
+			"contact_address":              contact.Address,
+			"contact_latency_ms":           contact.LatencyMS,
 		})
 	}
 	return out
@@ -631,15 +660,19 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Description        *string `json:"description"`
-		Password           *string `json:"password"`
-		RouteTo            *string `json:"route_to"`
-		VideoEnabled       *bool   `json:"video_enabled"`
-		AutoAnswer         *bool   `json:"auto_answer"`
-		AutoAnswerCallers  *string `json:"auto_answer_callers"`
-		AutoSpeaker        *bool   `json:"auto_speaker"`
-		AutoSpeakerCallers *string `json:"auto_speaker_callers"`
-		Enabled            *bool   `json:"enabled"`
+		Description               *string `json:"description"`
+		Password                  *string `json:"password"`
+		RouteTo                   *string `json:"route_to"`
+		VideoEnabled              *bool   `json:"video_enabled"`
+		AutoAnswer                *bool   `json:"auto_answer"`
+		AutoAnswerCallers         *string `json:"auto_answer_callers"`
+		AutoSpeaker               *bool   `json:"auto_speaker"`
+		AutoSpeakerCallers        *string `json:"auto_speaker_callers"`
+		CallbackBridge            *bool   `json:"callback_bridge"`
+		CallbackBridgeCallers     *string `json:"callback_bridge_callers"`
+		CallbackCallerAutoAnswer  *bool   `json:"callback_caller_auto_answer"`
+		CallbackCallerAutoSpeaker *bool   `json:"callback_caller_auto_speaker"`
+		Enabled                   *bool   `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -682,10 +715,27 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		}
 		ep.AutoSpeakerCallers = callers
 	}
+	if body.CallbackBridge != nil {
+		ep.CallbackBridge = *body.CallbackBridge
+	}
+	if body.CallbackBridgeCallers != nil {
+		callers, ok := normalizeAutoAnswerCallersInput(*body.CallbackBridgeCallers)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "callback_bridge_callers must contain only extension/user tokens separated by commas"})
+			return
+		}
+		ep.CallbackBridgeCallers = callers
+	}
+	if body.CallbackCallerAutoAnswer != nil {
+		ep.CallbackCallerAutoAnswer = *body.CallbackCallerAutoAnswer
+	}
+	if body.CallbackCallerAutoSpeaker != nil {
+		ep.CallbackCallerAutoSpeaker = *body.CallbackCallerAutoSpeaker
+	}
 	if body.Enabled != nil {
 		ep.Enabled = *body.Enabled
 	}
-	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.VideoEnabled, ep.AutoAnswer, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.AutoSpeakerCallers, ep.Enabled); err != nil {
+	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.VideoEnabled, ep.AutoAnswer, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.AutoSpeakerCallers, ep.CallbackBridge, ep.CallbackBridgeCallers, ep.CallbackCallerAutoAnswer, ep.CallbackCallerAutoSpeaker, ep.Enabled); err != nil {
 		a.log.Error("update sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
@@ -1005,17 +1055,21 @@ func (a *API) reconfigureAsterisk() {
 	defs := make([]asterisk.SIPEndpointDef, 0, len(endpoints))
 	for _, ep := range endpoints {
 		defs = append(defs, asterisk.SIPEndpointDef{
-			ID:                 ep.ID,
-			Extension:          ep.Extension,
-			Username:           ep.Username,
-			Password:           ep.Password,
-			RouteTo:            ep.RouteTo,
-			VideoEnabled:       ep.VideoEnabled,
-			AutoAnswer:         ep.AutoAnswer,
-			AutoAnswerCallers:  ep.AutoAnswerCallers,
-			AutoSpeaker:        ep.AutoSpeaker,
-			AutoSpeakerCallers: ep.AutoSpeakerCallers,
-			Enabled:            ep.Enabled,
+			ID:                        ep.ID,
+			Extension:                 ep.Extension,
+			Username:                  ep.Username,
+			Password:                  ep.Password,
+			RouteTo:                   ep.RouteTo,
+			VideoEnabled:              ep.VideoEnabled,
+			AutoAnswer:                ep.AutoAnswer,
+			AutoAnswerCallers:         ep.AutoAnswerCallers,
+			AutoSpeaker:               ep.AutoSpeaker,
+			AutoSpeakerCallers:        ep.AutoSpeakerCallers,
+			CallbackBridge:            ep.CallbackBridge,
+			CallbackBridgeCallers:     ep.CallbackBridgeCallers,
+			CallbackCallerAutoAnswer:  ep.CallbackCallerAutoAnswer,
+			CallbackCallerAutoSpeaker: ep.CallbackCallerAutoSpeaker,
+			Enabled:                   ep.Enabled,
 		})
 	}
 

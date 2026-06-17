@@ -49,7 +49,7 @@ func TestOpenMigratesLegacySIPEndpointsWithVideoFlag(t *testing.T) {
 		t.Fatal("legacy SIP endpoint should not auto-answer by default")
 	}
 
-	if err := store.UpdateSIPEndpoint(door.ID, door.Description, door.Password, door.RouteTo, true, true, "1025", true, "1602", door.Enabled); err != nil {
+	if err := store.UpdateSIPEndpoint(door.ID, door.Description, door.Password, door.RouteTo, true, true, "1025", true, "1602", true, "1025", true, true, door.Enabled); err != nil {
 		t.Fatal(err)
 	}
 	door, err = store.GetSIPEndpoint("door")
@@ -70,5 +70,8 @@ func TestOpenMigratesLegacySIPEndpointsWithVideoFlag(t *testing.T) {
 	}
 	if door.AutoSpeakerCallers != "1602" {
 		t.Fatalf("auto_speaker_callers update was not persisted: %q", door.AutoSpeakerCallers)
+	}
+	if !door.CallbackBridge || door.CallbackBridgeCallers != "1025" || !door.CallbackCallerAutoAnswer || !door.CallbackCallerAutoSpeaker {
+		t.Fatalf("callback bridge fields were not persisted: %#v", door)
 	}
 }

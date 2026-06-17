@@ -95,6 +95,7 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 		)
 		router := asterisk.NewRouter(ami, log)
 		router.OnIncomingCall = s.handleSIPIncomingCall
+		router.OnIntercomCallback = s.handleSIPIntercomCallback
 		router.OnChannelHangup = s.handleSIPChannelHangup
 		router.OnOriginateResult = s.handleSIPOriginateResult
 		s.asterisk = router
@@ -1748,6 +1749,15 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	}
 
 	if routeTo != "" {
+		routeToSess := s.hub.Get(routeTo)
+		if routeToSess != nil && routeToSess.AccountID != accountID {
+			s.log.Warn("route_to node belongs to a different account; ignoring unsafe SIP route",
+				map[string]any{"route_to": routeTo, "route_account": routeToSess.AccountID, "call_account": accountID, "extension": in.Extension})
+			routeTo = ""
+		}
+	}
+
+	if routeTo != "" {
 		if s.hub.IsOnline(routeTo) && len(s.calls.ActiveByNode(routeTo)) == 0 {
 			appendUnique(routeTo)
 		} else {
@@ -1849,6 +1859,156 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	s.log.Info("SIP invite dispatched", map[string]any{
 		"call_id": callID, "extension": in.Extension, "targets": sentCount,
 	})
+}
+
+func (s *Server) handleSIPIntercomCallback(req asterisk.IntercomCallbackRequest) {
+	if s.asterisk == nil {
+		return
+	}
+	source := strings.TrimSpace(req.SourceExtension)
+	target := strings.TrimSpace(req.TargetExtension)
+	if !isSafeDoorSIPExtension(source) || !isSafeDoorSIPExtension(target) || source == target {
+		s.log.Warn("rejecting unsafe SIP intercom callback",
+			map[string]any{"source": source, "target": target, "channel": req.Channel})
+		s.hangupAsteriskChannelAsync(req.Channel, "unsafe intercom callback")
+		return
+	}
+	if isReservedGatewayExtension(source) || isReservedGatewayExtension(target) {
+		s.log.Warn("rejecting intercom callback involving gateway endpoint",
+			map[string]any{"source": source, "target": target, "channel": req.Channel})
+		s.hangupAsteriskChannelAsync(req.Channel, "gateway endpoint cannot use intercom callback")
+		return
+	}
+
+	sourceEP, err := s.store.GetSIPEndpointByExtension(source)
+	if err != nil {
+		s.log.Error("db error looking up intercom callback source", map[string]any{"source": source, "err": err.Error()})
+		s.hangupAsteriskChannelAsync(req.Channel, "source lookup failed")
+		return
+	}
+	targetEP, err := s.store.GetSIPEndpointByExtension(target)
+	if err != nil {
+		s.log.Error("db error looking up intercom callback target", map[string]any{"target": target, "err": err.Error()})
+		s.hangupAsteriskChannelAsync(req.Channel, "target lookup failed")
+		return
+	}
+	if sourceEP == nil || targetEP == nil || !sourceEP.Enabled || !targetEP.Enabled || sourceEP.AccountID != targetEP.AccountID {
+		s.log.Warn("rejecting intercom callback with missing or cross-account endpoints",
+			map[string]any{"source": source, "target": target, "channel": req.Channel})
+		s.hangupAsteriskChannelAsync(req.Channel, "invalid callback endpoints")
+		return
+	}
+	if !targetEP.CallbackBridge || !callerAllowedForCallback(source, targetEP.CallbackBridgeCallers) {
+		s.log.Warn("rejecting intercom callback not allowed by target config",
+			map[string]any{"source": source, "target": target, "allowlist": targetEP.CallbackBridgeCallers})
+		s.hangupAsteriskChannelAsync(req.Channel, "callback not allowed")
+		return
+	}
+	acct, err := s.store.GetAccount(sourceEP.AccountID)
+	if err == nil && acct != nil && s.calls.CountActiveByAccount(sourceEP.AccountID) >= acct.MaxCalls {
+		s.log.Warn("rejecting intercom callback because account call limit is reached",
+			map[string]any{"account_id": sourceEP.AccountID, "source": source, "target": target})
+		s.hangupAsteriskChannelAsync(req.Channel, "account call limit reached")
+		return
+	}
+	if !s.asterisk.EndpointHasContacts(source) || !s.asterisk.EndpointHasContacts(target) {
+		s.log.Warn("rejecting intercom callback because endpoint is not registered",
+			map[string]any{"source": source, "target": target})
+		s.hangupAsteriskChannelAsync(req.Channel, "callback endpoint not registered")
+		return
+	}
+
+	callID := "call_" + uuid.NewString()
+	c := &calls.Call{
+		ID:        callID,
+		FromNode:  "sip:" + source,
+		ToNode:    "sip:" + target,
+		AccountID: sourceEP.AccountID,
+		CallType:  "sip",
+		CallerID:  firstNonBlank(req.CallerID, source),
+	}
+	if !s.calls.Create(c) {
+		s.hangupAsteriskChannelAsync(req.Channel, "duplicate intercom callback")
+		return
+	}
+
+	callerID := formatSIPCallerID(firstNonBlank(req.CallerID, source), source)
+	sourceMode := sanitizeAutoAnswerMode(req.SourceAutoMode)
+	targetMode := sanitizeAutoAnswerMode(req.TargetAutoMode)
+	s.hangupAsteriskChannelAsync(req.Channel, "replacing caller leg with callback bridge")
+	go func() {
+		time.Sleep(350 * time.Millisecond)
+		if _, err := s.asterisk.OriginateIntercomCallback(source, target, callerID, callID, sourceMode, targetMode, s.cfg.CallTimeoutSec); err != nil {
+			if ended, ok := s.calls.End(callID, "originate_failed"); ok {
+				s.notifyCallStatus(ended)
+			}
+			s.asterisk.UntrackCall(callID)
+			s.log.Error("intercom callback originate failed",
+				map[string]any{"call_id": callID, "source": source, "target": target, "err": err.Error()})
+			return
+		}
+		s.log.Info("intercom callback bridge originated",
+			map[string]any{"call_id": callID, "source": source, "target": target, "source_mode": sourceMode, "target_mode": targetMode})
+		s.store.WriteAudit(sourceEP.AccountID, "", "sip_intercom_callback",
+			fmt.Sprintf("call=%s source=%s target=%s source_mode=%s target_mode=%s", callID, source, target, sourceMode, targetMode), "")
+	}()
+}
+
+func callerAllowedForCallback(source, allowlist string) bool {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return false
+	}
+	for _, caller := range splitTokenList(allowlist) {
+		if caller == source {
+			return true
+		}
+	}
+	return false
+}
+
+func splitTokenList(values string) []string {
+	parts := strings.FieldsFunc(values, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
+	})
+	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		if _, ok := seen[token]; ok {
+			continue
+		}
+		seen[token] = struct{}{}
+		out = append(out, token)
+	}
+	return out
+}
+
+func isReservedGatewayExtension(ext string) bool {
+	return len(ext) == 4 && strings.HasPrefix(ext, "70")
+}
+
+func sanitizeAutoAnswerMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "speaker":
+		return "speaker"
+	case "normal":
+		return "normal"
+	default:
+		return ""
+	}
+}
+
+func firstNonBlank(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (s *Server) resolveIncomingSIPCallerEndpoint(in asterisk.IncomingSIPCall) (string, *store.SIPEndpoint) {
@@ -2599,17 +2759,21 @@ func (s *Server) configureAsteriskFromStore() {
 	defs := make([]asterisk.SIPEndpointDef, 0, len(endpoints))
 	for _, ep := range endpoints {
 		defs = append(defs, asterisk.SIPEndpointDef{
-			ID:                 ep.ID,
-			Extension:          ep.Extension,
-			Username:           ep.Username,
-			Password:           ep.Password,
-			RouteTo:            ep.RouteTo,
-			VideoEnabled:       ep.VideoEnabled,
-			AutoAnswer:         ep.AutoAnswer,
-			AutoAnswerCallers:  ep.AutoAnswerCallers,
-			AutoSpeaker:        ep.AutoSpeaker,
-			AutoSpeakerCallers: ep.AutoSpeakerCallers,
-			Enabled:            ep.Enabled,
+			ID:                        ep.ID,
+			Extension:                 ep.Extension,
+			Username:                  ep.Username,
+			Password:                  ep.Password,
+			RouteTo:                   ep.RouteTo,
+			VideoEnabled:              ep.VideoEnabled,
+			AutoAnswer:                ep.AutoAnswer,
+			AutoAnswerCallers:         ep.AutoAnswerCallers,
+			AutoSpeaker:               ep.AutoSpeaker,
+			AutoSpeakerCallers:        ep.AutoSpeakerCallers,
+			CallbackBridge:            ep.CallbackBridge,
+			CallbackBridgeCallers:     ep.CallbackBridgeCallers,
+			CallbackCallerAutoAnswer:  ep.CallbackCallerAutoAnswer,
+			CallbackCallerAutoSpeaker: ep.CallbackCallerAutoSpeaker,
+			Enabled:                   ep.Enabled,
 		})
 	}
 

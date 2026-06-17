@@ -162,12 +162,56 @@ func TestRouteSpecificAutoAnswerHeadersAreConditional(t *testing.T) {
 	if !strings.Contains(target, "Goto(simson-auto-answer-done)") {
 		t.Fatal("route-specific auto-answer must fall through to a normal dial when caller does not match")
 	}
-	if !strings.Contains(dialplan, "[simson-auto-answer]") || !strings.Contains(dialplan, "info=intercom") {
-		t.Fatal("auto-answer pre-dial handler with speaker hint headers missing")
+	if !strings.Contains(dialplan, "[simson-auto-answer]") ||
+		!strings.Contains(dialplan, "info=intercom") ||
+		!strings.Contains(dialplan, "P-Auto-Answer)=intercom") ||
+		!strings.Contains(dialplan, "Alert-Info)=answer-after=0") {
+		t.Fatal("auto-answer pre-dial handler with compatibility speaker hint headers missing")
 	}
 	caller := section(dialplan, "exten => 1025,1,NoOp(Simson direct SIP endpoint", "exten => 1603,1,NoOp")
 	if strings.Contains(caller, "Answer-Mode)=Auto") {
 		t.Fatal("caller endpoint should not receive target endpoint auto-answer headers")
+	}
+}
+
+func TestCallbackBridgeDialplanIsAllowlistedAndCarriesBothAutoModes(t *testing.T) {
+	endpoints := []SIPEndpointDef{
+		{ID: "caller", Extension: "1025", Username: "1025", Password: "secret", Enabled: true},
+		{
+			ID:                        "target",
+			Extension:                 "1603",
+			Username:                  "1603",
+			Password:                  "secret",
+			Enabled:                   true,
+			AutoAnswer:                true,
+			AutoAnswerCallers:         "1025",
+			AutoSpeaker:               true,
+			AutoSpeakerCallers:        "1025",
+			CallbackBridge:            true,
+			CallbackBridgeCallers:     "1025",
+			CallbackCallerAutoAnswer:  true,
+			CallbackCallerAutoSpeaker: true,
+		},
+	}
+
+	dialplan := buildDirectEndpointDialplan(endpoints)
+	target := section(dialplan, "exten => 1603,1,NoOp(Simson direct SIP endpoint", "exten => _+X.")
+	for _, want := range []string{
+		`"${SIMSON_CALLER_ENDPOINT}" = "1025"`,
+		`UserEvent(SimsonIntercomCallback`,
+		`Source: ${SIMSON_CALLBACK_SOURCE}`,
+		`Target: ${EXTEN}`,
+		`SourceAutoMode: speaker`,
+		`TargetAutoMode: ${SIMSON_AUTO_ANSWER_MODE}`,
+		`Hangup(16)`,
+		`Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},${SIMSON_DIAL_OPTIONS})`,
+	} {
+		if !strings.Contains(target, want) {
+			t.Fatalf("callback bridge dialplan missing %q:\n%s", want, target)
+		}
+	}
+	if strings.Contains(target, "SourceAutoMode: normal") {
+		t.Fatal("speaker mode should take precedence over normal caller auto-answer mode")
 	}
 }
 

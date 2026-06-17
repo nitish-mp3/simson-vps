@@ -47,7 +47,14 @@ type SIPEndpointDef struct {
 	// AutoSpeakerCallers optionally narrows speaker/intercom mode to a separate
 	// caller allowlist. Empty reuses AutoAnswerCallers for backward compatibility.
 	AutoSpeakerCallers string
-	Enabled            bool
+	// CallbackBridge lets Simson call the original caller back first, then bridge
+	// to this endpoint. This is the only reliable caller-side auto speaker path.
+	CallbackBridge bool
+	// CallbackBridgeCallers is the allowlist for callback bridge source phones.
+	CallbackBridgeCallers     string
+	CallbackCallerAutoAnswer  bool
+	CallbackCallerAutoSpeaker bool
+	Enabled                   bool
 }
 
 // Setup writes all Asterisk config files needed by the Simson VPS and reloads
@@ -672,6 +679,30 @@ exten => _X.,1,NoOp(Simson door camera bridge to SIP endpoint ${EXTEN})
  same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},T)
  same  => n,Hangup()
 
+[from-simson-callback-source]
+; Caller-side intercom bridge: Simson calls the original caller phone back as
+; a fresh called leg. This is the reliable way to request caller-side
+; auto-answer/speaker, because SIP cannot force speaker on an already-originated
+; caller handset.
+exten => _X.,1,NoOp(Simson callback bridge source ${EXTEN})
+ same  => n,Set(__SIMSON_CALL_ID=${SIMSON_CALL_ID})
+ same  => n,Set(SIMSON_DIAL_OPTIONS=T)
+ same  => n,GotoIf($["${SIMSON_SOURCE_AUTO_MODE}" = ""]?dial)
+ same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-auto-answer^s^1(${SIMSON_SOURCE_AUTO_MODE})))
+ same  => n(dial),Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},${SIMSON_DIAL_OPTIONS})
+ same  => n,Hangup()
+
+[from-simson-callback-target]
+; After the caller callback leg answers, ring the requested target phone in a
+; plain SIP bridge so normal audio/video negotiation stays native.
+exten => _X.,1,NoOp(Simson callback bridge target ${EXTEN})
+ same  => n,Set(__SIMSON_CALL_ID=${SIMSON_CALL_ID})
+ same  => n,Set(SIMSON_DIAL_OPTIONS=T)
+ same  => n,GotoIf($["${SIMSON_TARGET_AUTO_MODE}" = ""]?dial)
+ same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-auto-answer^s^1(${SIMSON_TARGET_AUTO_MODE})))
+ same  => n(dial),Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},${SIMSON_DIAL_OPTIONS})
+ same  => n,Hangup()
+
 [%s]
 ; Configured outbound landline/PSTN targets.
 ; The VPS originates Local/<number>@%s and passes SIMSON_TRUNK.
@@ -687,13 +718,21 @@ exten => missing-trunk,1,NoOp(Simson outbound trunk call missing SIMSON_TRUNK)
 
 [simson-auto-answer]
 exten => s,1,NoOp(Add Simson SIP auto-answer headers mode=${ARG1})
+ ; Different SIP phones listen for different auto-answer/intercom hints. Keep
+ ; this as a conservative superset on the called leg only.
  same  => n,Set(PJSIP_HEADER(add,Alert-Info)=<http://www.notused.com>;info=alert-autoanswer)
  same  => n,Set(PJSIP_HEADER(add,Call-Info)=<sip:simson>;answer-after=0)
  same  => n,Set(PJSIP_HEADER(add,Answer-Mode)=Auto)
  same  => n,Set(PJSIP_HEADER(add,Priv-Answer-Mode)=Auto)
  same  => n,Set(PJSIP_HEADER(add,P-Auto-Answer)=normal)
+ same  => n,Set(PJSIP_HEADER(add,Alert-Info)=Auto Answer)
+ same  => n,Set(PJSIP_HEADER(add,Alert-Info)=answer-after=0)
  same  => n,GotoIf($["${ARG1}" != "speaker"]?done)
  same  => n,Set(PJSIP_HEADER(add,Alert-Info)=<http://www.notused.com>;info=intercom)
+ same  => n,Set(PJSIP_HEADER(add,Call-Info)=<sip:simson>;answer-after=0;intercom=true)
+ same  => n,Set(PJSIP_HEADER(add,P-Auto-Answer)=intercom)
+ same  => n,Set(PJSIP_HEADER(add,Answer-Mode)=Auto)
+ same  => n,Set(PJSIP_HEADER(add,Priv-Answer-Mode)=Auto)
  same  => n(done),Return()
 
 [simson-extension-predial]
@@ -941,7 +980,17 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		}
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
-		if aa, ok := autoAnswer[ext]; ok {
+		targetAutoModePrepared := false
+		if ep.CallbackBridge {
+			if aa, ok := autoAnswer[ext]; ok {
+				appendConditionalAutoAnswerMode(&sb, aa.AutoAnswerCallers, aa.AutoSpeaker, aa.AutoSpeakerCallers)
+			} else {
+				sb.WriteString(" same  => n,Set(SIMSON_AUTO_ANSWER_MODE=)\n")
+			}
+			targetAutoModePrepared = true
+			appendConditionalCallbackBridge(&sb, ep.CallbackBridgeCallers, callbackSourceMode(ep))
+		}
+		if aa, ok := autoAnswer[ext]; ok && !targetAutoModePrepared {
 			appendConditionalAutoAnswerMode(&sb, aa.AutoAnswerCallers, aa.AutoSpeaker, aa.AutoSpeakerCallers)
 		}
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=T)\n")
@@ -951,6 +1000,39 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		sb.WriteString(" same  => n,Hangup()\n")
 	}
 	return sb.String()
+}
+
+func callbackSourceMode(ep SIPEndpointDef) string {
+	if ep.CallbackCallerAutoSpeaker {
+		return "speaker"
+	}
+	if ep.CallbackCallerAutoAnswer {
+		return "normal"
+	}
+	return ""
+}
+
+func appendConditionalCallbackBridge(sb *strings.Builder, callers, sourceMode string) {
+	allowed := parseAutoAnswerCallers(callers)
+	if len(allowed) == 0 {
+		sb.WriteString(" same  => n,NoOp(Simson callback bridge enabled but no caller allowlist configured)\n")
+		return
+	}
+	appendCallerIdentityVars(sb)
+	sb.WriteString(" same  => n,Set(SIMSON_CALLBACK_BRIDGE_MATCH=)\n")
+	for _, caller := range allowed {
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_CALLER_ENDPOINT}\" = \"%s\"]?simson-callback-match)\n", caller)
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_SOURCE_EXTENSION}\" = \"%s\"]?simson-callback-match)\n", caller)
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${CALLERID(num)}\" = \"%s\"]?simson-callback-match)\n", caller)
+	}
+	sb.WriteString(" same  => n,Goto(simson-callback-done)\n")
+	sb.WriteString(" same  => n(simson-callback-match),NoOp(Simson callback bridge matched caller ${SIMSON_CALLER_ENDPOINT}/${CALLERID(num)})\n")
+	sb.WriteString(" same  => n,Set(SIMSON_CALLBACK_SOURCE=${SIMSON_CALLER_ENDPOINT})\n")
+	sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_CALLBACK_SOURCE}\" != \"\"]?simson-callback-send)\n")
+	sb.WriteString(" same  => n,Set(SIMSON_CALLBACK_SOURCE=${SIMSON_SOURCE_EXTENSION})\n")
+	sb.WriteString(" same  => n(simson-callback-send),UserEvent(SimsonIntercomCallback,Source: ${SIMSON_CALLBACK_SOURCE},Target: ${EXTEN},Caller: ${CALLERID(num)},UniqueID: ${UNIQUEID},Channel: ${CHANNEL},SourceAutoMode: " + sourceMode + ",TargetAutoMode: ${SIMSON_AUTO_ANSWER_MODE})\n")
+	sb.WriteString(" same  => n,Hangup(16)\n")
+	sb.WriteString(" same  => n(simson-callback-done),NoOp(Simson callback bridge not used)\n")
 }
 
 func appendConditionalAutoAnswerMode(sb *strings.Builder, callers string, speaker bool, speakerCallers string) {

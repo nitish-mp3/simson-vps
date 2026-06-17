@@ -20,6 +20,18 @@ type IncomingSIPCall struct {
 	BridgeID       string // ConfBridge room the SIP channel is already parked in
 }
 
+// IntercomCallbackRequest asks the server to replace a direct SIP caller leg
+// with a fresh callback leg so caller-side auto-answer/speaker hints can be sent.
+type IntercomCallbackRequest struct {
+	Channel         string
+	SourceExtension string
+	TargetExtension string
+	CallerID        string
+	UniqueID        string
+	SourceAutoMode  string
+	TargetAutoMode  string
+}
+
 // ContactStatus describes the live PJSIP registration/contact state for an AoR.
 type ContactStatus struct {
 	Registered bool   `json:"registered"`
@@ -41,9 +53,10 @@ type Router struct {
 	log *logging.Logger
 
 	// Callbacks set by server.go after construction.
-	OnIncomingCall    func(in IncomingSIPCall)                    // SIP phone dialled in
-	OnChannelHangup   func(channel string)                        // SIP channel hung up
-	OnOriginateResult func(callID string, ok bool, reason string) // async Originate outcome
+	OnIncomingCall     func(in IncomingSIPCall)                    // SIP phone dialled in
+	OnIntercomCallback func(req IntercomCallbackRequest)           // SIP direct route requested callback bridge
+	OnChannelHangup    func(channel string)                        // SIP channel hung up
+	OnOriginateResult  func(callID string, ok bool, reason string) // async Originate outcome
 
 	// call tracking
 	mu                    sync.RWMutex
@@ -286,6 +299,49 @@ func (r *Router) OriginateDoorStationToBridge(sourceExtension, bridgeExt, caller
 		actionID,
 		vars,
 		"ulaw,alaw",
+	)
+	if err != nil {
+		r.originateMu.Lock()
+		delete(r.actionIDToCallID, actionID)
+		r.originateMu.Unlock()
+		return "", err
+	}
+
+	return actionID, nil
+}
+
+// OriginateIntercomCallback calls the original source phone back first and, once
+// answered, dials the target extension. This enables caller-side intercom
+// headers because the source phone becomes a called leg.
+func (r *Router) OriginateIntercomCallback(sourceExtension, targetExtension, callerID, callID, sourceAutoMode, targetAutoMode string, timeoutSec int) (string, error) {
+	channel := fmt.Sprintf("Local/%s@from-simson-callback-source/n", sourceExtension)
+	actionID := uuid.NewString()
+	r.TrackPendingPrefix(callID, fmt.Sprintf("Local/%s@from-simson-callback-source-", sourceExtension))
+	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", sourceExtension))
+	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", targetExtension))
+
+	r.originateMu.Lock()
+	r.actionIDToCallID[actionID] = callID
+	r.originateMu.Unlock()
+
+	vars := map[string]string{
+		"SIMSON_CALL_ID":            callID,
+		"__SIMSON_CALL_ID":          callID,
+		"SIMSON_WAIT_TIMEOUT":       fmt.Sprintf("%d", timeoutSec),
+		"SIMSON_SOURCE_AUTO_MODE":   sourceAutoMode,
+		"__SIMSON_SOURCE_AUTO_MODE": sourceAutoMode,
+		"SIMSON_TARGET_AUTO_MODE":   targetAutoMode,
+		"__SIMSON_TARGET_AUTO_MODE": targetAutoMode,
+	}
+	_, err := r.ami.OriginateWithVarsAndCodecs(
+		channel,
+		"from-simson-callback-target",
+		targetExtension,
+		callerID,
+		timeoutSec*1000,
+		actionID,
+		vars,
+		"ulaw,alaw,h264",
 	)
 	if err != nil {
 		r.originateMu.Lock()
@@ -619,8 +675,11 @@ func (r *Router) onEvent(ev Event) {
 
 	case "UserEvent":
 		// Our dialplan fires: UserEvent(SimsonRoute,Extension:…,Caller:…,…)
-		if ev.Fields["UserEvent"] == "SimsonRoute" {
+		switch ev.Fields["UserEvent"] {
+		case "SimsonRoute":
 			r.handleSimsonRoute(ev)
+		case "SimsonIntercomCallback":
+			r.handleSimsonIntercomCallback(ev)
 		}
 
 	case "Hangup":
@@ -638,6 +697,28 @@ func (r *Router) onEvent(ev Event) {
 				r.TrackCall(callID, channel)
 			}
 		}
+	}
+}
+
+func (r *Router) handleSimsonIntercomCallback(ev Event) {
+	req := IntercomCallbackRequest{
+		Channel:         ev.Fields["Channel"],
+		SourceExtension: strings.TrimSpace(ev.Fields["Source"]),
+		TargetExtension: strings.TrimSpace(ev.Fields["Target"]),
+		CallerID:        strings.TrimSpace(ev.Fields["Caller"]),
+		UniqueID:        ev.Fields["UniqueID"],
+		SourceAutoMode:  strings.TrimSpace(ev.Fields["SourceAutoMode"]),
+		TargetAutoMode:  strings.TrimSpace(ev.Fields["TargetAutoMode"]),
+	}
+	if req.Channel == "" || req.SourceExtension == "" || req.TargetExtension == "" {
+		r.log.Warn("SimsonIntercomCallback event missing required fields", map[string]any{"fields": ev.Fields})
+		return
+	}
+	r.log.Info("SIP intercom callback requested", map[string]any{
+		"source": req.SourceExtension, "target": req.TargetExtension, "source_mode": req.SourceAutoMode, "target_mode": req.TargetAutoMode,
+	})
+	if r.OnIntercomCallback != nil {
+		r.OnIntercomCallback(req)
 	}
 }
 
