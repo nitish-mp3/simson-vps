@@ -153,11 +153,17 @@ func TestRouteSpecificAutoAnswerHeadersAreConditional(t *testing.T) {
 	if !strings.Contains(target, `"${SIMSON_CALLER_ENDPOINT}" = "1025"`) {
 		t.Fatal("direct SIP route should condition auto-answer on the caller endpoint")
 	}
-	if !strings.Contains(target, "info=intercom") {
-		t.Fatal("auto-speaker route should include intercom/speaker hint headers")
+	if !strings.Contains(target, "SIMSON_AUTO_ANSWER_MODE=speaker") {
+		t.Fatal("route-specific auto-speaker should set speaker mode only after caller match")
 	}
-	if !strings.Contains(target, "Goto(simson-dial)") {
+	if !strings.Contains(target, "b(simson-auto-answer^s^1(${SIMSON_AUTO_ANSWER_MODE}))") {
+		t.Fatal("direct SIP route should inject auto-answer headers with a called-channel pre-dial handler")
+	}
+	if !strings.Contains(target, "Goto(simson-auto-answer-done)") {
 		t.Fatal("route-specific auto-answer must fall through to a normal dial when caller does not match")
+	}
+	if !strings.Contains(dialplan, "[simson-auto-answer]") || !strings.Contains(dialplan, "info=intercom") {
+		t.Fatal("auto-answer pre-dial handler with speaker hint headers missing")
 	}
 	caller := section(dialplan, "exten => 1025,1,NoOp(Simson direct SIP endpoint", "exten => 1603,1,NoOp")
 	if strings.Contains(caller, "Answer-Mode)=Auto") {

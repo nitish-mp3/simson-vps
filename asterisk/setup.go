@@ -682,6 +682,24 @@ exten => missing-trunk,1,NoOp(Simson outbound trunk call missing SIMSON_TRUNK)
  same  => n,Congestion(5)
  same  => n,Hangup(21)
 
+[simson-auto-answer]
+exten => s,1,NoOp(Add Simson SIP auto-answer headers mode=${ARG1})
+ same  => n,Set(PJSIP_HEADER(add,Alert-Info)=<http://www.notused.com>;info=alert-autoanswer)
+ same  => n,Set(PJSIP_HEADER(add,Call-Info)=<sip:simson>;answer-after=0)
+ same  => n,Set(PJSIP_HEADER(add,Answer-Mode)=Auto)
+ same  => n,Set(PJSIP_HEADER(add,Priv-Answer-Mode)=Auto)
+ same  => n,Set(PJSIP_HEADER(add,P-Auto-Answer)=normal)
+ same  => n,GotoIf($["${ARG1}" != "speaker"]?done)
+ same  => n,Set(PJSIP_HEADER(add,Alert-Info)=<http://www.notused.com>;info=intercom)
+ same  => n(done),Return()
+
+[simson-extension-predial]
+exten => s,1,NoOp(Mark Simson extension leg and optionally add auto-answer headers)
+ same  => n,Gosub(simson-outbound-mark^s^1(${ARG1}))
+ same  => n,GotoIf($["${ARG2}" = ""]?done)
+ same  => n,Gosub(simson-auto-answer^s^1(${ARG2}))
+ same  => n(done),Return()
+
 [simson-outbound-mark]
 exten => s,1,NoOp(Mark Simson outbound child channel ${ARG1})
  same  => n,Set(SIMSON_CALL_ID=${ARG1})
@@ -921,43 +939,40 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
 		if aa, ok := autoAnswer[ext]; ok {
-			appendConditionalAutoAnswerHeaders(&sb, aa.AutoAnswerCallers, aa.AutoSpeaker)
+			appendConditionalAutoAnswerMode(&sb, aa.AutoAnswerCallers, aa.AutoSpeaker)
 		}
-		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},T)\n")
+		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=T)\n")
+		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
+		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-auto-answer^s^1(${SIMSON_AUTO_ANSWER_MODE})))\n")
+		sb.WriteString(" same  => n(simson-dial),Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},${SIMSON_DIAL_OPTIONS})\n")
 		sb.WriteString(" same  => n,Hangup()\n")
 	}
 	return sb.String()
 }
 
-func appendConditionalAutoAnswerHeaders(sb *strings.Builder, callers string, speaker bool) {
+func appendConditionalAutoAnswerMode(sb *strings.Builder, callers string, speaker bool) {
+	mode := "normal"
+	if speaker {
+		mode = "speaker"
+	}
+	sb.WriteString(" same  => n,Set(SIMSON_AUTO_ANSWER_MODE=)\n")
 	allowed := parseAutoAnswerCallers(callers)
 	if len(allowed) == 0 {
-		appendAutoAnswerHeaders(sb, speaker)
+		fmt.Fprintf(sb, " same  => n,Set(SIMSON_AUTO_ANSWER_MODE=%s)\n", mode)
 		return
 	}
 
 	sb.WriteString(" same  => n,Set(SIMSON_CALLER_ENDPOINT=${CHANNEL(pjsip,endpoint)})\n")
 	sb.WriteString(" same  => n,Set(SIMSON_SOURCE_EXTENSION=${IF($[\"${SIMSON_SOURCE_EXTENSION}\" = \"\"]?${CALLERID(num)}:${SIMSON_SOURCE_EXTENSION})})\n")
 	for _, caller := range allowed {
-		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_CALLER_ENDPOINT}\" = \"%s\"]?simson-auto-answer)\n", caller)
-		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_SOURCE_EXTENSION}\" = \"%s\"]?simson-auto-answer)\n", caller)
-		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${CALLERID(num)}\" = \"%s\"]?simson-auto-answer)\n", caller)
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_CALLER_ENDPOINT}\" = \"%s\"]?simson-auto-answer-match)\n", caller)
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_SOURCE_EXTENSION}\" = \"%s\"]?simson-auto-answer-match)\n", caller)
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${CALLERID(num)}\" = \"%s\"]?simson-auto-answer-match)\n", caller)
 	}
-	sb.WriteString(" same  => n,Goto(simson-dial)\n")
-	sb.WriteString(" same  => n(simson-auto-answer),NoOp(Simson route-specific auto-answer matched caller ${SIMSON_CALLER_ENDPOINT}/${CALLERID(num)})\n")
-	appendAutoAnswerHeaders(sb, speaker)
-	sb.WriteString(" same  => n(simson-dial),NoOp(Simson normal SIP dial)\n")
-}
-
-func appendAutoAnswerHeaders(sb *strings.Builder, speaker bool) {
-	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Alert-Info)=<http://www.notused.com>;info=alert-autoanswer)\n")
-	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Call-Info)=<sip:simson>;answer-after=0)\n")
-	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Answer-Mode)=Auto)\n")
-	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Priv-Answer-Mode)=Auto)\n")
-	sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,P-Auto-Answer)=normal)\n")
-	if speaker {
-		sb.WriteString(" same  => n,Set(PJSIP_HEADER(add,Alert-Info)=<http://www.notused.com>;info=intercom)\n")
-	}
+	sb.WriteString(" same  => n,Goto(simson-auto-answer-done)\n")
+	sb.WriteString(" same  => n(simson-auto-answer-match),NoOp(Simson route-specific auto-answer matched caller ${SIMSON_CALLER_ENDPOINT}/${CALLERID(num)})\n")
+	fmt.Fprintf(sb, " same  => n,Set(SIMSON_AUTO_ANSWER_MODE=%s)\n", mode)
+	sb.WriteString(" same  => n(simson-auto-answer-done),NoOp(Simson auto-answer mode ${SIMSON_AUTO_ANSWER_MODE})\n")
 }
 
 func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
@@ -976,8 +991,11 @@ func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
 		}
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson dial auto-answer SIP endpoint ${EXTEN})\n", ext)
-		appendConditionalAutoAnswerHeaders(&sb, ep.AutoAnswerCallers, ep.AutoSpeaker)
-		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=120},rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))\n")
+		appendConditionalAutoAnswerMode(&sb, ep.AutoAnswerCallers, ep.AutoSpeaker)
+		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))\n")
+		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
+		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE})))\n")
+		sb.WriteString(" same  => n(simson-dial),Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=120},${SIMSON_DIAL_OPTIONS})\n")
 		sb.WriteString(" same  => n,Hangup()\n\n")
 	}
 	return sb.String()
