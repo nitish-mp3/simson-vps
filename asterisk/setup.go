@@ -44,7 +44,10 @@ type SIPEndpointDef struct {
 	// AutoAnswerCallers is a comma-separated allowlist. Empty means any caller.
 	AutoAnswerCallers string
 	AutoSpeaker       bool
-	Enabled           bool
+	// AutoSpeakerCallers optionally narrows speaker/intercom mode to a separate
+	// caller allowlist. Empty reuses AutoAnswerCallers for backward compatibility.
+	AutoSpeakerCallers string
+	Enabled            bool
 }
 
 // Setup writes all Asterisk config files needed by the Simson VPS and reloads
@@ -939,7 +942,7 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
 		if aa, ok := autoAnswer[ext]; ok {
-			appendConditionalAutoAnswerMode(&sb, aa.AutoAnswerCallers, aa.AutoSpeaker)
+			appendConditionalAutoAnswerMode(&sb, aa.AutoAnswerCallers, aa.AutoSpeaker, aa.AutoSpeakerCallers)
 		}
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=T)\n")
 		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
@@ -950,20 +953,25 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 	return sb.String()
 }
 
-func appendConditionalAutoAnswerMode(sb *strings.Builder, callers string, speaker bool) {
-	mode := "normal"
-	if speaker {
-		mode = "speaker"
-	}
+func appendConditionalAutoAnswerMode(sb *strings.Builder, callers string, speaker bool, speakerCallers string) {
 	sb.WriteString(" same  => n,Set(SIMSON_AUTO_ANSWER_MODE=)\n")
 	allowed := parseAutoAnswerCallers(callers)
+	speakerAllowed := parseAutoAnswerCallers(speakerCallers)
+	if speaker && len(speakerAllowed) == 0 {
+		speakerAllowed = append([]string(nil), allowed...)
+	}
 	if len(allowed) == 0 {
-		fmt.Fprintf(sb, " same  => n,Set(SIMSON_AUTO_ANSWER_MODE=%s)\n", mode)
+		sb.WriteString(" same  => n,Set(SIMSON_AUTO_ANSWER_MODE=normal)\n")
+		if speaker {
+			if len(speakerAllowed) > 0 {
+				appendCallerIdentityVars(sb)
+			}
+			appendConditionalSpeakerMode(sb, speakerAllowed)
+		}
 		return
 	}
 
-	sb.WriteString(" same  => n,Set(SIMSON_CALLER_ENDPOINT=${CHANNEL(pjsip,endpoint)})\n")
-	sb.WriteString(" same  => n,Set(SIMSON_SOURCE_EXTENSION=${IF($[\"${SIMSON_SOURCE_EXTENSION}\" = \"\"]?${CALLERID(num)}:${SIMSON_SOURCE_EXTENSION})})\n")
+	appendCallerIdentityVars(sb)
 	for _, caller := range allowed {
 		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_CALLER_ENDPOINT}\" = \"%s\"]?simson-auto-answer-match)\n", caller)
 		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_SOURCE_EXTENSION}\" = \"%s\"]?simson-auto-answer-match)\n", caller)
@@ -971,8 +979,32 @@ func appendConditionalAutoAnswerMode(sb *strings.Builder, callers string, speake
 	}
 	sb.WriteString(" same  => n,Goto(simson-auto-answer-done)\n")
 	sb.WriteString(" same  => n(simson-auto-answer-match),NoOp(Simson route-specific auto-answer matched caller ${SIMSON_CALLER_ENDPOINT}/${CALLERID(num)})\n")
-	fmt.Fprintf(sb, " same  => n,Set(SIMSON_AUTO_ANSWER_MODE=%s)\n", mode)
+	sb.WriteString(" same  => n,Set(SIMSON_AUTO_ANSWER_MODE=normal)\n")
+	if speaker {
+		appendConditionalSpeakerMode(sb, speakerAllowed)
+	}
 	sb.WriteString(" same  => n(simson-auto-answer-done),NoOp(Simson auto-answer mode ${SIMSON_AUTO_ANSWER_MODE})\n")
+}
+
+func appendCallerIdentityVars(sb *strings.Builder) {
+	sb.WriteString(" same  => n,Set(SIMSON_CALLER_ENDPOINT=${CHANNEL(pjsip,endpoint)})\n")
+	sb.WriteString(" same  => n,Set(SIMSON_SOURCE_EXTENSION=${IF($[\"${SIMSON_SOURCE_EXTENSION}\" = \"\"]?${CALLERID(num)}:${SIMSON_SOURCE_EXTENSION})})\n")
+}
+
+func appendConditionalSpeakerMode(sb *strings.Builder, allowed []string) {
+	if len(allowed) == 0 {
+		sb.WriteString(" same  => n,Set(SIMSON_AUTO_ANSWER_MODE=speaker)\n")
+		return
+	}
+	sb.WriteString(" same  => n,Set(SIMSON_SPEAKER_MATCH=)\n")
+	for _, caller := range allowed {
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_CALLER_ENDPOINT}\" = \"%s\"]?simson-speaker-match)\n", caller)
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${SIMSON_SOURCE_EXTENSION}\" = \"%s\"]?simson-speaker-match)\n", caller)
+		fmt.Fprintf(sb, " same  => n,GotoIf($[\"${CALLERID(num)}\" = \"%s\"]?simson-speaker-match)\n", caller)
+	}
+	sb.WriteString(" same  => n,Goto(simson-speaker-done)\n")
+	sb.WriteString(" same  => n(simson-speaker-match),Set(SIMSON_AUTO_ANSWER_MODE=speaker)\n")
+	sb.WriteString(" same  => n(simson-speaker-done),NoOp(Simson speaker match ${SIMSON_AUTO_ANSWER_MODE})\n")
 }
 
 func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
@@ -991,7 +1023,7 @@ func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
 		}
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson dial auto-answer SIP endpoint ${EXTEN})\n", ext)
-		appendConditionalAutoAnswerMode(&sb, ep.AutoAnswerCallers, ep.AutoSpeaker)
+		appendConditionalAutoAnswerMode(&sb, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.AutoSpeakerCallers)
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))\n")
 		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE})))\n")

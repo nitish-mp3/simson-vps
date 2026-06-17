@@ -431,16 +431,17 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Extension         string `json:"extension"`
-		Username          string `json:"username"`
-		Password          string `json:"password"`
-		Description       string `json:"description"`
-		RouteTo           string `json:"route_to"`
-		VideoEnabled      *bool  `json:"video_enabled"`
-		AutoAnswer        *bool  `json:"auto_answer"`
-		AutoAnswerCallers string `json:"auto_answer_callers"`
-		AutoSpeaker       *bool  `json:"auto_speaker"`
-		Enabled           *bool  `json:"enabled"`
+		Extension          string `json:"extension"`
+		Username           string `json:"username"`
+		Password           string `json:"password"`
+		Description        string `json:"description"`
+		RouteTo            string `json:"route_to"`
+		VideoEnabled       *bool  `json:"video_enabled"`
+		AutoAnswer         *bool  `json:"auto_answer"`
+		AutoAnswerCallers  string `json:"auto_answer_callers"`
+		AutoSpeaker        *bool  `json:"auto_speaker"`
+		AutoSpeakerCallers string `json:"auto_speaker_callers"`
+		Enabled            *bool  `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -454,6 +455,11 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	autoAnswerCallers, ok := normalizeAutoAnswerCallersInput(body.AutoAnswerCallers)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "auto_answer_callers must contain only extension/user tokens separated by commas"})
+		return
+	}
+	autoSpeakerCallers, ok := normalizeAutoAnswerCallersInput(body.AutoSpeakerCallers)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "auto_speaker_callers must contain only extension/user tokens separated by commas"})
 		return
 	}
 	if body.Extension == "" || body.Username == "" || body.Password == "" {
@@ -520,18 +526,19 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	idb := make([]byte, 16)
 	rand.Read(idb) //nolint:errcheck
 	ep := store.SIPEndpoint{
-		ID:                hex.EncodeToString(idb),
-		AccountID:         accountID,
-		Extension:         body.Extension,
-		Username:          body.Username,
-		Password:          body.Password,
-		Description:       body.Description,
-		RouteTo:           body.RouteTo,
-		VideoEnabled:      videoEnabled,
-		AutoAnswer:        autoAnswer,
-		AutoAnswerCallers: autoAnswerCallers,
-		AutoSpeaker:       autoSpeaker,
-		Enabled:           enabled,
+		ID:                 hex.EncodeToString(idb),
+		AccountID:          accountID,
+		Extension:          body.Extension,
+		Username:           body.Username,
+		Password:           body.Password,
+		Description:        body.Description,
+		RouteTo:            body.RouteTo,
+		VideoEnabled:       videoEnabled,
+		AutoAnswer:         autoAnswer,
+		AutoAnswerCallers:  autoAnswerCallers,
+		AutoSpeaker:        autoSpeaker,
+		AutoSpeakerCallers: autoSpeakerCallers,
+		Enabled:            enabled,
 	}
 	if err := a.store.CreateSIPEndpoint(ep); err != nil {
 		a.log.Error("create sip endpoint", map[string]any{"err": err.Error()})
@@ -572,24 +579,25 @@ func (a *API) enrichSIPEndpoints(eps []store.SIPEndpoint) []map[string]any {
 			}
 		}
 		out = append(out, map[string]any{
-			"id":                  ep.ID,
-			"account_id":          ep.AccountID,
-			"extension":           ep.Extension,
-			"username":            ep.Username,
-			"description":         ep.Description,
-			"route_to":            ep.RouteTo,
-			"video_enabled":       ep.VideoEnabled,
-			"auto_answer":         ep.AutoAnswer,
-			"auto_answer_callers": ep.AutoAnswerCallers,
-			"auto_speaker":        ep.AutoSpeaker,
-			"enabled":             ep.Enabled,
-			"created_at":          ep.CreatedAt,
-			"updated_at":          ep.UpdatedAt,
-			"registered":          contact.Registered,
-			"contact_status":      contact.Status,
-			"contact_uri":         contact.URI,
-			"contact_address":     contact.Address,
-			"contact_latency_ms":  contact.LatencyMS,
+			"id":                   ep.ID,
+			"account_id":           ep.AccountID,
+			"extension":            ep.Extension,
+			"username":             ep.Username,
+			"description":          ep.Description,
+			"route_to":             ep.RouteTo,
+			"video_enabled":        ep.VideoEnabled,
+			"auto_answer":          ep.AutoAnswer,
+			"auto_answer_callers":  ep.AutoAnswerCallers,
+			"auto_speaker":         ep.AutoSpeaker,
+			"auto_speaker_callers": ep.AutoSpeakerCallers,
+			"enabled":              ep.Enabled,
+			"created_at":           ep.CreatedAt,
+			"updated_at":           ep.UpdatedAt,
+			"registered":           contact.Registered,
+			"contact_status":       contact.Status,
+			"contact_uri":          contact.URI,
+			"contact_address":      contact.Address,
+			"contact_latency_ms":   contact.LatencyMS,
 		})
 	}
 	return out
@@ -623,14 +631,15 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Description       *string `json:"description"`
-		Password          *string `json:"password"`
-		RouteTo           *string `json:"route_to"`
-		VideoEnabled      *bool   `json:"video_enabled"`
-		AutoAnswer        *bool   `json:"auto_answer"`
-		AutoAnswerCallers *string `json:"auto_answer_callers"`
-		AutoSpeaker       *bool   `json:"auto_speaker"`
-		Enabled           *bool   `json:"enabled"`
+		Description        *string `json:"description"`
+		Password           *string `json:"password"`
+		RouteTo            *string `json:"route_to"`
+		VideoEnabled       *bool   `json:"video_enabled"`
+		AutoAnswer         *bool   `json:"auto_answer"`
+		AutoAnswerCallers  *string `json:"auto_answer_callers"`
+		AutoSpeaker        *bool   `json:"auto_speaker"`
+		AutoSpeakerCallers *string `json:"auto_speaker_callers"`
+		Enabled            *bool   `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -665,10 +674,18 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if body.AutoSpeaker != nil {
 		ep.AutoSpeaker = *body.AutoSpeaker
 	}
+	if body.AutoSpeakerCallers != nil {
+		callers, ok := normalizeAutoAnswerCallersInput(*body.AutoSpeakerCallers)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "auto_speaker_callers must contain only extension/user tokens separated by commas"})
+			return
+		}
+		ep.AutoSpeakerCallers = callers
+	}
 	if body.Enabled != nil {
 		ep.Enabled = *body.Enabled
 	}
-	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.VideoEnabled, ep.AutoAnswer, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.Enabled); err != nil {
+	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.VideoEnabled, ep.AutoAnswer, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.AutoSpeakerCallers, ep.Enabled); err != nil {
 		a.log.Error("update sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
@@ -988,16 +1005,17 @@ func (a *API) reconfigureAsterisk() {
 	defs := make([]asterisk.SIPEndpointDef, 0, len(endpoints))
 	for _, ep := range endpoints {
 		defs = append(defs, asterisk.SIPEndpointDef{
-			ID:                ep.ID,
-			Extension:         ep.Extension,
-			Username:          ep.Username,
-			Password:          ep.Password,
-			RouteTo:           ep.RouteTo,
-			VideoEnabled:      ep.VideoEnabled,
-			AutoAnswer:        ep.AutoAnswer,
-			AutoAnswerCallers: ep.AutoAnswerCallers,
-			AutoSpeaker:       ep.AutoSpeaker,
-			Enabled:           ep.Enabled,
+			ID:                 ep.ID,
+			Extension:          ep.Extension,
+			Username:           ep.Username,
+			Password:           ep.Password,
+			RouteTo:            ep.RouteTo,
+			VideoEnabled:       ep.VideoEnabled,
+			AutoAnswer:         ep.AutoAnswer,
+			AutoAnswerCallers:  ep.AutoAnswerCallers,
+			AutoSpeaker:        ep.AutoSpeaker,
+			AutoSpeakerCallers: ep.AutoSpeakerCallers,
+			Enabled:            ep.Enabled,
 		})
 	}
 
