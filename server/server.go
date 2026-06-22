@@ -49,6 +49,15 @@ type Server struct {
 	sipBridgeTransfersMu sync.Mutex
 	sipBridgeTransfers   map[string]time.Time
 
+	// sipIntercomCallbacks makes caller-callback bridge replacement idempotent.
+	// Some SIP phones retry immediately after the original caller leg is
+	// released, which can otherwise create a delayed second callback ring.
+	sipIntercomCallbacksMu       sync.Mutex
+	sipIntercomCallbacks         map[string]time.Time
+	sipIntercomCallbackCallToKey map[string]string
+	sipIntercomIgnoredHangups    map[string]time.Time
+	sipIntercomOriginalRelease   map[string]chan struct{}
+
 	doorEventMu   sync.Mutex
 	doorEventLast map[string]time.Time
 
@@ -68,16 +77,20 @@ type sipOutboundRetry struct {
 // New constructs a Server.
 func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 	s := &Server{
-		cfg:                cfg,
-		store:              st,
-		hub:                hub.New(),
-		calls:              calls.NewManager(),
-		limiter:            ratelimit.New(cfg.RateLimitPerSec, cfg.RateLimitPerSec*2),
-		log:                log,
-		recentSIPInvites:   make(map[string]time.Time),
-		sipOutboundRetries: make(map[string]*sipOutboundRetry),
-		sipBridgeTransfers: make(map[string]time.Time),
-		doorEventLast:      make(map[string]time.Time),
+		cfg:                          cfg,
+		store:                        st,
+		hub:                          hub.New(),
+		calls:                        calls.NewManager(),
+		limiter:                      ratelimit.New(cfg.RateLimitPerSec, cfg.RateLimitPerSec*2),
+		log:                          log,
+		recentSIPInvites:             make(map[string]time.Time),
+		sipOutboundRetries:           make(map[string]*sipOutboundRetry),
+		sipBridgeTransfers:           make(map[string]time.Time),
+		sipIntercomCallbacks:         make(map[string]time.Time),
+		sipIntercomCallbackCallToKey: make(map[string]string),
+		sipIntercomIgnoredHangups:    make(map[string]time.Time),
+		sipIntercomOriginalRelease:   make(map[string]chan struct{}),
+		doorEventLast:                make(map[string]time.Time),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -296,6 +309,187 @@ func (s *Server) HandleNodeDoorEvent(w http.ResponseWriter, r *http.Request) {
 		"status":           "calling_door_station",
 		"source_extension": source,
 		"target_extension": target,
+	})
+}
+
+// HandleNodeSIPIntercom starts the same caller-callback bridge as the SIP
+// feature-code path, but without making the source phone place an outbound SIP
+// call first. This is intended for phone action URLs/DSS keys and HA
+// automations: the handset stays idle, then receives a fresh callback INVITE
+// with auto-answer/speaker hints.
+func (s *Server) HandleNodeSIPIntercom(w http.ResponseWriter, r *http.Request) {
+	node, ok := s.authenticateNodeRequest(w, r, "sip-intercom")
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		writeNodeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	if s.asterisk == nil || !s.asterisk.Connected() {
+		writeNodeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Asterisk integration unavailable"})
+		return
+	}
+
+	var body struct {
+		SourceExtension string `json:"source_extension"`
+		TargetExtension string `json:"target_extension"`
+		SourceAutoMode  string `json:"source_auto_mode"`
+		TargetAutoMode  string `json:"target_auto_mode"`
+		CallerID        string `json:"caller_id"`
+		TimeoutSec      int    `json:"timeout_sec"`
+	}
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+			return
+		}
+	}
+	q := r.URL.Query()
+	if v := strings.TrimSpace(q.Get("source")); v != "" {
+		body.SourceExtension = v
+	}
+	if v := strings.TrimSpace(q.Get("source_extension")); v != "" {
+		body.SourceExtension = v
+	}
+	if v := strings.TrimSpace(q.Get("target")); v != "" {
+		body.TargetExtension = v
+	}
+	if v := strings.TrimSpace(q.Get("target_extension")); v != "" {
+		body.TargetExtension = v
+	}
+	if v := strings.TrimSpace(q.Get("source_auto_mode")); v != "" {
+		body.SourceAutoMode = v
+	}
+	if v := strings.TrimSpace(q.Get("target_auto_mode")); v != "" {
+		body.TargetAutoMode = v
+	}
+	if v := strings.TrimSpace(q.Get("caller_id")); v != "" {
+		body.CallerID = v
+	}
+	if v := strings.TrimSpace(q.Get("timeout_sec")); v != "" {
+		timeout, err := strconv.Atoi(v)
+		if err != nil {
+			writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "timeout_sec must be a number"})
+			return
+		}
+		body.TimeoutSec = timeout
+	}
+
+	source := strings.TrimSpace(body.SourceExtension)
+	target := strings.TrimSpace(body.TargetExtension)
+	if !isSafeDoorSIPExtension(source) || !isSafeDoorSIPExtension(target) || source == target {
+		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "source and target must be different numeric SIP extensions"})
+		return
+	}
+	if isReservedGatewayExtension(source) || isReservedGatewayExtension(target) {
+		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway endpoints cannot use silent SIP intercom callbacks"})
+		return
+	}
+
+	sourceEP, err := s.store.GetSIPEndpointByExtension(source)
+	if err != nil {
+		s.log.Error("silent intercom source lookup failed", map[string]any{"source": source, "err": err.Error()})
+		writeNodeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	targetEP, err := s.store.GetSIPEndpointByExtension(target)
+	if err != nil {
+		s.log.Error("silent intercom target lookup failed", map[string]any{"target": target, "err": err.Error()})
+		writeNodeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	if sourceEP == nil || targetEP == nil || !sourceEP.Enabled || !targetEP.Enabled || sourceEP.AccountID != node.AccountID || targetEP.AccountID != node.AccountID {
+		writeNodeJSON(w, http.StatusNotFound, map[string]any{"error": "source or target SIP endpoint not found for this site"})
+		return
+	}
+	if !targetEP.CallbackBridge || !callerAllowedForCallback(source, targetEP.CallbackBridgeCallers) {
+		writeNodeJSON(w, http.StatusForbidden, map[string]any{"error": "target SIP endpoint does not allow callback bridge from this source"})
+		return
+	}
+	if !s.asterisk.EndpointHasContacts(source) {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "source SIP phone is not registered", "source_extension": source})
+		return
+	}
+	if !s.asterisk.EndpointHasContacts(target) {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "target SIP phone is not registered", "target_extension": target})
+		return
+	}
+	acct, err := s.store.GetAccount(node.AccountID)
+	if err == nil && acct != nil && s.calls.CountActiveByAccount(node.AccountID) >= acct.MaxCalls {
+		writeNodeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "account call limit reached"})
+		return
+	}
+
+	timeoutSec := body.TimeoutSec
+	if timeoutSec == 0 {
+		timeoutSec = s.cfg.CallTimeoutSec
+	}
+	if timeoutSec < 5 {
+		timeoutSec = 5
+	}
+	if timeoutSec > 120 {
+		timeoutSec = 120
+	}
+	sourceMode := sanitizeAutoAnswerMode(body.SourceAutoMode)
+	if sourceMode == "" {
+		sourceMode = "speaker"
+	}
+	targetMode := sanitizeAutoAnswerMode(body.TargetAutoMode)
+	if targetMode == "" {
+		targetMode = autoAnswerModeForEndpointCaller(targetEP, source)
+	}
+
+	callbackKey, callbackStarted := s.beginSIPIntercomCallback(node.AccountID, source, target)
+	if !callbackStarted {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "silent intercom callback is already starting", "source_extension": source, "target_extension": target})
+		return
+	}
+
+	callID := "call_" + uuid.NewString()
+	sourceLabel := firstNonBlank(sourceEP.Description, source)
+	c := &calls.Call{
+		ID:        callID,
+		FromNode:  "sip:" + source,
+		ToNode:    "sip:" + target,
+		AccountID: node.AccountID,
+		CallType:  "sip",
+		CallerID:  firstNonBlank(body.CallerID, sourceLabel, source),
+	}
+	if !s.calls.Create(c) {
+		s.finishSIPIntercomCallback("", callbackKey, false)
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "duplicate call"})
+		return
+	}
+	s.bindSIPIntercomCallback(callID, callbackKey)
+
+	sourceLegCallerID := target
+	targetLegCallerName := firstNonBlank(body.CallerID, sourceLabel, source)
+	if _, err := s.asterisk.OriginateIntercomCallback(source, target, sourceLegCallerID, source, targetLegCallerName, callID, sourceMode, targetMode, timeoutSec); err != nil {
+		if ended, ok := s.calls.End(callID, "originate_failed"); ok {
+			s.notifyCallStatus(ended)
+		}
+		s.asterisk.UntrackCall(callID)
+		s.finishSIPIntercomCallback(callID, callbackKey, true)
+		s.log.Error("silent intercom originate failed",
+			map[string]any{"call_id": callID, "source": source, "target": target, "err": err.Error()})
+		writeNodeJSON(w, http.StatusBadGateway, map[string]any{"error": "could not start silent SIP intercom"})
+		return
+	}
+
+	s.store.WriteAudit(node.AccountID, node.ID, "sip_intercom_silent",
+		fmt.Sprintf("call=%s source=%s target=%s source_mode=%s target_mode=%s", callID, source, target, sourceMode, targetMode), extractIP(r))
+	s.log.Info("silent SIP intercom bridge originated",
+		map[string]any{"call_id": callID, "source": source, "target": target, "source_mode": sourceMode, "target_mode": targetMode})
+	writeNodeJSON(w, http.StatusAccepted, map[string]any{
+		"call_id":          callID,
+		"status":           "calling",
+		"source_extension": source,
+		"target_extension": target,
+		"source_auto_mode": sourceMode,
+		"target_auto_mode": targetMode,
 	})
 }
 
@@ -1536,7 +1730,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		rawDigits := digitsOnly(ext)
 		rawDigits = stripOutboundTrunkPrefix(rawDigits, trunk)
 		ext = normalizePSTNDigits(rawDigits, trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
-		dialCandidates = outboundGatewayDialCandidates(rawDigits, ext)
+		dialCandidates = outboundGatewayDialCandidates(rawDigits, ext, s.isLandlineGatewayTrunk(sess.AccountID, trunk))
 	}
 
 	c := &calls.Call{
@@ -1708,6 +1902,19 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 				map[string]any{"extension": in.Extension, "channel": in.Channel, "caller_id": in.CallerID})
 			if s.asterisk != nil {
 				s.hangupAsteriskChannelAsync(in.Channel, "unknown non-internal extension")
+			}
+			return
+		}
+		if strings.TrimSpace(callerEP.RouteTo) == "" {
+			s.log.Warn("rejecting unknown internal extension from desk phone",
+				map[string]any{
+					"extension":       in.Extension,
+					"caller_ext":      callerEP.Extension,
+					"caller_endpoint": in.CallerEndpoint,
+					"channel":         in.Channel,
+				})
+			if s.asterisk != nil {
+				s.hangupAsteriskChannelAsync(in.Channel, "unknown internal extension")
 			}
 			return
 		}
@@ -1911,10 +2118,11 @@ func (s *Server) handleSIPIntercomCallback(req asterisk.IntercomCallbackRequest)
 		s.hangupAsteriskChannelAsync(req.Channel, "account call limit reached")
 		return
 	}
-	if !s.asterisk.EndpointHasContacts(source) || !s.asterisk.EndpointHasContacts(target) {
-		s.log.Warn("rejecting intercom callback because endpoint is not registered",
-			map[string]any{"source": source, "target": target})
-		s.hangupAsteriskChannelAsync(req.Channel, "callback endpoint not registered")
+	callbackKey, callbackStarted := s.beginSIPIntercomCallback(sourceEP.AccountID, source, target)
+	if !callbackStarted {
+		s.log.Warn("suppressing duplicate intercom callback bridge",
+			map[string]any{"source": source, "target": target, "channel": req.Channel})
+		s.hangupAsteriskChannelAsync(req.Channel, "duplicate callback bridge")
 		return
 	}
 
@@ -1928,21 +2136,56 @@ func (s *Server) handleSIPIntercomCallback(req asterisk.IntercomCallbackRequest)
 		CallerID:  firstNonBlank(req.CallerID, source),
 	}
 	if !s.calls.Create(c) {
+		s.finishSIPIntercomCallback("", callbackKey, false)
 		s.hangupAsteriskChannelAsync(req.Channel, "duplicate intercom callback")
 		return
 	}
+	s.bindSIPIntercomCallback(callID, callbackKey)
+	originalReleased := s.ignoreSIPIntercomOriginalHangup(req.Channel)
 
-	callerID := formatSIPCallerID(firstNonBlank(req.CallerID, source), source)
+	sourceLabel := firstNonBlank(sourceEP.Description, source)
+	// The caller-side callback must look like a plain extension call to the
+	// source handset. Some SIP phones only apply intercom/speaker policy when
+	// the callback caller identity is exactly the target extension; a formatted
+	// display name such as "Kitchen Monitor <1603>" can make them auto-answer
+	// normally but refuse speaker mode.
+	sourceLegCallerID := target
+	targetLegCallerName := firstNonBlank(req.CallerID, sourceLabel, source)
 	sourceMode := sanitizeAutoAnswerMode(req.SourceAutoMode)
 	targetMode := sanitizeAutoAnswerMode(req.TargetAutoMode)
-	s.hangupAsteriskChannelAsync(req.Channel, "replacing caller leg with callback bridge")
 	go func() {
-		time.Sleep(350 * time.Millisecond)
-		if _, err := s.asterisk.OriginateIntercomCallback(source, target, callerID, callID, sourceMode, targetMode, s.cfg.CallTimeoutSec); err != nil {
+		// Wait for the original caller leg to really disappear before calling
+		// the phone back. Speaker/intercom hints are ignored by several desk
+		// phones if the callback INVITE arrives while their outbound dialog is
+		// still closing.
+		if originalReleased != nil {
+			select {
+			case <-originalReleased:
+				if req.ControlCode {
+					time.Sleep(25 * time.Millisecond)
+				} else {
+					time.Sleep(250 * time.Millisecond)
+				}
+			case <-time.After(2500 * time.Millisecond):
+				s.log.Warn("timed out waiting for original caller leg release before callback",
+					map[string]any{"call_id": callID, "source": source, "target": target, "channel": req.Channel})
+			}
+		} else {
+			if req.ControlCode {
+				time.Sleep(75 * time.Millisecond)
+			} else {
+				time.Sleep(900 * time.Millisecond)
+			}
+		}
+		if _, err := s.asterisk.OriginateIntercomCallback(source, target, sourceLegCallerID, source, targetLegCallerName, callID, sourceMode, targetMode, s.cfg.CallTimeoutSec); err != nil {
 			if ended, ok := s.calls.End(callID, "originate_failed"); ok {
 				s.notifyCallStatus(ended)
 			}
 			s.asterisk.UntrackCall(callID)
+			// Keep a short guard after originate failure. Some SIP devices retry
+			// the original INVITE after receiving Hangup(16), which otherwise
+			// creates the delayed duplicate callback loop.
+			s.finishSIPIntercomCallback(callID, callbackKey, true)
 			s.log.Error("intercom callback originate failed",
 				map[string]any{"call_id": callID, "source": source, "target": target, "err": err.Error()})
 			return
@@ -1954,12 +2197,163 @@ func (s *Server) handleSIPIntercomCallback(req asterisk.IntercomCallbackRequest)
 	}()
 }
 
+func (s *Server) ignoreSIPIntercomOriginalHangup(channel string) <-chan struct{} {
+	channel = strings.TrimSpace(channel)
+	if channel == "" {
+		return nil
+	}
+	s.sipIntercomCallbacksMu.Lock()
+	defer s.sipIntercomCallbacksMu.Unlock()
+	now := time.Now()
+	for ch, until := range s.sipIntercomIgnoredHangups {
+		if now.After(until) {
+			if release := s.sipIntercomOriginalRelease[ch]; release != nil {
+				close(release)
+			}
+			delete(s.sipIntercomIgnoredHangups, ch)
+			delete(s.sipIntercomOriginalRelease, ch)
+		}
+	}
+	if release := s.sipIntercomOriginalRelease[channel]; release != nil {
+		close(release)
+	}
+	release := make(chan struct{})
+	s.sipIntercomIgnoredHangups[channel] = now.Add(12 * time.Second)
+	s.sipIntercomOriginalRelease[channel] = release
+	return release
+}
+
+func (s *Server) shouldIgnoreSIPIntercomOriginalHangup(channel string) bool {
+	channel = strings.TrimSpace(channel)
+	if channel == "" {
+		return false
+	}
+	s.sipIntercomCallbacksMu.Lock()
+	defer s.sipIntercomCallbacksMu.Unlock()
+	now := time.Now()
+	for ch, until := range s.sipIntercomIgnoredHangups {
+		if now.After(until) {
+			if release := s.sipIntercomOriginalRelease[ch]; release != nil {
+				close(release)
+			}
+			delete(s.sipIntercomIgnoredHangups, ch)
+			delete(s.sipIntercomOriginalRelease, ch)
+		}
+	}
+	until, ok := s.sipIntercomIgnoredHangups[channel]
+	if !ok || now.After(until) {
+		return false
+	}
+	if release := s.sipIntercomOriginalRelease[channel]; release != nil {
+		close(release)
+	}
+	delete(s.sipIntercomIgnoredHangups, channel)
+	delete(s.sipIntercomOriginalRelease, channel)
+	return true
+}
+
+func (s *Server) beginSIPIntercomCallback(accountID, source, target string) (string, bool) {
+	key := strings.Join([]string{
+		strings.TrimSpace(accountID),
+		strings.TrimSpace(source),
+		strings.TrimSpace(target),
+	}, "|")
+	now := time.Now()
+	s.sipIntercomCallbacksMu.Lock()
+	defer s.sipIntercomCallbacksMu.Unlock()
+	for existing, until := range s.sipIntercomCallbacks {
+		if now.After(until) {
+			delete(s.sipIntercomCallbacks, existing)
+		}
+	}
+	if until, exists := s.sipIntercomCallbacks[key]; exists && now.Before(until) {
+		return key, false
+	}
+	// Keep the key guarded while Asterisk is releasing the original caller leg
+	// and originating the replacement bridge.
+	s.sipIntercomCallbacks[key] = now.Add(45 * time.Second)
+	return key, true
+}
+
+func (s *Server) bindSIPIntercomCallback(callID, key string) {
+	if callID == "" || key == "" {
+		return
+	}
+	s.sipIntercomCallbacksMu.Lock()
+	s.sipIntercomCallbackCallToKey[callID] = key
+	s.sipIntercomCallbacksMu.Unlock()
+}
+
+func (s *Server) finishSIPIntercomCallback(callID, key string, keepCooldown bool) {
+	s.sipIntercomCallbacksMu.Lock()
+	defer s.sipIntercomCallbacksMu.Unlock()
+	if key == "" && callID != "" {
+		key = s.sipIntercomCallbackCallToKey[callID]
+	}
+	if callID != "" {
+		delete(s.sipIntercomCallbackCallToKey, callID)
+	}
+	if key == "" {
+		return
+	}
+	if keepCooldown {
+		s.sipIntercomCallbacks[key] = time.Now().Add(1500 * time.Millisecond)
+		return
+	}
+	delete(s.sipIntercomCallbacks, key)
+}
+
+func (s *Server) isSIPIntercomCallbackCall(callID string) bool {
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return false
+	}
+	s.sipIntercomCallbacksMu.Lock()
+	defer s.sipIntercomCallbacksMu.Unlock()
+	_, ok := s.sipIntercomCallbackCallToKey[callID]
+	return ok
+}
+
 func callerAllowedForCallback(source, allowlist string) bool {
 	source = strings.TrimSpace(source)
 	if source == "" {
 		return false
 	}
 	for _, caller := range splitTokenList(allowlist) {
+		if caller == source {
+			return true
+		}
+	}
+	return false
+}
+
+func autoAnswerModeForEndpointCaller(ep *store.SIPEndpoint, source string) string {
+	if ep == nil || !ep.AutoAnswer || !callerAllowedForAutoAnswer(source, ep.AutoAnswerCallers) {
+		return ""
+	}
+	if !ep.AutoSpeaker {
+		return "normal"
+	}
+	speakerCallers := strings.TrimSpace(ep.AutoSpeakerCallers)
+	if speakerCallers == "" {
+		speakerCallers = ep.AutoAnswerCallers
+	}
+	if callerAllowedForAutoAnswer(source, speakerCallers) {
+		return "speaker"
+	}
+	return "normal"
+}
+
+func callerAllowedForAutoAnswer(source, allowlist string) bool {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return false
+	}
+	allowed := splitTokenList(allowlist)
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, caller := range allowed {
 		if caller == source {
 			return true
 		}
@@ -2053,7 +2447,7 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 	// variants so redial formats can recover from gateway/operator differences.
 	number := stripOutboundTrunkPrefix(rawDigits, trunk)
 	preferred := normalizePSTNDigits(number, trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
-	numbers := outboundGatewayDialCandidates(number, preferred)
+	numbers := outboundGatewayDialCandidates(number, preferred, s.isLandlineGatewayTrunk(callerEP.AccountID, trunk))
 	if len(numbers) == 0 || !isSafeDialNumber(numbers[0]) || !isSafeAsteriskName(trunk) {
 		s.log.Warn("rejecting unsafe SIP-phone outbound gateway dial",
 			map[string]any{"extension": in.Extension, "caller_ext": callerEP.Extension, "trunk": trunk})
@@ -2152,6 +2546,34 @@ func (s *Server) selectOutboundGatewayTrunk(accountID, rawDigits string) string 
 		return fallback
 	}
 	return defaultTrunk
+}
+
+func (s *Server) isLandlineGatewayTrunk(accountID, trunk string) bool {
+	trunk = strings.TrimSpace(trunk)
+	if trunk == "" {
+		return false
+	}
+	ep, err := s.store.GetSIPEndpointByExtension(trunk)
+	if err != nil {
+		s.log.Warn("failed to inspect gateway trunk metadata",
+			map[string]any{"account": accountID, "trunk": trunk, "err": err.Error()})
+		return false
+	}
+	if ep == nil || ep.AccountID != accountID {
+		return false
+	}
+	meta := strings.ToLower(strings.Join([]string{
+		ep.Extension,
+		ep.Username,
+		ep.Description,
+		ep.RouteTo,
+	}, " "))
+	for _, marker := range []string{"fxo", "landline", "pstn", "grandstream", "ht813", "ht841"} {
+		if strings.Contains(meta, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) setSIPOutboundRetry(callID string, retry *sipOutboundRetry) {
@@ -2317,6 +2739,11 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 	if s.asterisk == nil {
 		return
 	}
+	if s.shouldIgnoreSIPIntercomOriginalHangup(channel) {
+		s.log.Debug("ignoring original caller-leg hangup after callback replacement",
+			map[string]any{"channel": channel})
+		return
+	}
 	callID, ok := s.asterisk.CallIDForChannel(channel)
 	if !ok {
 		return
@@ -2365,6 +2792,7 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 	if !ok {
 		return
 	}
+	s.finishSIPIntercomCallback(callID, "", false)
 	s.notifyCallStatus(c)
 	go func() {
 		if err := s.asterisk.HangupCallExcept(callID, channel); err != nil {
@@ -2423,6 +2851,7 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 		c, ended := s.calls.End(callID, endReason)
 		if ended {
 			s.clearSIPOutboundRetry(callID)
+			s.finishSIPIntercomCallback(callID, "", true)
 			s.notifyCallStatus(c)
 			if s.asterisk != nil {
 				go func() {
@@ -2571,14 +3000,16 @@ func sipOutboundDialCandidates(digits string) []string {
 	add(digits)
 	if len(digits) == 12 && strings.HasPrefix(digits, "91") {
 		add(digits[2:])
+		add("0" + digits[2:])
 	}
 	if len(digits) == 10 {
 		add("91" + digits)
+		add("0" + digits)
 	}
 	return candidates
 }
 
-func outboundGatewayDialCandidates(rawDigits, preferred string) []string {
+func outboundGatewayDialCandidates(rawDigits, preferred string, preferLandlinePrefix bool) []string {
 	var candidates []string
 	add := func(v string) {
 		v = digitsOnly(v)
@@ -2593,6 +3024,15 @@ func outboundGatewayDialCandidates(rawDigits, preferred string) []string {
 		candidates = append(candidates, v)
 	}
 
+	if preferLandlinePrefix {
+		digits := digitsOnly(rawDigits)
+		if len(digits) == 12 && strings.HasPrefix(digits, "91") {
+			add("0" + digits[2:])
+		}
+		if len(digits) == 10 {
+			add("0" + digits)
+		}
+	}
 	add(preferred)
 	for _, v := range sipOutboundDialCandidates(rawDigits) {
 		add(v)

@@ -163,10 +163,35 @@ func TestRouteSpecificAutoAnswerHeadersAreConditional(t *testing.T) {
 		t.Fatal("route-specific auto-answer must fall through to a normal dial when caller does not match")
 	}
 	if !strings.Contains(dialplan, "[simson-auto-answer]") ||
-		!strings.Contains(dialplan, "info=intercom") ||
+		!strings.Contains(dialplan, `\;info=intercom`) ||
 		!strings.Contains(dialplan, "P-Auto-Answer)=intercom") ||
+		!strings.Contains(dialplan, "Answer-After)=0") ||
 		!strings.Contains(dialplan, "Alert-Info)=answer-after=0") {
 		t.Fatal("auto-answer pre-dial handler with compatibility speaker hint headers missing")
+	}
+	autoHandler := section(dialplan, "[simson-auto-answer]", "[simson-extension-predial]")
+	jumpIdx := strings.Index(autoHandler, `GotoIf($["${ARG1}" = "speaker"]?speaker)`)
+	normalIdx := strings.Index(autoHandler, "P-Auto-Answer)=normal")
+	speakerIdx := strings.Index(autoHandler, `n(speaker),Set(PJSIP_HEADER(add,Alert-Info)=<http://www.notused.com>\;info=alert-autoanswer)`)
+	if jumpIdx < 0 || speakerIdx < 0 || normalIdx < 0 {
+		t.Fatal("auto-answer handler missing speaker jump, speaker branch, or normal branch")
+	}
+	if strings.Contains(autoHandler, "<http://www.notused.com>;info=") ||
+		strings.Contains(autoHandler, "<sip:simson>;answer-after=") {
+		t.Fatal("headers with semicolon parameters must escape semicolons in extensions.conf")
+	}
+	if jumpIdx > normalIdx {
+		t.Fatal("speaker mode must jump away before normal auto-answer headers are emitted")
+	}
+	speakerBranch := autoHandler[speakerIdx:]
+	if !strings.Contains(speakerBranch, `\;info=alert-autoanswer`) ||
+		!strings.Contains(speakerBranch, "P-Auto-Answer)=normal") {
+		t.Fatal("speaker mode should include normal auto-answer compatibility hints as well as intercom hints")
+	}
+	normalHintIdx := strings.Index(speakerBranch, "P-Auto-Answer)=normal")
+	intercomHintIdx := strings.LastIndex(speakerBranch, "P-Auto-Answer)=intercom")
+	if normalHintIdx < 0 || intercomHintIdx < normalHintIdx {
+		t.Fatal("speaker/intercom hints must be emitted after normal compatibility hints so last-header-wins phones enter speaker mode")
 	}
 	caller := section(dialplan, "exten => 1025,1,NoOp(Simson direct SIP endpoint", "exten => 1603,1,NoOp")
 	if strings.Contains(caller, "Answer-Mode)=Auto") {
@@ -175,6 +200,13 @@ func TestRouteSpecificAutoAnswerHeadersAreConditional(t *testing.T) {
 }
 
 func TestCallbackBridgeDialplanIsAllowlistedAndCarriesBothAutoModes(t *testing.T) {
+	root := t.TempDir()
+	cfg := SetupConfig{
+		SIPDomain:   "simson-vps.vipsy.in",
+		InContext:   "from-simson-sip",
+		NodeContext: "from-simson-node",
+		OutContext:  "from-simson-out",
+	}
 	endpoints := []SIPEndpointDef{
 		{ID: "caller", Extension: "1025", Username: "1025", Password: "secret", Enabled: true},
 		{
@@ -193,6 +225,9 @@ func TestCallbackBridgeDialplanIsAllowlistedAndCarriesBothAutoModes(t *testing.T
 			CallbackCallerAutoSpeaker: true,
 		},
 	}
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, "7009", nil, endpoints); err != nil {
+		t.Fatal(err)
+	}
 
 	dialplan := buildDirectEndpointDialplan(endpoints)
 	target := section(dialplan, "exten => 1603,1,NoOp(Simson direct SIP endpoint", "exten => _+X.")
@@ -203,15 +238,139 @@ func TestCallbackBridgeDialplanIsAllowlistedAndCarriesBothAutoModes(t *testing.T
 		`Target: ${EXTEN}`,
 		`SourceAutoMode: speaker`,
 		`TargetAutoMode: ${SIMSON_AUTO_ANSWER_MODE}`,
-		`Hangup(16)`,
+		`ControlCode: no`,
+		`Answer()`,
+		`Wait(0.2)`,
+		`Hangup()`,
 		`Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},${SIMSON_DIAL_OPTIONS})`,
 	} {
 		if !strings.Contains(target, want) {
 			t.Fatalf("callback bridge dialplan missing %q:\n%s", want, target)
 		}
 	}
+	eventIdx := strings.Index(target, `UserEvent(SimsonIntercomCallback`)
+	answerIdx := strings.Index(target, `Answer()`)
+	waitIdx := strings.Index(target, `Wait(0.2)`)
+	hangupIdx := strings.Index(target, `Hangup()`)
+	if eventIdx < 0 || answerIdx < eventIdx || waitIdx < answerIdx || hangupIdx < waitIdx {
+		t.Fatalf("callback bridge must arm the VPS event, answer as a clean control leg, then short-teardown:\n%s", target)
+	}
 	if strings.Contains(target, "SourceAutoMode: normal") {
 		t.Fatal("speaker mode should take precedence over normal caller auto-answer mode")
+	}
+	feature := section(dialplan, "exten => *1603,1,NoOp(Simson callback feature code", "exten => _+X.")
+	for _, want := range []string{
+		`Target: 1603`,
+		`SourceAutoMode: speaker`,
+		`TargetAutoMode: ${SIMSON_AUTO_ANSWER_MODE}`,
+		`ControlCode: yes`,
+		`Wait(0.03)`,
+		`Hangup()`,
+	} {
+		if !strings.Contains(feature, want) {
+			t.Fatalf("callback feature-code route missing %q:\n%s", want, feature)
+		}
+	}
+	if strings.Contains(feature, `Dial(PJSIP/${EXTEN}`) || strings.Contains(feature, `Dial(PJSIP/1603`) {
+		t.Fatalf("feature-code route must not directly ring the target before VPS callback:\n%s", feature)
+	}
+
+	fullDialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
+	callbackSource := section(fullDialplan, "[from-simson-callback-source]", "[from-simson-callback-target]")
+	for _, want := range []string{
+		`Tb(simson-auto-answer^s^1(${SIMSON_SOURCE_AUTO_MODE}))`,
+		`Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},${SIMSON_DIAL_OPTIONS})`,
+	} {
+		if !strings.Contains(callbackSource, want) {
+			t.Fatalf("callback source dialplan missing %q:\n%s", want, callbackSource)
+		}
+	}
+	callbackTarget := section(fullDialplan, "[from-simson-callback-target]", "[from-simson-out]")
+	for _, want := range []string{
+		`Set(CALLERID(num)=${SIMSON_TARGET_LEG_CALLER_NUM})`,
+		`Set(CALLERID(name)=${SIMSON_TARGET_LEG_CALLER_NAME})`,
+		`Tb(simson-auto-answer^s^1(${SIMSON_TARGET_AUTO_MODE}))`,
+	} {
+		if !strings.Contains(callbackTarget, want) {
+			t.Fatalf("callback target dialplan missing %q:\n%s", want, callbackTarget)
+		}
+	}
+	targetFirst := section(fullDialplan, "[from-simson-callback-target-first]", "[from-simson-callback-source-after-target]")
+	for _, want := range []string{
+		`Set(CALLERID(num)=${SIMSON_TARGET_LEG_CALLER_NUM})`,
+		`Tb(simson-auto-answer^s^1(${SIMSON_TARGET_AUTO_MODE}))`,
+		`Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},${SIMSON_DIAL_OPTIONS})`,
+	} {
+		if !strings.Contains(targetFirst, want) {
+			t.Fatalf("callback target-first dialplan missing %q:\n%s", want, targetFirst)
+		}
+	}
+	sourceAfterTarget := section(fullDialplan, "[from-simson-callback-source-after-target]", "[from-simson-out]")
+	for _, want := range []string{
+		`Set(CALLERID(all)=${SIMSON_SOURCE_LEG_CALLER_ID})`,
+		`Tb(simson-auto-answer^s^1(${SIMSON_SOURCE_AUTO_MODE}))`,
+		`Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},${SIMSON_DIAL_OPTIONS})`,
+	} {
+		if !strings.Contains(sourceAfterTarget, want) {
+			t.Fatalf("callback source-after-target dialplan missing %q:\n%s", want, sourceAfterTarget)
+		}
+	}
+}
+
+func TestBLFHintsAreGeneratedForDirectRegisteredEndpointsOnly(t *testing.T) {
+	root := t.TempDir()
+	cfg := SetupConfig{
+		SIPDomain:   "simson-vps.vipsy.in",
+		InContext:   "from-simson-sip",
+		NodeContext: "from-simson-node",
+		OutContext:  "from-simson-out",
+	}
+	endpoints := []SIPEndpointDef{
+		{ID: "desk", Extension: "1027", Username: "1027", Password: "secret", Enabled: true},
+		{ID: "target", Extension: "1603", Username: "1603", Password: "secret", Enabled: true},
+		{ID: "gateway", Extension: "7009", Username: "7009", Password: "secret", Enabled: true},
+		{ID: "node-route", Extension: "198", Username: "198", Password: "secret", RouteTo: "office2", Enabled: true},
+	}
+	if err := writePJSIPConf(root, cfg, endpoints); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, "7009", nil, endpoints); err != nil {
+		t.Fatal(err)
+	}
+
+	pjsip := readTestFile(t, filepath.Join(root, "pjsip.d", "simson.conf"))
+	template := section(pjsip, "[simson-ep-tpl](!)", "[simson-auth-tpl](!)")
+	for _, want := range []string{
+		"allow_subscribe=yes",
+		"subscribe_context=simson-blf",
+		"notify_early_inuse_ringing=yes",
+	} {
+		if !strings.Contains(template, want) {
+			t.Fatalf("SIP endpoint template missing BLF setting %q:\n%s", want, template)
+		}
+	}
+
+	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
+	blfStart := strings.Index(dialplan, "[simson-blf]")
+	if blfStart < 0 {
+		t.Fatalf("BLF context missing:\n%s", dialplan)
+	}
+	blf := dialplan[blfStart:]
+	for _, want := range []string{
+		"exten => 1027,hint,PJSIP/1027",
+		"exten => 1603,hint,PJSIP/1603",
+	} {
+		if !strings.Contains(blf, want) {
+			t.Fatalf("BLF hints missing %q:\n%s", want, blf)
+		}
+	}
+	for _, notWant := range []string{
+		"exten => 7009,hint",
+		"exten => 198,hint",
+	} {
+		if strings.Contains(blf, notWant) {
+			t.Fatalf("BLF hints should not include gateway or HAOS-routed endpoint %q:\n%s", notWant, blf)
+		}
 	}
 }
 

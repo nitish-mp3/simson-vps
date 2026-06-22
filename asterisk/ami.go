@@ -284,6 +284,17 @@ func (a *AMIClient) HangupChannel(channel string) error {
 	return nil
 }
 
+// HangupChannelNoWait writes a Hangup action without waiting for the AMI
+// response. It is useful for replacement flows where the next action should not
+// be delayed by noisy AMI response handling.
+func (a *AMIClient) HangupChannelNoWait(channel string) error {
+	return a.sendActionNoWait(map[string]string{
+		"Action":  "Hangup",
+		"Channel": channel,
+		"Cause":   "16", // normal clearing
+	})
+}
+
 // BridgeChannels bridges two Asterisk channels together.
 func (a *AMIClient) BridgeChannels(ch1, ch2 string) error {
 	_, resp, err := a.sendAction(map[string]string{
@@ -368,6 +379,40 @@ func (a *AMIClient) sendAction(fields map[string]string) (string, map[string]str
 	case <-time.After(10 * time.Second):
 		return actionID, nil, fmt.Errorf("ami action timeout (action=%s)", fields["Action"])
 	}
+}
+
+// sendActionNoWait writes an AMI action and returns after the bytes are sent.
+// The later AMI response is intentionally ignored by ReadLoop.
+func (a *AMIClient) sendActionNoWait(fields map[string]string) error {
+	if fields["ActionID"] == "" {
+		fields["ActionID"] = uuid.NewString()
+	}
+
+	a.writeMu.Lock()
+	conn := a.conn
+	if conn == nil {
+		a.writeMu.Unlock()
+		return fmt.Errorf("ami not connected")
+	}
+
+	var sb strings.Builder
+	for k, v := range fields {
+		sb.WriteString(k)
+		sb.WriteString(": ")
+		sb.WriteString(v)
+		sb.WriteString("\r\n")
+	}
+	sb.WriteString("\r\n")
+
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, writeErr := fmt.Fprint(conn, sb.String())
+	conn.SetWriteDeadline(time.Time{})
+	a.writeMu.Unlock()
+
+	if writeErr != nil {
+		return fmt.Errorf("ami write: %w", writeErr)
+	}
+	return nil
 }
 
 // readBlock reads one blank-line-terminated key:value block from the stream.

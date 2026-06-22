@@ -30,6 +30,7 @@ type IntercomCallbackRequest struct {
 	UniqueID        string
 	SourceAutoMode  string
 	TargetAutoMode  string
+	ControlCode     bool
 }
 
 // ContactStatus describes the live PJSIP registration/contact state for an AoR.
@@ -313,7 +314,12 @@ func (r *Router) OriginateDoorStationToBridge(sourceExtension, bridgeExt, caller
 // OriginateIntercomCallback calls the original source phone back first and, once
 // answered, dials the target extension. This enables caller-side intercom
 // headers because the source phone becomes a called leg.
-func (r *Router) OriginateIntercomCallback(sourceExtension, targetExtension, callerID, callID, sourceAutoMode, targetAutoMode string, timeoutSec int) (string, error) {
+func (r *Router) OriginateIntercomCallback(sourceExtension, targetExtension, sourceLegCallerID, targetLegCallerNum, targetLegCallerName, callID, sourceAutoMode, targetAutoMode string, timeoutSec int) (string, error) {
+	// Speaker mode on the original caller is only reliable when that phone is the
+	// first fresh called leg. Target-first callback can preserve target timing,
+	// but several SIP handsets ignore intercom/speaker hints on the later source
+	// leg. The server waits for the original outbound dialog to release before
+	// calling this, so source-first remains fast without reintroducing retry loops.
 	channel := fmt.Sprintf("Local/%s@from-simson-callback-source/n", sourceExtension)
 	actionID := uuid.NewString()
 	r.TrackPendingPrefix(callID, fmt.Sprintf("Local/%s@from-simson-callback-source-", sourceExtension))
@@ -325,19 +331,70 @@ func (r *Router) OriginateIntercomCallback(sourceExtension, targetExtension, cal
 	r.originateMu.Unlock()
 
 	vars := map[string]string{
-		"SIMSON_CALL_ID":            callID,
-		"__SIMSON_CALL_ID":          callID,
-		"SIMSON_WAIT_TIMEOUT":       fmt.Sprintf("%d", timeoutSec),
-		"SIMSON_SOURCE_AUTO_MODE":   sourceAutoMode,
-		"__SIMSON_SOURCE_AUTO_MODE": sourceAutoMode,
-		"SIMSON_TARGET_AUTO_MODE":   targetAutoMode,
-		"__SIMSON_TARGET_AUTO_MODE": targetAutoMode,
+		"SIMSON_CALL_ID":                callID,
+		"__SIMSON_CALL_ID":              callID,
+		"SIMSON_WAIT_TIMEOUT":           fmt.Sprintf("%d", timeoutSec),
+		"SIMSON_SOURCE_AUTO_MODE":       sourceAutoMode,
+		"__SIMSON_SOURCE_AUTO_MODE":     sourceAutoMode,
+		"SIMSON_TARGET_AUTO_MODE":       targetAutoMode,
+		"__SIMSON_TARGET_AUTO_MODE":     targetAutoMode,
+		"SIMSON_TARGET_LEG_CALLER_NUM":  targetLegCallerNum,
+		"SIMSON_TARGET_LEG_CALLER_NAME": targetLegCallerName,
 	}
-	_, err := r.ami.OriginateWithVarsAndCodecs(
+	_, err := r.ami.OriginateWithVars(
 		channel,
 		"from-simson-callback-target",
 		targetExtension,
-		callerID,
+		sourceLegCallerID,
+		timeoutSec*1000,
+		actionID,
+		vars,
+	)
+	if err != nil {
+		r.originateMu.Lock()
+		delete(r.actionIDToCallID, actionID)
+		r.originateMu.Unlock()
+		return "", err
+	}
+
+	return actionID, nil
+}
+
+func (r *Router) originateIntercomCallbackTargetFirst(sourceExtension, targetExtension, sourceLegCallerID, targetLegCallerNum, targetLegCallerName, callID, sourceAutoMode, targetAutoMode string, timeoutSec int) (string, error) {
+	channel := fmt.Sprintf("Local/%s@from-simson-callback-target-first/n", targetExtension)
+	actionID := uuid.NewString()
+	r.TrackPendingPrefix(callID, fmt.Sprintf("Local/%s@from-simson-callback-target-first-", targetExtension))
+	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", sourceExtension))
+	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", targetExtension))
+
+	r.originateMu.Lock()
+	r.actionIDToCallID[actionID] = callID
+	r.originateMu.Unlock()
+
+	targetLegCallerID := targetLegCallerName
+	if targetLegCallerID == "" {
+		targetLegCallerID = targetLegCallerNum
+	} else if targetLegCallerNum != "" && !strings.Contains(targetLegCallerID, "<") {
+		targetLegCallerID = fmt.Sprintf("%s <%s>", targetLegCallerID, targetLegCallerNum)
+	}
+
+	vars := map[string]string{
+		"SIMSON_CALL_ID":                callID,
+		"__SIMSON_CALL_ID":              callID,
+		"SIMSON_WAIT_TIMEOUT":           fmt.Sprintf("%d", timeoutSec),
+		"SIMSON_SOURCE_AUTO_MODE":       sourceAutoMode,
+		"__SIMSON_SOURCE_AUTO_MODE":     sourceAutoMode,
+		"SIMSON_TARGET_AUTO_MODE":       targetAutoMode,
+		"__SIMSON_TARGET_AUTO_MODE":     targetAutoMode,
+		"SIMSON_TARGET_LEG_CALLER_NUM":  targetLegCallerNum,
+		"SIMSON_TARGET_LEG_CALLER_NAME": targetLegCallerName,
+		"SIMSON_SOURCE_LEG_CALLER_ID":   sourceLegCallerID,
+	}
+	_, err := r.ami.OriginateWithVarsAndCodecs(
+		channel,
+		"from-simson-callback-source-after-target",
+		sourceExtension,
+		targetLegCallerID,
 		timeoutSec*1000,
 		actionID,
 		vars,
@@ -566,6 +623,12 @@ func (r *Router) HangupChannel(channel string) error {
 	return r.ami.HangupChannel(channel)
 }
 
+// HangupChannelNoWait sends Hangup without waiting for AMI acknowledgement.
+// Use only where the caller immediately follows with another AMI action.
+func (r *Router) HangupChannelNoWait(channel string) error {
+	return r.ami.HangupChannelNoWait(channel)
+}
+
 // BridgeCall bridges the SIP channel of callID with a second Asterisk channel
 // (typically the local channel of the node-callback leg).
 func (r *Router) BridgeCall(callID, nodeChannel string) error {
@@ -709,16 +772,17 @@ func (r *Router) handleSimsonIntercomCallback(ev Event) {
 		UniqueID:        ev.Fields["UniqueID"],
 		SourceAutoMode:  strings.TrimSpace(ev.Fields["SourceAutoMode"]),
 		TargetAutoMode:  strings.TrimSpace(ev.Fields["TargetAutoMode"]),
+		ControlCode:     strings.EqualFold(strings.TrimSpace(ev.Fields["ControlCode"]), "yes"),
 	}
 	if req.Channel == "" || req.SourceExtension == "" || req.TargetExtension == "" {
 		r.log.Warn("SimsonIntercomCallback event missing required fields", map[string]any{"fields": ev.Fields})
 		return
 	}
 	r.log.Info("SIP intercom callback requested", map[string]any{
-		"source": req.SourceExtension, "target": req.TargetExtension, "source_mode": req.SourceAutoMode, "target_mode": req.TargetAutoMode,
+		"source": req.SourceExtension, "target": req.TargetExtension, "source_mode": req.SourceAutoMode, "target_mode": req.TargetAutoMode, "control_code": req.ControlCode,
 	})
 	if r.OnIntercomCallback != nil {
-		r.OnIntercomCallback(req)
+		go r.OnIntercomCallback(req)
 	}
 }
 
@@ -830,6 +894,25 @@ func normalizeChannel(channel string) string {
 func (r *Router) findCallByChannelLocked(channel string) (callID string, trackedChannel string, ok bool) {
 	if id, found := r.chanToCallID[channel]; found {
 		return id, channel, true
+	}
+
+	var prefixMatchedID string
+	var prefixMatchedPrefix string
+	for id, prefixes := range r.callIDToChannelPrefix {
+		for _, prefix := range prefixes {
+			if prefix == "" || !strings.HasPrefix(channel, prefix) {
+				continue
+			}
+			if prefixMatchedID != "" && prefixMatchedID != id {
+				// Ambiguous prefix match; refuse to guess.
+				return "", "", false
+			}
+			prefixMatchedID = id
+			prefixMatchedPrefix = prefix
+		}
+	}
+	if prefixMatchedID != "" {
+		return prefixMatchedID, prefixMatchedPrefix, true
 	}
 
 	// PJSIP channel names are unique call legs. Falling back to a base key like

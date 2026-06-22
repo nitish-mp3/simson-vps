@@ -74,13 +74,21 @@ func main() {
 			defs := make([]asterisk.SIPEndpointDef, len(eps))
 			for i, ep := range eps {
 				defs[i] = asterisk.SIPEndpointDef{
-					ID:           ep.ID,
-					Extension:    ep.Extension,
-					Username:     ep.Username,
-					Password:     ep.Password,
-					RouteTo:      ep.RouteTo,
-					VideoEnabled: ep.VideoEnabled,
-					Enabled:      ep.Enabled,
+					ID:                        ep.ID,
+					Extension:                 ep.Extension,
+					Username:                  ep.Username,
+					Password:                  ep.Password,
+					RouteTo:                   ep.RouteTo,
+					VideoEnabled:              ep.VideoEnabled,
+					AutoAnswer:                ep.AutoAnswer,
+					AutoAnswerCallers:         ep.AutoAnswerCallers,
+					AutoSpeaker:               ep.AutoSpeaker,
+					AutoSpeakerCallers:        ep.AutoSpeakerCallers,
+					CallbackBridge:            ep.CallbackBridge,
+					CallbackBridgeCallers:     ep.CallbackBridgeCallers,
+					CallbackCallerAutoAnswer:  ep.CallbackCallerAutoAnswer,
+					CallbackCallerAutoSpeaker: ep.CallbackCallerAutoSpeaker,
+					Enabled:                   ep.Enabled,
 				}
 			}
 			scfg := asterisk.SetupConfig{
@@ -91,6 +99,7 @@ func main() {
 				InContext:               cfg.Asterisk.InContext,
 				NodeContext:             cfg.Asterisk.NodeContext,
 				OutContext:              cfg.Asterisk.OutContext,
+				DefaultPSTNTrunk:        cfg.Asterisk.DefaultPSTNTrunk,
 				TrustedGatewayIPs:       cfg.Asterisk.TrustedGatewayIPs,
 				NoAuthInboundExtensions: cfg.Asterisk.NoAuthInboundExtensions,
 				WebRTCUser:              cfg.Asterisk.SIPWebRTC.Username,
@@ -120,6 +129,7 @@ func main() {
 	mux.HandleFunc("/node/webrtc-config", srv.HandleNodeWebRTCConfig)
 	mux.HandleFunc("/node/door-events", srv.HandleNodeDoorEvent)
 	mux.HandleFunc("/node/door-node-events", srv.HandleNodeDoorNodeEvent)
+	mux.HandleFunc("/node/sip-intercom", srv.HandleNodeSIPIntercom)
 
 	// Admin endpoints.
 	adminRouter := adminAPI.Router()
