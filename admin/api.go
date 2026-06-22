@@ -445,6 +445,7 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		CallbackBridgeCallers     string `json:"callback_bridge_callers"`
 		CallbackCallerAutoAnswer  *bool  `json:"callback_caller_auto_answer"`
 		CallbackCallerAutoSpeaker *bool  `json:"callback_caller_auto_speaker"`
+		DefaultOutbound           *bool  `json:"default_outbound"`
 		Enabled                   *bool  `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -543,6 +544,10 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if body.CallbackCallerAutoSpeaker != nil {
 		callbackCallerAutoSpeaker = *body.CallbackCallerAutoSpeaker
 	}
+	defaultOutbound := false
+	if body.DefaultOutbound != nil {
+		defaultOutbound = *body.DefaultOutbound
+	}
 	// Generate a random ID
 	idb := make([]byte, 16)
 	rand.Read(idb) //nolint:errcheck
@@ -563,12 +568,16 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		CallbackBridgeCallers:     callbackBridgeCallers,
 		CallbackCallerAutoAnswer:  callbackCallerAutoAnswer,
 		CallbackCallerAutoSpeaker: callbackCallerAutoSpeaker,
+		DefaultOutbound:           defaultOutbound,
 		Enabled:                   enabled,
 	}
 	if err := a.store.CreateSIPEndpoint(ep); err != nil {
 		a.log.Error("create sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
+	}
+	if ep.DefaultOutbound {
+		a.clearOtherDefaultOutboundGateways(ep.AccountID, ep.ID)
 	}
 	a.reconfigureAsterisk()
 	writeJSON(w, http.StatusCreated, ep)
@@ -619,6 +628,7 @@ func (a *API) enrichSIPEndpoints(eps []store.SIPEndpoint) []map[string]any {
 			"callback_bridge_callers":      ep.CallbackBridgeCallers,
 			"callback_caller_auto_answer":  ep.CallbackCallerAutoAnswer,
 			"callback_caller_auto_speaker": ep.CallbackCallerAutoSpeaker,
+			"default_outbound":             ep.DefaultOutbound,
 			"enabled":                      ep.Enabled,
 			"created_at":                   ep.CreatedAt,
 			"updated_at":                   ep.UpdatedAt,
@@ -672,6 +682,7 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		CallbackBridgeCallers     *string `json:"callback_bridge_callers"`
 		CallbackCallerAutoAnswer  *bool   `json:"callback_caller_auto_answer"`
 		CallbackCallerAutoSpeaker *bool   `json:"callback_caller_auto_speaker"`
+		DefaultOutbound           *bool   `json:"default_outbound"`
 		Enabled                   *bool   `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -732,16 +743,54 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if body.CallbackCallerAutoSpeaker != nil {
 		ep.CallbackCallerAutoSpeaker = *body.CallbackCallerAutoSpeaker
 	}
+	if body.DefaultOutbound != nil {
+		ep.DefaultOutbound = *body.DefaultOutbound
+	}
 	if body.Enabled != nil {
 		ep.Enabled = *body.Enabled
 	}
-	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.VideoEnabled, ep.AutoAnswer, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.AutoSpeakerCallers, ep.CallbackBridge, ep.CallbackBridgeCallers, ep.CallbackCallerAutoAnswer, ep.CallbackCallerAutoSpeaker, ep.Enabled); err != nil {
+	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.VideoEnabled, ep.AutoAnswer, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.AutoSpeakerCallers, ep.CallbackBridge, ep.CallbackBridgeCallers, ep.CallbackCallerAutoAnswer, ep.CallbackCallerAutoSpeaker, ep.DefaultOutbound, ep.Enabled); err != nil {
 		a.log.Error("update sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
 	}
+	if ep.DefaultOutbound {
+		a.clearOtherDefaultOutboundGateways(ep.AccountID, ep.ID)
+	}
 	a.reconfigureAsterisk()
 	writeJSON(w, http.StatusOK, ep)
+}
+
+func (a *API) clearOtherDefaultOutboundGateways(accountID, keepID string) {
+	eps, err := a.store.ListSIPEndpoints(accountID)
+	if err != nil {
+		a.log.Warn("could not enforce single default outbound gateway", map[string]any{"account_id": accountID, "err": err.Error()})
+		return
+	}
+	for _, other := range eps {
+		if other.ID == keepID || !other.DefaultOutbound {
+			continue
+		}
+		if err := a.store.UpdateSIPEndpoint(
+			other.ID,
+			other.Description,
+			other.Password,
+			other.RouteTo,
+			other.VideoEnabled,
+			other.AutoAnswer,
+			other.AutoAnswerCallers,
+			other.AutoSpeaker,
+			other.AutoSpeakerCallers,
+			other.CallbackBridge,
+			other.CallbackBridgeCallers,
+			other.CallbackCallerAutoAnswer,
+			other.CallbackCallerAutoSpeaker,
+			false,
+			other.Enabled,
+		); err != nil {
+			a.log.Warn("could not clear previous default outbound gateway", map[string]any{"endpoint": other.Extension, "err": err.Error()})
+		}
+	}
 }
 
 func (a *API) handleDeleteSIPEndpoint(w http.ResponseWriter, r *http.Request) {

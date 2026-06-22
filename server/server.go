@@ -1632,6 +1632,15 @@ func (s *Server) notifyCallStatus(c *calls.Call) {
 			nodeSess.Send(data)
 		}
 	}
+	if c.CallType == "sip" && c.AccountID != "" {
+		for _, accountSess := range s.hub.ListByAccount(c.AccountID) {
+			if accountSess == nil || accountSess.NodeID == "" ||
+				accountSess.NodeID == c.FromNode || accountSess.NodeID == c.ToNode {
+				continue
+			}
+			accountSess.Send(data)
+		}
+	}
 }
 
 func (s *Server) notifyCallStatusToNode(nodeID string, c *calls.Call, status, reason, answeredBy string) {
@@ -1721,10 +1730,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 	dialCandidates := []string(nil)
 
 	if ep == nil && trunk == "" && isExternalDialString(ext) {
-		trunk = strings.TrimSpace(s.cfg.Asterisk.DefaultPSTNTrunk)
-		if trunk == "" {
-			trunk = "7009"
-		}
+		trunk = s.selectOutboundGatewayTrunk(sess.AccountID, digitsOnly(ext))
 	}
 	if ep == nil && trunk != "" {
 		rawDigits := digitsOnly(ext)
@@ -2519,6 +2525,7 @@ func (s *Server) selectOutboundGatewayTrunk(accountID, rawDigits string) string 
 	var fallback string
 	fallbackRank := -1
 	var defaultAvailable string
+	var accountDefault string
 	for _, ep := range endpoints {
 		ext := strings.TrimSpace(ep.Extension)
 		if !ep.Enabled || !isGatewayLikeTrunk(ext, defaultTrunk) {
@@ -2533,11 +2540,17 @@ func (s *Server) selectOutboundGatewayTrunk(accountID, rawDigits string) string 
 		if ext == defaultTrunk {
 			defaultAvailable = ext
 		}
+		if ep.DefaultOutbound {
+			accountDefault = ext
+		}
 		rank, _ := strconv.Atoi(digitsOnly(ext))
 		if fallback == "" || rank > fallbackRank {
 			fallback = ext
 			fallbackRank = rank
 		}
+	}
+	if accountDefault != "" {
+		return accountDefault
 	}
 	if defaultAvailable != "" {
 		return defaultAvailable
