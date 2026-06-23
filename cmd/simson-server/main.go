@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -91,6 +92,7 @@ func main() {
 					Enabled:                   ep.Enabled,
 				}
 			}
+			noAuthInbound := gatewayNoAuthInboundExtensions(cfg.Asterisk.NoAuthInboundExtensions, eps)
 			scfg := asterisk.SetupConfig{
 				AmiUser:                 cfg.Asterisk.User,
 				AmiSecret:               cfg.Asterisk.Secret,
@@ -101,7 +103,7 @@ func main() {
 				OutContext:              cfg.Asterisk.OutContext,
 				DefaultPSTNTrunk:        cfg.Asterisk.DefaultPSTNTrunk,
 				TrustedGatewayIPs:       cfg.Asterisk.TrustedGatewayIPs,
-				NoAuthInboundExtensions: cfg.Asterisk.NoAuthInboundExtensions,
+				NoAuthInboundExtensions: noAuthInbound,
 				WebRTCUser:              cfg.Asterisk.SIPWebRTC.Username,
 				WebRTCPass:              cfg.Asterisk.SIPWebRTC.Password,
 			}
@@ -194,4 +196,42 @@ func main() {
 	httpSrv.Shutdown(ctx)
 
 	log.Info("stopped", nil)
+}
+
+func gatewayNoAuthInboundExtensions(configured []string, endpoints []store.SIPEndpoint) []string {
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(configured)+len(endpoints))
+	add := func(value string) {
+		ext := strings.TrimSpace(value)
+		if ext == "" || seen[ext] {
+			return
+		}
+		seen[ext] = true
+		out = append(out, ext)
+	}
+	for _, ext := range configured {
+		add(ext)
+	}
+	for _, ep := range endpoints {
+		if ep.Enabled && isGatewayNoAuthCandidate(ep.Extension) {
+			add(ep.Extension)
+		}
+	}
+	return out
+}
+
+func isGatewayNoAuthCandidate(extension string) bool {
+	ext := strings.TrimSpace(extension)
+	if len(ext) < 3 || len(ext) > 8 {
+		return false
+	}
+	if !strings.HasPrefix(ext, "70") {
+		return false
+	}
+	for _, ch := range ext {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
 }
