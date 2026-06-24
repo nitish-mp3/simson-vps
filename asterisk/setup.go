@@ -747,12 +747,23 @@ exten => _X.,1,NoOp(Simson callback bridge source after target ${EXTEN})
 exten => _X.,1,NoOp(Simson outbound trunk call ${EXTEN} via ${SIMSON_TRUNK})
  same  => n,GotoIf($["${SIMSON_TRUNK}" = ""]?missing-trunk,1)
  same  => n,Set(JITTERBUFFER(adaptive)=default)
- same  => n,Dial(PJSIP/${EXTEN}@${SIMSON_TRUNK},${SIMSON_WAIT_TIMEOUT:=120},rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))
+ same  => n,Set(SIMSON_DIAL_TARGET=${EXTEN}${SIMSON_DIAL_SUFFIX})
+ same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))
+ same  => n,GotoIf($["${SIMSON_POST_ANSWER_DTMF}" = ""]?dial)
+ same  => n,Set(SIMSON_DIAL_OPTIONS=${SIMSON_DIAL_OPTIONS}U(simson-outbound-postanswer^s^1(${SIMSON_POST_ANSWER_DTMF})))
+ same  => n(dial),Dial(PJSIP/${SIMSON_DIAL_TARGET}@${SIMSON_TRUNK},${SIMSON_WAIT_TIMEOUT:=120},${SIMSON_DIAL_OPTIONS})
  same  => n,Hangup()
 
 exten => missing-trunk,1,NoOp(Simson outbound trunk call missing SIMSON_TRUNK)
  same  => n,Congestion(5)
  same  => n,Hangup(21)
+
+[simson-outbound-postanswer]
+exten => s,1,NoOp(Simson outbound gateway post-answer DTMF ${ARG1})
+ same  => n,GotoIf($["${ARG1}" = ""]?done)
+ same  => n,Wait(0.2)
+ same  => n,SendDTMF(${ARG1})
+ same  => n(done),Return()
 
 [simson-auto-answer]
 exten => s,1,NoOp(Add Simson SIP auto-answer headers mode=${ARG1})

@@ -65,13 +65,15 @@ type Server struct {
 }
 
 type sipOutboundRetry struct {
-	Numbers   []string
-	Index     int
-	Trunk     string
-	BridgeID  string
-	CallerID  string
-	FromNode  string
-	CallerExt string
+	Numbers        []string
+	Index          int
+	Trunk          string
+	BridgeID       string
+	CallerID       string
+	DialTerminator string
+	PostAnswerDTMF string
+	FromNode       string
+	CallerExt      string
 }
 
 // New constructs a Server.
@@ -1736,7 +1738,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		rawDigits := digitsOnly(ext)
 		rawDigits = stripOutboundTrunkPrefix(rawDigits, trunk)
 		ext = normalizePSTNDigits(rawDigits, trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
-		dialCandidates = outboundGatewayDialCandidates(rawDigits, ext, s.isLandlineGatewayTrunk(sess.AccountID, trunk))
+		dialCandidates = outboundGatewayDialCandidates(rawDigits, ext, s.prefersLeadingZeroGatewayDial(sess.AccountID, trunk))
 	}
 
 	c := &calls.Call{
@@ -1801,11 +1803,12 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 			dialCandidates = []string{ext}
 		}
 		s.setSIPOutboundRetry(callID, &sipOutboundRetry{
-			Numbers:  dialCandidates,
-			Trunk:    trunk,
-			BridgeID: bridgeID,
-			CallerID: callerID,
-			FromNode: sess.NodeID,
+			Numbers:        dialCandidates,
+			Trunk:          trunk,
+			BridgeID:       bridgeID,
+			CallerID:       callerID,
+			PostAnswerDTMF: s.gatewayPostAnswerDTMF(sess.AccountID, trunk),
+			FromNode:       sess.NodeID,
 		})
 		if !s.trySIPPhoneOutboundGateway(callID) {
 			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "AMI originate failed")
@@ -1962,6 +1965,13 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	}
 
 	if routeTo != "" {
+		if sipRouteExt, ok := normalizeSIPRouteTarget(routeTo); ok {
+			go s.routeIncomingSIPDirectToExtension(accountID, sipRouteExt, sourceExt, in)
+			return
+		}
+	}
+
+	if routeTo != "" {
 		routeToSess := s.hub.Get(routeTo)
 		if routeToSess != nil && routeToSess.AccountID != accountID {
 			s.log.Warn("route_to node belongs to a different account; ignoring unsafe SIP route",
@@ -1988,9 +1998,6 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 			if reason == "busy" {
 				appendUnique(routeTo)
 			}
-		}
-		for _, nodeID := range busy {
-			appendUnique(nodeID)
 		}
 	} else {
 		for _, nodeID := range available {
@@ -2072,6 +2079,96 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	s.log.Info("SIP invite dispatched", map[string]any{
 		"call_id": callID, "extension": in.Extension, "targets": sentCount,
 	})
+}
+
+func normalizeSIPRouteTarget(routeTo string) (string, bool) {
+	text := strings.TrimSpace(routeTo)
+	text = strings.TrimPrefix(strings.ToLower(text), "sip:")
+	text = strings.TrimSpace(text)
+	if text == "" || isExternalDialString(text) || !isLikelyInternalExtension(text) {
+		return "", false
+	}
+	return text, true
+}
+
+func (s *Server) routeIncomingSIPDirectToExtension(accountID, ext, sourceExt string, in asterisk.IncomingSIPCall) bool {
+	if s.asterisk == nil || !s.asterisk.Connected() {
+		s.log.Warn("direct SIP route skipped because Asterisk AMI is not connected",
+			map[string]any{"extension": in.Extension, "target_ext": ext})
+		return false
+	}
+	if ext == sourceExt {
+		s.log.Warn("direct SIP route rejected because target equals source",
+			map[string]any{"source_ext": sourceExt, "target_ext": ext, "channel": in.Channel})
+		return false
+	}
+
+	ep, err := s.store.GetSIPEndpointByExtension(ext)
+	if err != nil {
+		s.log.Error("db error looking up direct route SIP endpoint",
+			map[string]any{"err": err.Error(), "ext": ext})
+		return false
+	}
+	if ep == nil || ep.AccountID != accountID || !ep.Enabled {
+		s.log.Warn("direct SIP route target unavailable in account",
+			map[string]any{"account": accountID, "target_ext": ext, "extension": in.Extension})
+		return false
+	}
+	if !s.asterisk.EndpointHasContacts(ext) {
+		s.log.Warn("direct SIP route target is not registered",
+			map[string]any{"account": accountID, "target_ext": ext, "extension": in.Extension})
+		return false
+	}
+	if !s.reserveSIPBridgeTransfer(in.BridgeID, ext) {
+		s.log.Warn("suppressing duplicate direct SIP route",
+			map[string]any{"bridge": in.BridgeID, "target_ext": ext, "extension": in.Extension})
+		return true
+	}
+
+	callID := "call_" + uuid.NewString()
+	c := &calls.Call{
+		ID:          callID,
+		FromNode:    "sip:" + sourceExt,
+		ToNode:      "sip:" + ext,
+		InviteNodes: nil,
+		AccountID:   accountID,
+		CallType:    "sip",
+		SIPBridgeID: in.BridgeID,
+		CallerID:    in.CallerID,
+	}
+	if !s.calls.Create(c) {
+		s.releaseSIPBridgeTransfer(in.BridgeID, ext)
+		return true
+	}
+
+	s.asterisk.TrackCall(callID, in.Channel)
+	callerID := formatSIPCallerID(in.CallerID, in.CallerID)
+	if strings.TrimSpace(in.CallerID) == "" {
+		callerID = formatSIPCallerID("Gateway call", sourceExt)
+	}
+	_, err = s.asterisk.OriginateToExtension(
+		ext,
+		s.cfg.Asterisk.NodeContext,
+		in.BridgeID,
+		callerID,
+		callID,
+		"gateway:"+sourceExt,
+		s.cfg.CallTimeoutSec,
+	)
+	if err != nil {
+		s.calls.End(callID, "originate_failed")
+		s.asterisk.UntrackCall(callID)
+		s.releaseSIPBridgeTransfer(in.BridgeID, ext)
+		s.log.Error("direct SIP route originate failed",
+			map[string]any{"call_id": callID, "target_ext": ext, "err": err.Error()})
+		return false
+	}
+
+	s.store.WriteAudit(accountID, "sip:"+sourceExt, "sip_incoming_direct_sip_route",
+		fmt.Sprintf("call=%s source=%s target=%s bridge=%s", callID, sourceExt, ext, in.BridgeID), "")
+	s.log.Info("incoming SIP call routed directly to SIP target",
+		map[string]any{"call_id": callID, "source_ext": sourceExt, "target_ext": ext, "extension": in.Extension})
+	return true
 }
 
 func (s *Server) handleSIPIntercomCallback(req asterisk.IntercomCallbackRequest) {
@@ -2453,7 +2550,7 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 	// variants so redial formats can recover from gateway/operator differences.
 	number := stripOutboundTrunkPrefix(rawDigits, trunk)
 	preferred := normalizePSTNDigits(number, trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
-	numbers := outboundGatewayDialCandidates(number, preferred, s.isLandlineGatewayTrunk(callerEP.AccountID, trunk))
+	numbers := outboundGatewayDialCandidates(number, preferred, s.prefersLeadingZeroGatewayDial(callerEP.AccountID, trunk))
 	if len(numbers) == 0 || !isSafeDialNumber(numbers[0]) || !isSafeAsteriskName(trunk) {
 		s.log.Warn("rejecting unsafe SIP-phone outbound gateway dial",
 			map[string]any{"extension": in.Extension, "caller_ext": callerEP.Extension, "trunk": trunk})
@@ -2493,12 +2590,14 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 	// when a desk SIP phone starts the outside call.
 	callerID := formatSIPCallerID(display, "100")
 	s.setSIPOutboundRetry(callID, &sipOutboundRetry{
-		Numbers:   numbers,
-		Trunk:     trunk,
-		BridgeID:  in.BridgeID,
-		CallerID:  callerID,
-		FromNode:  "sip:" + callerEP.Extension,
-		CallerExt: callerEP.Extension,
+		Numbers:        numbers,
+		Trunk:          trunk,
+		BridgeID:       in.BridgeID,
+		CallerID:       callerID,
+		DialTerminator: "",
+		PostAnswerDTMF: s.gatewayPostAnswerDTMF(callerEP.AccountID, trunk),
+		FromNode:       "sip:" + callerEP.Extension,
+		CallerExt:      callerEP.Extension,
 	})
 	if !s.trySIPPhoneOutboundGateway(callID) {
 		return
@@ -2589,6 +2688,41 @@ func (s *Server) isLandlineGatewayTrunk(accountID, trunk string) bool {
 	return false
 }
 
+func (s *Server) prefersLeadingZeroGatewayDial(accountID, trunk string) bool {
+	trunk = strings.TrimSpace(trunk)
+	if trunk == "" {
+		return false
+	}
+	ep, err := s.store.GetSIPEndpointByExtension(trunk)
+	if err != nil {
+		s.log.Warn("failed to inspect gateway dial profile",
+			map[string]any{"account": accountID, "trunk": trunk, "err": err.Error()})
+		return false
+	}
+	if ep == nil || ep.AccountID != accountID {
+		return false
+	}
+	meta := strings.ToLower(strings.Join([]string{
+		ep.Extension,
+		ep.Username,
+		ep.Description,
+		ep.RouteTo,
+	}, " "))
+	for _, marker := range []string{"fxo", "landline", "pstn", "grandstream", "ht813", "ht841", "synway", "smg", "gsm"} {
+		if strings.Contains(meta, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) gatewayPostAnswerDTMF(accountID, trunk string) string {
+	if s.prefersLeadingZeroGatewayDial(accountID, trunk) {
+		return "#"
+	}
+	return ""
+}
+
 func (s *Server) setSIPOutboundRetry(callID string, retry *sipOutboundRetry) {
 	s.sipOutboundMu.Lock()
 	defer s.sipOutboundMu.Unlock()
@@ -2634,6 +2768,19 @@ func (s *Server) clearSIPOutboundRetry(callID string) {
 	s.setSIPOutboundRetry(callID, nil)
 }
 
+func (s *Server) clearSIPOutboundDialTerminator(callID string) (*sipOutboundRetry, bool) {
+	s.sipOutboundMu.Lock()
+	defer s.sipOutboundMu.Unlock()
+	retry := s.sipOutboundRetries[callID]
+	if retry == nil || retry.DialTerminator == "" {
+		return nil, false
+	}
+	retry.DialTerminator = ""
+	cp := *retry
+	cp.Numbers = append([]string(nil), retry.Numbers...)
+	return &cp, true
+}
+
 func (s *Server) trySIPPhoneOutboundGateway(callID string) bool {
 	if c := s.calls.Get(callID); c == nil || c.State != calls.StateRinging {
 		s.clearSIPOutboundRetry(callID)
@@ -2665,11 +2812,18 @@ func (s *Server) trySIPPhoneOutboundGateway(callID string) bool {
 		retry.CallerID,
 		callID,
 		retry.FromNode,
+		retry.DialTerminator,
+		retry.PostAnswerDTMF,
 		s.cfg.CallTimeoutSec,
 	)
 	if err != nil {
 		s.log.Warn("SIP-phone outbound gateway originate attempt failed",
 			map[string]any{"call_id": callID, "caller_ext": retry.CallerExt, "number": number, "trunk": retry.Trunk, "attempt": retry.Index + 1, "err": err.Error()})
+		if same, ok := s.clearSIPOutboundDialTerminator(callID); ok {
+			s.log.Info("retrying SIP-phone outbound gateway without fast-dial terminator",
+				map[string]any{"call_id": callID, "number": same.Numbers[same.Index], "attempt": same.Index + 1})
+			return s.trySIPPhoneOutboundGateway(callID)
+		}
 		if next, ok := s.advanceSIPOutboundRetry(callID); ok {
 			s.log.Info("retrying SIP-phone outbound gateway after originate error",
 				map[string]any{"call_id": callID, "number": next.Numbers[next.Index], "attempt": next.Index + 1})
@@ -2685,7 +2839,7 @@ func (s *Server) trySIPPhoneOutboundGateway(callID string) bool {
 	}
 
 	s.log.Info("SIP-phone outbound gateway originate attempt sent",
-		map[string]any{"call_id": callID, "caller_ext": retry.CallerExt, "number": number, "trunk": retry.Trunk, "attempt": retry.Index + 1})
+		map[string]any{"call_id": callID, "caller_ext": retry.CallerExt, "number": number, "trunk": retry.Trunk, "attempt": retry.Index + 1, "fast_dial": retry.DialTerminator != "", "post_answer_dtmf": retry.PostAnswerDTMF != ""})
 	return true
 }
 
@@ -2833,6 +2987,12 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 		endReason := "no_answer"
 		if c := s.calls.Get(callID); c != nil {
 			if s.isOutboundGatewayCall(c) && c.State == calls.StateRinging {
+				if same, retryOK := s.clearSIPOutboundDialTerminator(callID); retryOK {
+					s.log.Info("outbound gateway attempt failed; retrying same number without fast-dial terminator",
+						map[string]any{"call_id": callID, "reason": reason, "number": same.Numbers[same.Index], "attempt": same.Index + 1})
+					go s.trySIPPhoneOutboundGateway(callID)
+					return
+				}
 				if next, retryOK := s.advanceSIPOutboundRetry(callID); retryOK {
 					s.log.Info("outbound gateway attempt failed; retrying alternate dial form",
 						map[string]any{"call_id": callID, "reason": reason, "number": next.Numbers[next.Index], "attempt": next.Index + 1})
@@ -3237,6 +3397,11 @@ func (s *Server) configureAsteriskFromStore() {
 		webrtcPass = s.cfg.Asterisk.SIPWebRTC.Password
 	}
 
+	noAuthInbound := gatewayNoAuthInboundExtensions(
+		s.cfg.Asterisk.NoAuthInboundExtensions,
+		endpoints,
+	)
+
 	if err := asterisk.Setup(asterisk.SetupConfig{
 		AmiUser:                 s.cfg.Asterisk.User,
 		AmiSecret:               s.cfg.Asterisk.Secret,
@@ -3247,7 +3412,7 @@ func (s *Server) configureAsteriskFromStore() {
 		OutContext:              s.cfg.Asterisk.OutContext,
 		DefaultPSTNTrunk:        s.cfg.Asterisk.DefaultPSTNTrunk,
 		TrustedGatewayIPs:       s.cfg.Asterisk.TrustedGatewayIPs,
-		NoAuthInboundExtensions: s.cfg.Asterisk.NoAuthInboundExtensions,
+		NoAuthInboundExtensions: noAuthInbound,
 		WebRTCUser:              webrtcUser,
 		WebRTCPass:              webrtcPass,
 	}, defs, s.log); err != nil {
@@ -3259,6 +3424,44 @@ func (s *Server) configureAsteriskFromStore() {
 		"sip_endpoints": len(defs),
 		"webrtc":        webrtcUser != "" && webrtcPass != "",
 	})
+}
+
+func gatewayNoAuthInboundExtensions(configured []string, endpoints []store.SIPEndpoint) []string {
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(configured)+len(endpoints))
+	add := func(value string) {
+		ext := strings.TrimSpace(value)
+		if ext == "" || seen[ext] {
+			return
+		}
+		seen[ext] = true
+		out = append(out, ext)
+	}
+	for _, ext := range configured {
+		add(ext)
+	}
+	for _, ep := range endpoints {
+		if ep.Enabled && isGatewayNoAuthCandidate(ep.Extension) {
+			add(ep.Extension)
+		}
+	}
+	return out
+}
+
+func isGatewayNoAuthCandidate(extension string) bool {
+	ext := strings.TrimSpace(extension)
+	if len(ext) < 3 || len(ext) > 8 {
+		return false
+	}
+	if !strings.HasPrefix(ext, "70") {
+		return false
+	}
+	for _, ch := range ext {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // sendErrorSafe sends an error through the session's mutex-protected Send method.

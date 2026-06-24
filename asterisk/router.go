@@ -413,7 +413,7 @@ func (r *Router) originateIntercomCallbackTargetFirst(sourceExtension, targetExt
 // OriginateToTrunk dials an external number through an existing PJSIP trunk and
 // then sends the answered leg into the same ConfBridge extension used by SIP
 // phone calls.
-func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, bridgeExt, callerID, callID, fromNode string, timeoutSec int) (string, error) {
+func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, bridgeExt, callerID, callID, fromNode, dialTerminator, postAnswerDTMF string, timeoutSec int) (string, error) {
 	if outContext == "" {
 		outContext = "from-simson-out"
 	}
@@ -422,18 +422,21 @@ func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, brid
 	channel := fmt.Sprintf("Local/%s@%s/n", number, outContext)
 	actionID := uuid.NewString()
 	r.TrackPendingPrefix(callID, fmt.Sprintf("Local/%s@%s-", number, outContext))
+	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", trunk))
 
 	r.originateMu.Lock()
 	r.actionIDToCallID[actionID] = callID
 	r.originateMu.Unlock()
 
 	vars := map[string]string{
-		"SIMSON_CALL_ID":      callID,
-		"__SIMSON_CALL_ID":    callID,
-		"SIMSON_FROM_NODE":    fromNode,
-		"__SIMSON_FROM_NODE":  fromNode,
-		"SIMSON_TRUNK":        trunk,
-		"SIMSON_WAIT_TIMEOUT": fmt.Sprintf("%d", timeoutSec),
+		"SIMSON_CALL_ID":          callID,
+		"__SIMSON_CALL_ID":        callID,
+		"SIMSON_FROM_NODE":        fromNode,
+		"__SIMSON_FROM_NODE":      fromNode,
+		"SIMSON_TRUNK":            trunk,
+		"SIMSON_DIAL_SUFFIX":      dialTerminator,
+		"SIMSON_POST_ANSWER_DTMF": postAnswerDTMF,
+		"SIMSON_WAIT_TIMEOUT":     fmt.Sprintf("%d", timeoutSec),
 	}
 	_, err := r.ami.OriginateWithVars(channel, bridgeContext, bridgeExt, callerID, timeoutSec*1000, actionID, vars)
 	if err != nil {
