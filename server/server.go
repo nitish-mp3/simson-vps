@@ -1888,7 +1888,7 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 			return
 		}
 
-		if isExternalDialString(in.Extension) {
+		if isExternalDialString(in.Extension) || s.hasExplicitGatewayTrunkPrefix(callerEP.AccountID, in.Extension) {
 			// This path runs from an AMI UserEvent. Originate must not block
 			// the AMI read loop, otherwise its own response cannot be read.
 			go s.handleSIPPhoneOutboundGateway(in, callerEP)
@@ -1966,6 +1966,9 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 
 	if routeTo != "" {
 		if sipRouteExt, ok := normalizeSIPRouteTarget(routeTo); ok {
+			// This callback runs on the AMI read loop. Direct SIP routing uses AMI
+			// commands too, so it must run asynchronously or it can deadlock waiting
+			// for the response it is currently blocking from being read.
 			go s.routeIncomingSIPDirectToExtension(accountID, sipRouteExt, sourceExt, in)
 			return
 		}
@@ -2092,32 +2095,37 @@ func normalizeSIPRouteTarget(routeTo string) (string, bool) {
 }
 
 func (s *Server) routeIncomingSIPDirectToExtension(accountID, ext, sourceExt string, in asterisk.IncomingSIPCall) bool {
-	if s.asterisk == nil || !s.asterisk.Connected() {
-		s.log.Warn("direct SIP route skipped because Asterisk AMI is not connected",
-			map[string]any{"extension": in.Extension, "target_ext": ext})
+	failDirectRoute := func(reason string, fields map[string]any) bool {
+		if fields == nil {
+			fields = map[string]any{}
+		}
+		fields["extension"] = in.Extension
+		fields["source_ext"] = sourceExt
+		fields["target_ext"] = ext
+		fields["channel"] = in.Channel
+		s.log.Warn("direct SIP route failed; hanging up original gateway leg",
+			map[string]any{"reason": reason, "fields": fields})
+		s.hangupAsteriskChannelAsync(in.Channel, reason)
 		return false
 	}
+	if s.asterisk == nil || !s.asterisk.Connected() {
+		return failDirectRoute("asterisk AMI not connected", nil)
+	}
 	if ext == sourceExt {
-		s.log.Warn("direct SIP route rejected because target equals source",
-			map[string]any{"source_ext": sourceExt, "target_ext": ext, "channel": in.Channel})
-		return false
+		return failDirectRoute("target equals source", nil)
 	}
 
 	ep, err := s.store.GetSIPEndpointByExtension(ext)
 	if err != nil {
 		s.log.Error("db error looking up direct route SIP endpoint",
 			map[string]any{"err": err.Error(), "ext": ext})
-		return false
+		return failDirectRoute("target lookup failed", map[string]any{"err": err.Error()})
 	}
 	if ep == nil || ep.AccountID != accountID || !ep.Enabled {
-		s.log.Warn("direct SIP route target unavailable in account",
-			map[string]any{"account": accountID, "target_ext": ext, "extension": in.Extension})
-		return false
+		return failDirectRoute("target unavailable in account", map[string]any{"account": accountID})
 	}
 	if !s.asterisk.EndpointHasContacts(ext) {
-		s.log.Warn("direct SIP route target is not registered",
-			map[string]any{"account": accountID, "target_ext": ext, "extension": in.Extension})
-		return false
+		return failDirectRoute("target is not registered", map[string]any{"account": accountID})
 	}
 	if !s.reserveSIPBridgeTransfer(in.BridgeID, ext) {
 		s.log.Warn("suppressing duplicate direct SIP route",
@@ -2161,6 +2169,7 @@ func (s *Server) routeIncomingSIPDirectToExtension(accountID, ext, sourceExt str
 		s.releaseSIPBridgeTransfer(in.BridgeID, ext)
 		s.log.Error("direct SIP route originate failed",
 			map[string]any{"call_id": callID, "target_ext": ext, "err": err.Error()})
+		s.hangupAsteriskChannelAsync(in.Channel, "direct SIP route originate failed")
 		return false
 	}
 
@@ -2632,7 +2641,7 @@ func (s *Server) selectOutboundGatewayTrunk(accountID, rawDigits string) string 
 		}
 		if rawDigits != "" && strings.HasPrefix(rawDigits, ext) {
 			rest := strings.TrimPrefix(rawDigits, ext)
-			if len(rest) >= 7 && len(rest) <= 15 {
+			if len(rest) >= 1 && len(rest) <= 15 {
 				return ext
 			}
 		}
@@ -2658,6 +2667,43 @@ func (s *Server) selectOutboundGatewayTrunk(accountID, rawDigits string) string 
 		return fallback
 	}
 	return defaultTrunk
+}
+
+func (s *Server) hasExplicitGatewayTrunkPrefix(accountID, rawDigits string) bool {
+	digits := digitsOnly(rawDigits)
+	if digits == "" {
+		return false
+	}
+	endpoints, err := s.store.ListSIPEndpoints(accountID)
+	if err != nil {
+		s.log.Warn("failed to list SIP endpoints for explicit gateway prefix detection",
+			map[string]any{"account": accountID, "err": err.Error()})
+	}
+	defaultTrunk := strings.TrimSpace(s.cfg.Asterisk.DefaultPSTNTrunk)
+	if defaultTrunk == "" {
+		defaultTrunk = "7009"
+	}
+	check := func(ext string) bool {
+		ext = digitsOnly(ext)
+		if ext == "" || !strings.HasPrefix(digits, ext) {
+			return false
+		}
+		rest := strings.TrimPrefix(digits, ext)
+		return len(rest) >= 1 && len(rest) <= 15
+	}
+	if check(defaultTrunk) {
+		return true
+	}
+	for _, ep := range endpoints {
+		ext := strings.TrimSpace(ep.Extension)
+		if !ep.Enabled || !isGatewayLikeTrunk(ext, defaultTrunk) {
+			continue
+		}
+		if check(ext) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) isLandlineGatewayTrunk(accountID, trunk string) bool {
@@ -2917,25 +2963,36 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 	}
 	call := s.calls.Get(callID)
 	if call != nil && strings.HasPrefix(channel, "Local/") && (call.State == calls.StateRinging || call.State == calls.StateActive) {
-		// Local channels are helper legs for outbound trunk calls. They can hang
-		// up during normal dial/bridge transitions; the real PJSIP leg owns the
-		// user-visible call lifecycle.
-		s.log.Debug("ignoring outbound helper channel hangup",
-			map[string]any{"call_id": callID, "channel": channel, "state": call.State})
-		return
+		if s.isDirectGatewaySIPRoute(call) {
+			// Direct gateway routes use a Local channel as the target SIP bridge leg.
+			// If it hangs up, the original FXO/GSM caller must be cleared too.
+			s.log.Info("direct gateway SIP local bridge leg hung up; ending incoming bridge",
+				map[string]any{"call_id": callID, "channel": channel, "state": call.State})
+		} else {
+			// Local channels are helper legs for outbound trunk calls. They can hang
+			// up during normal dial/bridge transitions; the real PJSIP leg owns the
+			// user-visible call lifecycle.
+			s.log.Debug("ignoring outbound helper channel hangup",
+				map[string]any{"call_id": callID, "channel": channel, "state": call.State})
+			return
+		}
 	}
 	if call != nil && s.isInboundSIPBridgeCall(call) && s.isSecondarySIPEndpointChannel(channel, call) {
 		// Before answer, a routed SIP desk-phone leg can fail, be cancelled, or be
 		// retried without meaning the original gateway caller hung up. Once that
 		// leg has answered, its hangup is the user ending the bridged call and must
 		// clear the outside caller too.
-		if call.State != calls.StateActive || call.AnsweredAt.IsZero() {
+		if s.isDirectGatewaySIPRoute(call) {
+			s.log.Info("direct gateway SIP route leg hung up; ending incoming bridge",
+				map[string]any{"call_id": callID, "channel": channel, "state": call.State})
+		} else if call.State != calls.StateActive || call.AnsweredAt.IsZero() {
 			s.log.Info("secondary SIP bridge leg hung up before answer; keeping original incoming call alive",
 				map[string]any{"call_id": callID, "channel": channel, "state": call.State})
 			return
+		} else {
+			s.log.Info("secondary SIP bridge leg hung up after answer; ending incoming bridge",
+				map[string]any{"call_id": callID, "channel": channel, "state": call.State})
 		}
-		s.log.Info("secondary SIP bridge leg hung up after answer; ending incoming bridge",
-			map[string]any{"call_id": callID, "channel": channel, "state": call.State})
 	}
 	if call != nil && call.State == calls.StateRinging && s.isOutboundGatewayCall(call) && strings.HasPrefix(channel, "PJSIP/") {
 		callerExt := strings.TrimPrefix(call.FromNode, "sip:")
@@ -3003,7 +3060,7 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 					return
 				}
 			}
-			if s.isInboundSIPBridgeCall(c) {
+			if s.isInboundSIPBridgeCall(c) && !s.isDirectGatewaySIPRoute(c) {
 				s.log.Info("SIP bridge add-on leg did not answer; keeping original incoming call alive",
 					map[string]any{"call_id": callID, "reason": reason, "state": c.State})
 				return
@@ -3104,8 +3161,28 @@ func (s *Server) isInboundSIPBridgeCall(c *calls.Call) bool {
 	if c == nil || c.CallType != "sip" || c.SIPBridgeID == "" {
 		return false
 	}
+	from := strings.TrimPrefix(strings.ToLower(c.FromNode), "sip:")
+	to := strings.TrimPrefix(strings.ToLower(c.ToNode), "sip:")
+	if from == "" || !strings.HasPrefix(strings.ToLower(c.FromNode), "sip:") {
+		return false
+	}
+	if isReservedGatewayExtension(from) {
+		return true
+	}
+	return to != "" && !strings.HasPrefix(strings.ToLower(c.ToNode), "sip:")
+}
+
+func (s *Server) isDirectGatewaySIPRoute(c *calls.Call) bool {
+	if c == nil || c.CallType != "sip" || c.SIPBridgeID == "" {
+		return false
+	}
+	from := strings.TrimPrefix(strings.ToLower(c.FromNode), "sip:")
+	to := strings.TrimPrefix(strings.ToLower(c.ToNode), "sip:")
 	return strings.HasPrefix(strings.ToLower(c.FromNode), "sip:") &&
-		!strings.HasPrefix(strings.ToLower(c.ToNode), "sip:")
+		strings.HasPrefix(strings.ToLower(c.ToNode), "sip:") &&
+		isReservedGatewayExtension(from) &&
+		to != "" &&
+		!isReservedGatewayExtension(to)
 }
 
 func (s *Server) isSecondarySIPEndpointChannel(channel string, c *calls.Call) bool {
@@ -3197,6 +3274,14 @@ func outboundGatewayDialCandidates(rawDigits, preferred string, preferLandlinePr
 		candidates = append(candidates, v)
 	}
 
+	// Building/intercom extensions sent through an explicit gateway prefix
+	// are not public PSTN numbers. Avoid 91/0 retry expansion, which can
+	// make gateways wait on invalid outside-number forms for 20-30 seconds.
+	if pref := digitsOnly(preferred); pref != "" && len(pref) < 7 {
+		add(pref)
+		return candidates
+	}
+
 	if preferLandlinePrefix {
 		digits := digitsOnly(rawDigits)
 		if len(digits) == 12 && strings.HasPrefix(digits, "91") {
@@ -3220,7 +3305,7 @@ func stripOutboundTrunkPrefix(digits, trunk string) string {
 		return stripCommonDialAccessPrefix(digits)
 	}
 	rest := strings.TrimPrefix(digits, trunk)
-	if len(rest) >= 7 && len(rest) <= 15 {
+	if len(rest) >= 1 && len(rest) <= 15 {
 		return stripCommonDialAccessPrefix(rest)
 	}
 	return stripCommonDialAccessPrefix(digits)

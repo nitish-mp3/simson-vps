@@ -549,8 +549,15 @@ func (r *Router) hangupCall(callID, exceptChannel string) error {
 		if exceptChannel != "" && normalizeChannel(ch) == exceptChannel {
 			continue
 		}
-		if err := r.ami.HangupChannel(ch); err != nil && firstErr == nil {
-			firstErr = err
+		if err := r.ami.HangupChannel(ch); err != nil {
+			// Asterisk often removes Local/PJSIP helper channels while we are
+			// already clearing the bridge. Treat that as successful cleanup.
+			if strings.Contains(strings.ToLower(err.Error()), "no such channel") {
+				continue
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr
