@@ -16,6 +16,7 @@ type IncomingSIPCall struct {
 	Extension      string // extension that was dialled (e.g. "1001")
 	CallerID       string // caller number / display name
 	CallerEndpoint string // PJSIP endpoint that Asterisk matched, when available
+	GatewaySource  string // no-auth gateway extension that accepted the anonymous call, when known
 	UniqueID       string // Asterisk unique call ID
 	BridgeID       string // ConfBridge room the SIP channel is already parked in
 }
@@ -462,6 +463,36 @@ func (r *Router) HangupCallExcept(callID, exceptChannel string) error {
 	return r.hangupCall(callID, exceptChannel)
 }
 
+// HangupBridge hangs up every active Asterisk channel currently parked in a
+// Simson ConfBridge room. This is the final safety net for browser/WebRTC
+// bridge legs that did not carry the Simson call ID in their channel data.
+func (r *Router) HangupBridge(bridgeID, exceptChannel string) error {
+	bridgeID = strings.TrimSpace(bridgeID)
+	exceptChannel = normalizeChannel(exceptChannel)
+	if bridgeID == "" {
+		return nil
+	}
+	channels := r.channelsInBridge(bridgeID)
+	if len(channels) == 0 {
+		return nil
+	}
+	var firstErr error
+	for _, ch := range channels {
+		if exceptChannel != "" && normalizeChannel(ch) == exceptChannel {
+			continue
+		}
+		if err := r.ami.HangupChannel(ch); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "no such channel") {
+				continue
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
 // CleanupOrphanSimsonChannels clears media legs left behind after a control-plane
 // restart. Asterisk keeps ConfBridge channels alive independently of this process,
 // so without this cleanup stale WebRTC/CBAnn legs can build up and hurt audio.
@@ -624,6 +655,42 @@ func (r *Router) channelsWithPendingPrefixes(callID string) []string {
 				break
 			}
 		}
+	}
+	return channels
+}
+
+func (r *Router) channelsInBridge(bridgeID string) []string {
+	bridgeID = strings.TrimSpace(bridgeID)
+	if bridgeID == "" {
+		return nil
+	}
+	out, err := r.ami.RunCommand("core show channels concise")
+	if err != nil {
+		r.log.Warn("could not inspect channels for bridge cleanup",
+			map[string]any{"bridge": bridgeID, "err": err.Error()})
+		return nil
+	}
+
+	var channels []string
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, bridgeID) {
+			continue
+		}
+		parts := strings.Split(line, "!")
+		if len(parts) == 0 {
+			continue
+		}
+		ch := normalizeChannel(parts[0])
+		if ch == "" {
+			continue
+		}
+		if _, ok := seen[ch]; ok {
+			continue
+		}
+		seen[ch] = struct{}{}
+		channels = append(channels, ch)
 	}
 	return channels
 }
@@ -801,6 +868,7 @@ func (r *Router) handleSimsonRoute(ev Event) {
 	extension := strings.TrimSpace(ev.Fields["Extension"])
 	callerID := strings.TrimSpace(ev.Fields["Caller"])
 	callerEndpoint := strings.TrimSpace(ev.Fields["CallerEndpoint"])
+	gatewaySource := strings.TrimSpace(ev.Fields["GatewaySource"])
 	uniqueID := ev.Fields["UniqueID"]
 	bridgeID := ev.Fields["Bridge"]
 
@@ -816,6 +884,7 @@ func (r *Router) handleSimsonRoute(ev Event) {
 		"extension":       extension,
 		"caller_id":       callerID,
 		"caller_endpoint": callerEndpoint,
+		"gateway_source":  gatewaySource,
 	})
 
 	if r.OnIncomingCall != nil {
@@ -824,6 +893,7 @@ func (r *Router) handleSimsonRoute(ev Event) {
 			Extension:      extension,
 			CallerID:       callerID,
 			CallerEndpoint: callerEndpoint,
+			GatewaySource:  gatewaySource,
 			UniqueID:       uniqueID,
 			BridgeID:       bridgeID,
 		})

@@ -1231,10 +1231,17 @@ func (s *Server) handleCallReject(sess *hub.Session, env *protocol.Envelope) {
 
 	if existing.CallType == "sip" && s.asterisk != nil {
 		s.clearSIPOutboundRetry(payload.CallID)
+		bridgeID := strings.TrimSpace(existing.SIPBridgeID)
 		go func() {
 			if err := s.asterisk.HangupCall(payload.CallID); err != nil {
 				s.log.Warn("failed to hang up SIP leg after reject",
 					map[string]any{"call_id": payload.CallID, "err": err.Error()})
+			}
+			if bridgeID != "" {
+				if err := s.asterisk.HangupBridge(bridgeID, ""); err != nil {
+					s.log.Warn("failed to hang up SIP bridge after reject",
+						map[string]any{"call_id": payload.CallID, "bridge": bridgeID, "err": err.Error()})
+				}
 			}
 			s.asterisk.UntrackCall(payload.CallID)
 		}()
@@ -1279,9 +1286,16 @@ func (s *Server) handleCallEnd(sess *hub.Session, env *protocol.Envelope) {
 
 	if existing.CallType == "sip" && s.asterisk != nil {
 		s.clearSIPOutboundRetry(payload.CallID)
+		bridgeID := strings.TrimSpace(existing.SIPBridgeID)
 		go func() {
 			if err := s.asterisk.HangupCall(payload.CallID); err != nil {
 				s.log.Warn("failed to hang up SIP leg", map[string]any{"call_id": payload.CallID, "err": err.Error()})
+			}
+			if bridgeID != "" {
+				if err := s.asterisk.HangupBridge(bridgeID, ""); err != nil {
+					s.log.Warn("failed to hang up SIP bridge",
+						map[string]any{"call_id": payload.CallID, "bridge": bridgeID, "err": err.Error()})
+				}
 			}
 			s.asterisk.UntrackCall(payload.CallID)
 		}()
@@ -2073,6 +2087,7 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 
 	if sentCount == 0 {
 		s.calls.End(callID, "target_disappeared")
+		s.hangupAsteriskChannelAsync(in.Channel, "target disappeared before SIP invite")
 		s.asterisk.UntrackCall(callID)
 		return
 	}
@@ -2519,6 +2534,7 @@ func firstNonBlank(values ...string) string {
 
 func (s *Server) resolveIncomingSIPCallerEndpoint(in asterisk.IncomingSIPCall) (string, *store.SIPEndpoint) {
 	candidates := []string{
+		strings.TrimSpace(in.GatewaySource),
 		strings.TrimSpace(in.CallerEndpoint),
 		extractEndpointFromChannel(in.Channel),
 		digitsOnly(in.CallerID),
@@ -2895,9 +2911,16 @@ func (s *Server) shouldSuppressIncomingSIPInvite(accountID string, in asterisk.I
 	if strings.TrimSpace(sourceExt) == "" {
 		sourceExt = callerExt
 	}
+	sourceKey := strings.TrimSpace(sourceExt)
+	if sourceKey == "" || strings.EqualFold(sourceKey, "anonymous") {
+		sourceKey = callerExt
+	}
+	if strings.EqualFold(callerExt, "anonymous") && strings.TrimSpace(in.GatewaySource) != "" {
+		sourceKey = strings.TrimSpace(in.GatewaySource)
+	}
 	key := strings.ToLower(strings.TrimSpace(accountID)) + "|" +
 		strings.ToLower(strings.TrimSpace(in.Extension)) + "|" +
-		strings.ToLower(strings.TrimSpace(callerExt)) + "|" +
+		strings.ToLower(strings.TrimSpace(sourceKey)) + "|" +
 		strings.ToLower(strings.TrimSpace(in.CallerID))
 
 	s.recentSIPInvitesMu.Lock()
@@ -3023,6 +3046,12 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 			s.log.Warn("failed to hang up remaining SIP bridge legs",
 				map[string]any{"call_id": callID, "channel": channel, "err": err.Error()})
 		}
+		if c.SIPBridgeID != "" {
+			if err := s.asterisk.HangupBridge(c.SIPBridgeID, channel); err != nil {
+				s.log.Warn("failed to hang up remaining ConfBridge legs",
+					map[string]any{"call_id": callID, "bridge": c.SIPBridgeID, "channel": channel, "err": err.Error()})
+			}
+		}
 		s.asterisk.UntrackCall(callID)
 	}()
 	s.log.Info("SIP call ended by channel hangup", map[string]any{"call_id": callID, "channel": channel})
@@ -3084,10 +3113,17 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 			s.finishSIPIntercomCallback(callID, "", true)
 			s.notifyCallStatus(c)
 			if s.asterisk != nil {
+				bridgeID := strings.TrimSpace(c.SIPBridgeID)
 				go func() {
 					if err := s.asterisk.HangupCall(callID); err != nil {
 						s.log.Warn("failed to hang up SIP call after originate failure",
 							map[string]any{"call_id": callID, "err": err.Error()})
+					}
+					if bridgeID != "" {
+						if err := s.asterisk.HangupBridge(bridgeID, ""); err != nil {
+							s.log.Warn("failed to hang up SIP bridge after originate failure",
+								map[string]any{"call_id": callID, "bridge": bridgeID, "err": err.Error()})
+						}
 					}
 					s.asterisk.UntrackCall(callID)
 				}()

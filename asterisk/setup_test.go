@@ -412,6 +412,9 @@ func TestNoAuthGatewayDoesNotSwallowRegisteredPhonesBehindSameNAT(t *testing.T) 
 	if !strings.Contains(dialplan, "exten => 7009,1,NoOp(Simson anonymous gateway call") {
 		t.Fatal("no-auth gateway extension missing from locked-down anonymous dialplan")
 	}
+	if !strings.Contains(dialplan, "GatewaySource: ${EXTEN}") {
+		t.Fatal("anonymous gateway dialplan must pass the gateway source extension to the router")
+	}
 	if strings.Contains(section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n"), "exten => 7009,1,NoOp(Simson direct SIP endpoint") {
 		t.Fatal("gateway/HAOS-routed endpoint must not be generated as a direct phone extension")
 	}

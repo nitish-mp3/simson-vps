@@ -975,7 +975,7 @@ func buildAnonymousInboundDialplan(extensions []string) string {
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson anonymous gateway call to ${EXTEN} from ${CALLERID(num)})\n", ext)
 		sb.WriteString(" same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})\n")
-		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
+		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},GatewaySource: ${EXTEN},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
 		sb.WriteString(" same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)\n")
 		sb.WriteString(" same  => n,Hangup()\n")
 	}
