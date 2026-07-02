@@ -1530,6 +1530,10 @@ func (s *Server) handleWebRTCSignal(sess *hub.Session, env *protocol.Envelope) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found")
 		return
 	}
+	if !callHasNode(c, payload.FromNodeID) || !callHasNode(c, payload.ToNodeID) {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "node is not a call participant")
+		return
+	}
 
 	// Forward the signal as-is to the target node.
 	fwd := protocol.NewEnvelope(protocol.TypeWebRTCSignal, protocol.WebRTCSignalPayload{
@@ -1543,6 +1547,14 @@ func (s *Server) handleWebRTCSignal(sess *hub.Session, env *protocol.Envelope) {
 	if err := targetSess.Send(data); err != nil {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "failed to relay signal")
 	}
+}
+
+func callHasNode(c *calls.Call, nodeID string) bool {
+	nodeID = strings.TrimSpace(nodeID)
+	if c == nil || nodeID == "" {
+		return false
+	}
+	return c.FromNode == nodeID || c.ToNode == nodeID || c.CanNodeAnswer(nodeID)
 }
 
 // --- Users Update ---
@@ -1749,6 +1761,13 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		trunk = s.selectOutboundGatewayTrunk(sess.AccountID, digitsOnly(ext))
 	}
 	if ep == nil && trunk != "" {
+		if !s.isUsableOutboundGatewayTrunk(sess.AccountID, trunk) {
+			if c2, ended := s.calls.End(callID, "gateway_unavailable"); ended {
+				s.notifyCallStatus(c2)
+			}
+			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "gateway trunk is not available for this account")
+			return
+		}
 		rawDigits := digitsOnly(ext)
 		rawDigits = stripOutboundTrunkPrefix(rawDigits, trunk)
 		ext = normalizePSTNDigits(rawDigits, trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
@@ -1767,6 +1786,12 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "duplicate call ID")
 		return
 	}
+	failCreatedCall := func(reason string, code int, message string) {
+		if c2, ended := s.calls.End(callID, reason); ended {
+			s.notifyCallStatus(c2)
+		}
+		s.sendErrorSafe(sess, env.ID, code, message)
+	}
 
 	if callerID == "" {
 		label := sess.NodeID
@@ -1781,11 +1806,15 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 
 	if ep == nil {
 		if trunk == "" {
-			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "SIP extension not registered: "+originalExt)
+			failCreatedCall("gateway_unavailable", protocol.ErrCodeNotFound, "SIP extension not registered and no account gateway is available: "+originalExt)
 			return
 		}
 		if !isSafeDialNumber(ext) || !isSafeAsteriskName(trunk) {
-			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "invalid outbound trunk target")
+			failCreatedCall("invalid_gateway_target", protocol.ErrCodeBadRequest, "invalid outbound trunk target")
+			return
+		}
+		if !s.isUsableOutboundGatewayTrunk(sess.AccountID, trunk) {
+			failCreatedCall("gateway_unavailable", protocol.ErrCodeForbidden, "gateway trunk is not available for this account")
 			return
 		}
 	} else {
@@ -1876,6 +1905,7 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	var accountID string
 	var routeTo string
 	sourceExt := strings.TrimSpace(in.Extension)
+	haosRingCode := false
 
 	if ep != nil {
 		accountID = ep.AccountID
@@ -1902,48 +1932,55 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 			return
 		}
 
-		if isExternalDialString(in.Extension) || s.hasExplicitGatewayTrunkPrefix(callerEP.AccountID, in.Extension) {
-			// This path runs from an AMI UserEvent. Originate must not block
-			// the AMI read loop, otherwise its own response cannot be read.
-			go s.handleSIPPhoneOutboundGateway(in, callerEP)
-			return
-		}
+		if isHAOSRingCode(in.Extension) {
+			accountID = callerEP.AccountID
+			routeTo = ""
+			sourceExt = callerEP.Extension
+			haosRingCode = true
+		} else {
+			if isExternalDialString(in.Extension) || s.hasExplicitGatewayTrunkPrefix(callerEP.AccountID, in.Extension) {
+				// This path runs from an AMI UserEvent. Originate must not block
+				// the AMI read loop, otherwise its own response cannot be read.
+				go s.handleSIPPhoneOutboundGateway(in, callerEP)
+				return
+			}
 
-		// Unknown external-looking numbers should not be dispatched to nodes.
-		// A configured SIP endpoint may still intentionally use a DID/landline
-		// number as its extension, so this check must happen after endpoint lookup.
-		if len(in.Extension) > 15 {
-			s.log.Warn("rejecting unknown external-looking extension",
-				map[string]any{"extension": in.Extension, "channel": in.Channel})
-			if s.asterisk != nil {
-				s.hangupAsteriskChannelAsync(in.Channel, "unknown external-looking extension")
+			// Unknown external-looking numbers should not be dispatched to nodes.
+			// A configured SIP endpoint may still intentionally use a DID/landline
+			// number as its extension, so this check must happen after endpoint lookup.
+			if len(in.Extension) > 15 {
+				s.log.Warn("rejecting unknown external-looking extension",
+					map[string]any{"extension": in.Extension, "channel": in.Channel})
+				if s.asterisk != nil {
+					s.hangupAsteriskChannelAsync(in.Channel, "unknown external-looking extension")
+				}
+				return
 			}
-			return
-		}
-		if !isLikelyInternalExtension(in.Extension) {
-			s.log.Warn("rejecting unknown non-internal extension",
-				map[string]any{"extension": in.Extension, "channel": in.Channel, "caller_id": in.CallerID})
-			if s.asterisk != nil {
-				s.hangupAsteriskChannelAsync(in.Channel, "unknown non-internal extension")
+			if !isLikelyInternalExtension(in.Extension) {
+				s.log.Warn("rejecting unknown non-internal extension",
+					map[string]any{"extension": in.Extension, "channel": in.Channel, "caller_id": in.CallerID})
+				if s.asterisk != nil {
+					s.hangupAsteriskChannelAsync(in.Channel, "unknown non-internal extension")
+				}
+				return
 			}
-			return
-		}
-		if strings.TrimSpace(callerEP.RouteTo) == "" {
-			s.log.Warn("rejecting unknown internal extension from desk phone",
-				map[string]any{
-					"extension":       in.Extension,
-					"caller_ext":      callerEP.Extension,
-					"caller_endpoint": in.CallerEndpoint,
-					"channel":         in.Channel,
-				})
-			if s.asterisk != nil {
-				s.hangupAsteriskChannelAsync(in.Channel, "unknown internal extension")
+			if strings.TrimSpace(callerEP.RouteTo) == "" {
+				s.log.Warn("rejecting unknown internal extension from desk phone",
+					map[string]any{
+						"extension":       in.Extension,
+						"caller_ext":      callerEP.Extension,
+						"caller_endpoint": in.CallerEndpoint,
+						"channel":         in.Channel,
+					})
+				if s.asterisk != nil {
+					s.hangupAsteriskChannelAsync(in.Channel, "unknown internal extension")
+				}
+				return
 			}
-			return
+			accountID = callerEP.AccountID
+			routeTo = callerEP.RouteTo
+			sourceExt = callerEP.Extension
 		}
-		accountID = callerEP.AccountID
-		routeTo = callerEP.RouteTo
-		sourceExt = callerEP.Extension
 	}
 
 	if s.shouldSuppressIncomingSIPInvite(accountID, in, sourceExt) {
@@ -2064,6 +2101,7 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		"sip_bridge_id":        in.BridgeID,
 		"sip_caller_id":        in.CallerID,
 		"sip_extension":        in.Extension,
+		"sip_haos_ring_code":   strconv.FormatBool(haosRingCode),
 		"sip_source_extension": sourceExt,
 		"sip_unique_id":        in.UniqueID,
 	})
@@ -2682,7 +2720,7 @@ func (s *Server) selectOutboundGatewayTrunk(accountID, rawDigits string) string 
 	if fallback != "" {
 		return fallback
 	}
-	return defaultTrunk
+	return ""
 }
 
 func (s *Server) hasExplicitGatewayTrunkPrefix(accountID, rawDigits string) bool {
@@ -2707,9 +2745,6 @@ func (s *Server) hasExplicitGatewayTrunkPrefix(accountID, rawDigits string) bool
 		rest := strings.TrimPrefix(digits, ext)
 		return len(rest) >= 1 && len(rest) <= 15
 	}
-	if check(defaultTrunk) {
-		return true
-	}
 	for _, ep := range endpoints {
 		ext := strings.TrimSpace(ep.Extension)
 		if !ep.Enabled || !isGatewayLikeTrunk(ext, defaultTrunk) {
@@ -2720,6 +2755,35 @@ func (s *Server) hasExplicitGatewayTrunkPrefix(accountID, rawDigits string) bool
 		}
 	}
 	return false
+}
+
+func (s *Server) isUsableOutboundGatewayTrunk(accountID, trunk string) bool {
+	trunk = strings.TrimSpace(trunk)
+	if trunk == "" {
+		return false
+	}
+	defaultTrunk := strings.TrimSpace(s.cfg.Asterisk.DefaultPSTNTrunk)
+	if defaultTrunk == "" {
+		defaultTrunk = "7009"
+	}
+	if !isGatewayLikeTrunk(trunk, defaultTrunk) {
+		return false
+	}
+	ep, err := s.store.GetSIPEndpointByExtension(trunk)
+	if err != nil {
+		s.log.Warn("failed to verify outbound gateway trunk",
+			map[string]any{"account": accountID, "trunk": trunk, "err": err.Error()})
+		return false
+	}
+	if ep == nil || ep.AccountID != accountID || !ep.Enabled {
+		return false
+	}
+	if s.asterisk != nil && s.asterisk.Connected() && !s.asterisk.EndpointHasContacts(trunk) {
+		s.log.Warn("outbound gateway trunk has no registered contact",
+			map[string]any{"account": accountID, "trunk": trunk})
+		return false
+	}
+	return true
 }
 
 func (s *Server) isLandlineGatewayTrunk(accountID, trunk string) bool {
@@ -3159,6 +3223,10 @@ func isLikelyInternalExtension(ext string) bool {
 		}
 	}
 	return true
+}
+
+func isHAOSRingCode(ext string) bool {
+	return strings.TrimSpace(ext) == "100"
 }
 
 func isSafeDialNumber(number string) bool {

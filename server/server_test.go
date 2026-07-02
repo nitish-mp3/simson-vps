@@ -1,12 +1,15 @@
 package server
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/nitish-mp3/simson-vps/asterisk"
 	"github.com/nitish-mp3/simson-vps/calls"
+	"github.com/nitish-mp3/simson-vps/config"
+	"github.com/nitish-mp3/simson-vps/store"
 )
 
 func TestOutboundGatewayDialCandidatesIncludeLandlineMobilePrefix(t *testing.T) {
@@ -64,4 +67,59 @@ func TestSIPOutboundDialCandidatesIncludeLandlineMobilePrefix(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("sipOutboundDialCandidates() = %#v, want %#v", got, want)
 	}
+}
+
+func TestHAOSRingCode(t *testing.T) {
+	if !isHAOSRingCode("100") {
+		t.Fatal("100 should be the reserved HAOS ring code")
+	}
+	if isHAOSRingCode("1001") {
+		t.Fatal("normal SIP extensions must not be treated as the HAOS ring code")
+	}
+}
+
+func TestGatewaySelectionDoesNotLeakDefaultTrunkAcrossAccounts(t *testing.T) {
+	st := newServerTestStore(t)
+	if err := st.CreateAccount("site-a", "Site A", 10, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateAccount("site-b", "Site B", 10, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSIPEndpoint(store.SIPEndpoint{
+		ID:              "gw-a",
+		AccountID:       "site-a",
+		Extension:       "7009",
+		Username:        "7009",
+		Password:        "secret",
+		Description:     "Synway gateway",
+		DefaultOutbound: true,
+		Enabled:         true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{store: st, cfg: config.DefaultConfig()}
+	if got := s.selectOutboundGatewayTrunk("site-b", "919123208334"); got != "" {
+		t.Fatalf("selectOutboundGatewayTrunk leaked trunk %q into another account", got)
+	}
+	if s.hasExplicitGatewayTrunkPrefix("site-b", "70099123208334") {
+		t.Fatal("explicit gateway prefix from another account should not be accepted")
+	}
+	if s.isUsableOutboundGatewayTrunk("site-b", "7009") {
+		t.Fatal("gateway trunk from another account should not be usable")
+	}
+	if got := s.selectOutboundGatewayTrunk("site-a", "919123208334"); got != "7009" {
+		t.Fatalf("selectOutboundGatewayTrunk() = %q, want 7009", got)
+	}
+}
+
+func newServerTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "simson.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
 }
