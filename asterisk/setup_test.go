@@ -69,6 +69,45 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	}
 }
 
+func TestGatewayWelcomeAnnouncementIsScopedToGatewayIngress(t *testing.T) {
+	root := t.TempDir()
+	cfg := SetupConfig{
+		SIPDomain:               "simson-vps.vipsy.in",
+		InContext:               "from-simson-sip",
+		NodeContext:             "from-simson-node",
+		OutContext:              "from-simson-out",
+		NoAuthInboundExtensions: []string{"7013"},
+	}
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, "7009", cfg.NoAuthInboundExtensions, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
+	announcement := section(dialplan, "[simson-gateway-announcement]", "[simson-auto-answer]")
+	for _, want := range []string{
+		"Answer()",
+		"STAT(e,/usr/share/asterisk/sounds/custom/simson-architech-welcome.wav)",
+		"Playback(queue-thankyou&one-moment-please&pls-hold-while-try)",
+		"Playback(custom/simson-architech-welcome)",
+		"Return()",
+	} {
+		if !strings.Contains(announcement, want) {
+			t.Fatalf("gateway welcome announcement missing %q:\n%s", want, announcement)
+		}
+	}
+
+	inboundSIP := section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n")
+	if !strings.Contains(inboundSIP, `GosubIf($["${CHANNEL(pjsip,endpoint)}" = "${EXTEN}"]?simson-gateway-announcement,s,1)`) {
+		t.Fatalf("authenticated gateway ingress should conditionally play the announcement:\n%s", inboundSIP)
+	}
+
+	anonymous := section(dialplan, "\n[from-simson-anonymous]\n", "\n[from-simson-sip-outbound]")
+	if !strings.Contains(anonymous, "exten => 7013,1,NoOp(Simson anonymous gateway call") ||
+		!strings.Contains(anonymous, "Gosub(simson-gateway-announcement,s,1)") {
+		t.Fatalf("no-auth gateway ingress should play the announcement before routing:\n%s", anonymous)
+	}
+}
+
 func TestStockAsteriskSamplesAreNeutralized(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "pjsip.conf"), []byte(`

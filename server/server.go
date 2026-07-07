@@ -314,11 +314,14 @@ func (s *Server) HandleNodeDoorEvent(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleNodeSIPIntercom starts the same caller-callback bridge as the SIP
-// feature-code path, but without making the source phone place an outbound SIP
-// call first. This is intended for phone action URLs/DSS keys and HA
-// automations: the handset stays idle, then receives a fresh callback INVITE
-// with auto-answer/speaker hints.
+// HandleNodeSIPIntercom starts an authenticated site-scoped SIP intercom bridge.
+//
+// This endpoint is used by the addon, Home Assistant services, and phone action
+// URLs that already carry the node install token.  Because the request is
+// authenticated and account-scoped here, we intentionally do not require the
+// target endpoint's direct-handset callback allowlist.  That stricter allowlist
+// is still enforced in OnIntercomCallback for calls that originate from a SIP
+// handset feature-code path, where the phone itself is the only proof of intent.
 func (s *Server) HandleNodeSIPIntercom(w http.ResponseWriter, r *http.Request) {
 	node, ok := s.authenticateNodeRequest(w, r, "sip-intercom")
 	if !ok {
@@ -407,10 +410,6 @@ func (s *Server) HandleNodeSIPIntercom(w http.ResponseWriter, r *http.Request) {
 		writeNodeJSON(w, http.StatusNotFound, map[string]any{"error": "source or target SIP endpoint not found for this site"})
 		return
 	}
-	if !targetEP.CallbackBridge || !callerAllowedForCallback(source, targetEP.CallbackBridgeCallers) {
-		writeNodeJSON(w, http.StatusForbidden, map[string]any{"error": "target SIP endpoint does not allow callback bridge from this source"})
-		return
-	}
 	if !s.asterisk.EndpointHasContacts(source) {
 		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "source SIP phone is not registered", "source_extension": source})
 		return
@@ -482,9 +481,9 @@ func (s *Server) HandleNodeSIPIntercom(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.store.WriteAudit(node.AccountID, node.ID, "sip_intercom_silent",
-		fmt.Sprintf("call=%s source=%s target=%s source_mode=%s target_mode=%s", callID, source, target, sourceMode, targetMode), extractIP(r))
+		fmt.Sprintf("call=%s source=%s target=%s source_mode=%s target_mode=%s auth=node", callID, source, target, sourceMode, targetMode), extractIP(r))
 	s.log.Info("silent SIP intercom bridge originated",
-		map[string]any{"call_id": callID, "source": source, "target": target, "source_mode": sourceMode, "target_mode": targetMode})
+		map[string]any{"call_id": callID, "source": source, "target": target, "source_mode": sourceMode, "target_mode": targetMode, "policy": "authenticated_node"})
 	writeNodeJSON(w, http.StatusAccepted, map[string]any{
 		"call_id":          callID,
 		"status":           "calling",
@@ -492,6 +491,7 @@ func (s *Server) HandleNodeSIPIntercom(w http.ResponseWriter, r *http.Request) {
 		"target_extension": target,
 		"source_auto_mode": sourceMode,
 		"target_auto_mode": targetMode,
+		"policy":           "authenticated_node",
 	})
 }
 
