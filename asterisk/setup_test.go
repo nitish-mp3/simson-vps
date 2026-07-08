@@ -97,14 +97,24 @@ func TestGatewayWelcomeAnnouncementIsScopedToGatewayIngress(t *testing.T) {
 	}
 
 	inboundSIP := section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n")
-	if !strings.Contains(inboundSIP, `GosubIf($["${CHANNEL(pjsip,endpoint)}" = "${EXTEN}"]?simson-gateway-announcement,s,1)`) {
+	routeIdx := strings.Index(inboundSIP, "UserEvent(SimsonRoute")
+	authAnnouncementIdx := strings.Index(inboundSIP, `GosubIf($["${CHANNEL(pjsip,endpoint)}" = "${EXTEN}"]?simson-gateway-announcement,s,1)`)
+	if authAnnouncementIdx < 0 {
 		t.Fatalf("authenticated gateway ingress should conditionally play the announcement:\n%s", inboundSIP)
+	}
+	if routeIdx < 0 || routeIdx > authAnnouncementIdx {
+		t.Fatalf("authenticated gateway ingress must start routing before playing the announcement:\n%s", inboundSIP)
 	}
 
 	anonymous := section(dialplan, "\n[from-simson-anonymous]\n", "\n[from-simson-sip-outbound]")
 	if !strings.Contains(anonymous, "exten => 7013,1,NoOp(Simson anonymous gateway call") ||
 		!strings.Contains(anonymous, "Gosub(simson-gateway-announcement,s,1)") {
-		t.Fatalf("no-auth gateway ingress should play the announcement before routing:\n%s", anonymous)
+		t.Fatalf("no-auth gateway ingress should play the announcement:\n%s", anonymous)
+	}
+	anonRouteIdx := strings.Index(anonymous, "UserEvent(SimsonRoute")
+	anonAnnouncementIdx := strings.Index(anonymous, "Gosub(simson-gateway-announcement,s,1)")
+	if anonRouteIdx < 0 || anonAnnouncementIdx < 0 || anonRouteIdx > anonAnnouncementIdx {
+		t.Fatalf("no-auth gateway ingress must start routing before playing the announcement:\n%s", anonymous)
 	}
 }
 

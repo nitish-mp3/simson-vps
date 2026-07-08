@@ -457,6 +457,9 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	body.Password = strings.TrimSpace(body.Password)
 	body.Description = strings.TrimSpace(body.Description)
 	body.RouteTo = strings.TrimSpace(body.RouteTo)
+	if body.Username == "" {
+		body.Username = body.Extension
+	}
 	autoAnswerCallers, ok := normalizeAutoAnswerCallersInput(body.AutoAnswerCallers)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "auto_answer_callers must contain only extension/user tokens separated by commas"})
@@ -478,6 +481,10 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isSafeSIPExtension(body.Extension) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "extension must be 2-12 digits"})
+		return
+	}
+	if !isSafeSIPUsername(body.Username) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "username/auth user must be 2-64 characters and contain only letters, numbers, dot, underscore, or dash. For normal phones, use the same value as extension."})
 		return
 	}
 	existing, err := a.store.GetSIPEndpointByUsername(body.Username)
@@ -919,6 +926,28 @@ func isSafeSIPExtension(extension string) bool {
 		if ch < '0' || ch > '9' {
 			return false
 		}
+	}
+	return true
+}
+
+func isSafeSIPUsername(username string) bool {
+	if len(username) < 2 || len(username) > 64 {
+		return false
+	}
+	for _, ch := range username {
+		if ch == '.' || ch == '_' || ch == '-' {
+			continue
+		}
+		if ch >= '0' && ch <= '9' {
+			continue
+		}
+		if ch >= 'A' && ch <= 'Z' {
+			continue
+		}
+		if ch >= 'a' && ch <= 'z' {
+			continue
+		}
+		return false
 	}
 	return true
 }

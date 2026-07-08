@@ -631,16 +631,16 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 exten => _+X.,1,NoOp(Simson: incoming E.164 SIP call to ${EXTEN} from ${CALLERID(num)})
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
  same  => n,Set(JITTERBUFFER(adaptive)=default)
- same  => n,GosubIf($["${CHANNEL(pjsip,endpoint)}" = "${EXTEN}"]?simson-gateway-announcement,s,1)
  same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
+ same  => n,GosubIf($["${CHANNEL(pjsip,endpoint)}" = "${EXTEN}"]?simson-gateway-announcement,s,1)
  same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
  same  => n,Hangup()
 
 exten => _X.,1,NoOp(Simson: incoming call to ${EXTEN} from ${CALLERID(num)})
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
  same  => n,Set(JITTERBUFFER(adaptive)=default)
- same  => n,GosubIf($["${CHANNEL(pjsip,endpoint)}" = "${EXTEN}"]?simson-gateway-announcement,s,1)
  same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
+ same  => n,GosubIf($["${CHANNEL(pjsip,endpoint)}" = "${EXTEN}"]?simson-gateway-announcement,s,1)
  same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
  same  => n,Hangup()
 
@@ -987,8 +987,8 @@ func buildAnonymousInboundDialplan(extensions []string) string {
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson anonymous gateway call to ${EXTEN} from ${CALLERID(num)})\n", ext)
 		sb.WriteString(" same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})\n")
-		sb.WriteString(" same  => n,Gosub(simson-gateway-announcement,s,1)\n")
 		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},GatewaySource: ${EXTEN},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
+		sb.WriteString(" same  => n,Gosub(simson-gateway-announcement,s,1)\n")
 		sb.WriteString(" same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)\n")
 		sb.WriteString(" same  => n,Hangup()\n")
 	}
