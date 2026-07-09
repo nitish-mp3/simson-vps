@@ -1911,6 +1911,11 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		accountID = ep.AccountID
 		routeTo = ep.RouteTo
 		sourceExt = ep.Extension
+		if isReservedGatewayExtension(ep.Extension) {
+			if mode, directTarget := gatewayInboundPolicy(ep); mode == "direct_target" && directTarget != "" {
+				routeTo = directTarget
+			}
+		}
 	} else {
 		// Step 2: no matching dialled endpoint — identify the caller’s account
 		// from the Asterisk channel name (e.g. "PJSIP/7001-00000001" → ext
@@ -1965,21 +1970,31 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 				return
 			}
 			if strings.TrimSpace(callerEP.RouteTo) == "" {
-				s.log.Warn("rejecting unknown internal extension from desk phone",
-					map[string]any{
-						"extension":       in.Extension,
-						"caller_ext":      callerEP.Extension,
-						"caller_endpoint": in.CallerEndpoint,
-						"channel":         in.Channel,
-					})
-				if s.asterisk != nil {
-					s.hangupAsteriskChannelAsync(in.Channel, "unknown internal extension")
+				if mode, directTarget := gatewayInboundPolicy(callerEP); mode == "direct_target" && directTarget != "" {
+					accountID = callerEP.AccountID
+					routeTo = directTarget
+					sourceExt = callerEP.Extension
+				} else {
+					s.log.Warn("rejecting unknown internal extension from desk phone",
+						map[string]any{
+							"extension":       in.Extension,
+							"caller_ext":      callerEP.Extension,
+							"caller_endpoint": in.CallerEndpoint,
+							"channel":         in.Channel,
+						})
+					if s.asterisk != nil {
+						s.hangupAsteriskChannelAsync(in.Channel, "unknown internal extension")
+					}
+					return
 				}
-				return
 			}
-			accountID = callerEP.AccountID
-			routeTo = callerEP.RouteTo
-			sourceExt = callerEP.Extension
+			if routeTo != "" {
+				// Per-gateway direct routing already decided the destination above.
+			} else {
+				accountID = callerEP.AccountID
+				routeTo = callerEP.RouteTo
+				sourceExt = callerEP.Extension
+			}
 		}
 	}
 
@@ -2145,6 +2160,21 @@ func normalizeSIPRouteTarget(routeTo string) (string, bool) {
 		return "", false
 	}
 	return text, true
+}
+
+func gatewayInboundPolicy(ep *store.SIPEndpoint) (string, string) {
+	if ep == nil || !isReservedGatewayExtension(ep.Extension) {
+		return "", ""
+	}
+	mode := strings.ToLower(strings.TrimSpace(ep.GatewayInboundMode))
+	switch mode {
+	case "direct_target":
+		return mode, strings.TrimSpace(ep.GatewayDirectTarget)
+	case "haos_then_fallback":
+		return mode, strings.TrimSpace(ep.GatewayDirectTarget)
+	default:
+		return "", strings.TrimSpace(ep.GatewayDirectTarget)
+	}
 }
 
 func (s *Server) routeIncomingSIPDirectToExtension(accountID, ext, sourceExt string, in asterisk.IncomingSIPCall) bool {
@@ -3575,6 +3605,8 @@ func (s *Server) configureAsteriskFromStore() {
 			CallbackBridgeCallers:     ep.CallbackBridgeCallers,
 			CallbackCallerAutoAnswer:  ep.CallbackCallerAutoAnswer,
 			CallbackCallerAutoSpeaker: ep.CallbackCallerAutoSpeaker,
+			GatewayIVREnabled:         ep.GatewayIVREnabled,
+			GatewayIVRSound:           ep.GatewayIVRSound,
 			Enabled:                   ep.Enabled,
 		})
 	}

@@ -446,6 +446,10 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		CallbackCallerAutoAnswer  *bool  `json:"callback_caller_auto_answer"`
 		CallbackCallerAutoSpeaker *bool  `json:"callback_caller_auto_speaker"`
 		DefaultOutbound           *bool  `json:"default_outbound"`
+		GatewayInboundMode        string `json:"gateway_inbound_mode"`
+		GatewayDirectTarget       string `json:"gateway_direct_target"`
+		GatewayIVREnabled         *bool  `json:"gateway_ivr_enabled"`
+		GatewayIVRSound           string `json:"gateway_ivr_sound"`
 		Enabled                   *bool  `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -473,6 +477,21 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	callbackBridgeCallers, ok := normalizeAutoAnswerCallersInput(body.CallbackBridgeCallers)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "callback_bridge_callers must contain only extension/user tokens separated by commas"})
+		return
+	}
+	gatewayInboundMode, ok := normalizeGatewayInboundMode(body.GatewayInboundMode)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_inbound_mode must be blank, haos_then_fallback, or direct_target"})
+		return
+	}
+	gatewayDirectTarget, ok := normalizeGatewayDirectTarget(body.GatewayDirectTarget)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_direct_target must be a node id, route id, or SIP extension token"})
+		return
+	}
+	gatewayIVRSound, ok := normalizeGatewayIVRSound(body.GatewayIVRSound)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_ivr_sound must be an Asterisk sound name such as custom/site_welcome"})
 		return
 	}
 	if body.Extension == "" || body.Username == "" || body.Password == "" {
@@ -555,6 +574,10 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if body.DefaultOutbound != nil {
 		defaultOutbound = *body.DefaultOutbound
 	}
+	gatewayIVREnabled := false
+	if body.GatewayIVREnabled != nil {
+		gatewayIVREnabled = *body.GatewayIVREnabled
+	}
 	// Generate a random ID
 	idb := make([]byte, 16)
 	rand.Read(idb) //nolint:errcheck
@@ -576,6 +599,10 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		CallbackCallerAutoAnswer:  callbackCallerAutoAnswer,
 		CallbackCallerAutoSpeaker: callbackCallerAutoSpeaker,
 		DefaultOutbound:           defaultOutbound,
+		GatewayInboundMode:        gatewayInboundMode,
+		GatewayDirectTarget:       gatewayDirectTarget,
+		GatewayIVREnabled:         gatewayIVREnabled,
+		GatewayIVRSound:           gatewayIVRSound,
 		Enabled:                   enabled,
 	}
 	if err := a.store.CreateSIPEndpoint(ep); err != nil {
@@ -636,6 +663,10 @@ func (a *API) enrichSIPEndpoints(eps []store.SIPEndpoint) []map[string]any {
 			"callback_caller_auto_answer":  ep.CallbackCallerAutoAnswer,
 			"callback_caller_auto_speaker": ep.CallbackCallerAutoSpeaker,
 			"default_outbound":             ep.DefaultOutbound,
+			"gateway_inbound_mode":         ep.GatewayInboundMode,
+			"gateway_direct_target":        ep.GatewayDirectTarget,
+			"gateway_ivr_enabled":          ep.GatewayIVREnabled,
+			"gateway_ivr_sound":            ep.GatewayIVRSound,
 			"enabled":                      ep.Enabled,
 			"created_at":                   ep.CreatedAt,
 			"updated_at":                   ep.UpdatedAt,
@@ -690,6 +721,10 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		CallbackCallerAutoAnswer  *bool   `json:"callback_caller_auto_answer"`
 		CallbackCallerAutoSpeaker *bool   `json:"callback_caller_auto_speaker"`
 		DefaultOutbound           *bool   `json:"default_outbound"`
+		GatewayInboundMode        *string `json:"gateway_inbound_mode"`
+		GatewayDirectTarget       *string `json:"gateway_direct_target"`
+		GatewayIVREnabled         *bool   `json:"gateway_ivr_enabled"`
+		GatewayIVRSound           *string `json:"gateway_ivr_sound"`
 		Enabled                   *bool   `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -753,6 +788,38 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if body.DefaultOutbound != nil {
 		ep.DefaultOutbound = *body.DefaultOutbound
 	}
+	gatewayFieldsChanged := false
+	if body.GatewayInboundMode != nil {
+		mode, ok := normalizeGatewayInboundMode(*body.GatewayInboundMode)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_inbound_mode must be blank, haos_then_fallback, or direct_target"})
+			return
+		}
+		ep.GatewayInboundMode = mode
+		gatewayFieldsChanged = true
+	}
+	if body.GatewayDirectTarget != nil {
+		target, ok := normalizeGatewayDirectTarget(*body.GatewayDirectTarget)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_direct_target must be a node id, route id, or SIP extension token"})
+			return
+		}
+		ep.GatewayDirectTarget = target
+		gatewayFieldsChanged = true
+	}
+	if body.GatewayIVREnabled != nil {
+		ep.GatewayIVREnabled = *body.GatewayIVREnabled
+		gatewayFieldsChanged = true
+	}
+	if body.GatewayIVRSound != nil {
+		sound, ok := normalizeGatewayIVRSound(*body.GatewayIVRSound)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_ivr_sound must be an Asterisk sound name such as custom/site_welcome"})
+			return
+		}
+		ep.GatewayIVRSound = sound
+		gatewayFieldsChanged = true
+	}
 	if body.Enabled != nil {
 		ep.Enabled = *body.Enabled
 	}
@@ -760,6 +827,13 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		a.log.Error("update sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
+	}
+	if gatewayFieldsChanged {
+		if err := a.store.UpdateSIPEndpointGateway(ep.ID, ep.GatewayInboundMode, ep.GatewayDirectTarget, ep.GatewayIVREnabled, ep.GatewayIVRSound); err != nil {
+			a.log.Error("update sip gateway settings", map[string]any{"err": err.Error()})
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+			return
+		}
 	}
 	if ep.DefaultOutbound {
 		a.clearOtherDefaultOutboundGateways(ep.AccountID, ep.ID)
@@ -980,6 +1054,69 @@ func normalizeAutoAnswerCallersInput(value string) (string, bool) {
 	return strings.Join(out, ","), true
 }
 
+func normalizeGatewayInboundMode(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "inherit":
+		return "", true
+	case "haos_then_fallback", "direct_target":
+		return strings.ToLower(strings.TrimSpace(value)), true
+	default:
+		return "", false
+	}
+}
+
+func normalizeGatewayDirectTarget(value string) (string, bool) {
+	target := strings.TrimSpace(value)
+	if target == "" {
+		return "", true
+	}
+	if len(target) > 96 {
+		return "", false
+	}
+	for _, ch := range target {
+		if ch == '-' || ch == '_' || ch == '.' || ch == ':' {
+			continue
+		}
+		if ch >= '0' && ch <= '9' {
+			continue
+		}
+		if ch >= 'A' && ch <= 'Z' {
+			continue
+		}
+		if ch >= 'a' && ch <= 'z' {
+			continue
+		}
+		return "", false
+	}
+	return target, true
+}
+
+func normalizeGatewayIVRSound(value string) (string, bool) {
+	sound := strings.TrimSpace(value)
+	if sound == "" {
+		return "", true
+	}
+	if len(sound) > 120 || strings.HasPrefix(sound, "/") || strings.Contains(sound, "..") {
+		return "", false
+	}
+	for _, ch := range sound {
+		if ch == '-' || ch == '_' || ch == '/' {
+			continue
+		}
+		if ch >= '0' && ch <= '9' {
+			continue
+		}
+		if ch >= 'A' && ch <= 'Z' {
+			continue
+		}
+		if ch >= 'a' && ch <= 'z' {
+			continue
+		}
+		return "", false
+	}
+	return sound, true
+}
+
 func (a *API) validRouteToNode(w http.ResponseWriter, accountID, routeTo string) bool {
 	routeTo = strings.TrimSpace(routeTo)
 	if routeTo == "" {
@@ -1147,6 +1284,8 @@ func (a *API) reconfigureAsterisk() {
 			CallbackBridgeCallers:     ep.CallbackBridgeCallers,
 			CallbackCallerAutoAnswer:  ep.CallbackCallerAutoAnswer,
 			CallbackCallerAutoSpeaker: ep.CallbackCallerAutoSpeaker,
+			GatewayIVREnabled:         ep.GatewayIVREnabled,
+			GatewayIVRSound:           ep.GatewayIVRSound,
 			Enabled:                   ep.Enabled,
 		})
 	}

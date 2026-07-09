@@ -78,41 +78,49 @@ func TestGatewayWelcomeAnnouncementIsScopedToGatewayIngress(t *testing.T) {
 		OutContext:              "from-simson-out",
 		NoAuthInboundExtensions: []string{"7013"},
 	}
-	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, "7009", cfg.NoAuthInboundExtensions, nil); err != nil {
+	endpoints := []SIPEndpointDef{
+		{Extension: "7013", Username: "7013", GatewayIVREnabled: true, GatewayIVRSound: "custom/site_7013_welcome", Enabled: true},
+		{Extension: "7014", Username: "7014", GatewayIVREnabled: false, Enabled: true},
+	}
+	cfg.NoAuthInboundExtensions = append(cfg.NoAuthInboundExtensions, "7014")
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, "7009", cfg.NoAuthInboundExtensions, endpoints); err != nil {
 		t.Fatal(err)
 	}
 
 	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
 	announcement := section(dialplan, "[simson-gateway-announcement]", "[simson-auto-answer]")
 	for _, want := range []string{
-		"Answer()",
-		"STAT(e,/usr/share/asterisk/sounds/custom/simson-architech-welcome.wav)",
-		"Playback(queue-thankyou&one-moment-please&pls-hold-while-try)",
-		"Playback(custom/simson-architech-welcome)",
+		"Progress()",
+		"TryExec(Playback(${ARG1},noanswer))",
+		"TryExec(Playback(queue-thankyou&one-moment-please&pls-hold-while-try,noanswer))",
 		"Return()",
 	} {
 		if !strings.Contains(announcement, want) {
 			t.Fatalf("gateway welcome announcement missing %q:\n%s", want, announcement)
 		}
 	}
+	if strings.Contains(announcement, "Answer()") {
+		t.Fatalf("gateway welcome announcement must not force-answer before routing:\n%s", announcement)
+	}
 
 	inboundSIP := section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n")
-	routeIdx := strings.Index(inboundSIP, "UserEvent(SimsonRoute")
-	authAnnouncementIdx := strings.Index(inboundSIP, `GosubIf($["${CHANNEL(pjsip,endpoint)}" = "${EXTEN}"]?simson-gateway-announcement,s,1)`)
-	if authAnnouncementIdx < 0 {
-		t.Fatalf("authenticated gateway ingress should conditionally play the announcement:\n%s", inboundSIP)
-	}
-	if routeIdx < 0 || routeIdx > authAnnouncementIdx {
-		t.Fatalf("authenticated gateway ingress must start routing before playing the announcement:\n%s", inboundSIP)
+	if strings.Contains(inboundSIP, "simson-gateway-announcement") {
+		t.Fatalf("authenticated catch-all routes should not play a global gateway announcement:\n%s", inboundSIP)
 	}
 
 	anonymous := section(dialplan, "\n[from-simson-anonymous]\n", "\n[from-simson-sip-outbound]")
 	if !strings.Contains(anonymous, "exten => 7013,1,NoOp(Simson anonymous gateway call") ||
-		!strings.Contains(anonymous, "Gosub(simson-gateway-announcement,s,1)") {
-		t.Fatalf("no-auth gateway ingress should play the announcement:\n%s", anonymous)
+		!strings.Contains(anonymous, "Gosub(simson-gateway-announcement,s,1(custom/site_7013_welcome))") {
+		t.Fatalf("no-auth gateway ingress with IVR enabled should play its configured announcement:\n%s", anonymous)
+	}
+	if !strings.Contains(anonymous, "exten => 7014,1,NoOp(Simson anonymous gateway call") {
+		t.Fatalf("second no-auth gateway missing:\n%s", anonymous)
+	}
+	if strings.Contains(section(anonymous, "exten => 7014,1", "\n[from-simson-sip-outbound]"), "simson-gateway-announcement") {
+		t.Fatalf("gateway without IVR enabled should not play an announcement:\n%s", anonymous)
 	}
 	anonRouteIdx := strings.Index(anonymous, "UserEvent(SimsonRoute")
-	anonAnnouncementIdx := strings.Index(anonymous, "Gosub(simson-gateway-announcement,s,1)")
+	anonAnnouncementIdx := strings.Index(anonymous, "Gosub(simson-gateway-announcement,s,1(custom/site_7013_welcome))")
 	if anonRouteIdx < 0 || anonAnnouncementIdx < 0 || anonRouteIdx > anonAnnouncementIdx {
 		t.Fatalf("no-auth gateway ingress must start routing before playing the announcement:\n%s", anonymous)
 	}

@@ -83,6 +83,15 @@ type SIPEndpoint struct {
 	// DefaultOutbound marks a gateway endpoint as this account's preferred
 	// outside-line trunk when a SIP phone dials a PSTN/GSM number without a prefix.
 	DefaultOutbound bool
+	// GatewayInboundMode controls PSTN/GSM/FXO calls that arrive through this
+	// gateway. Empty means the addon/global default. Supported values:
+	// haos_then_fallback, direct_target.
+	GatewayInboundMode  string
+	GatewayDirectTarget string
+	GatewayIVREnabled   bool
+	// GatewayIVRSound is an Asterisk sound name, e.g. custom/site_welcome.
+	// Empty uses the safe built-in wait prompt when GatewayIVREnabled is true.
+	GatewayIVRSound string
 	Enabled         bool
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
@@ -163,6 +172,10 @@ func (s *Store) migrate() error {
 			callback_caller_auto_answer INTEGER NOT NULL DEFAULT 0,
 			callback_caller_auto_speaker INTEGER NOT NULL DEFAULT 0,
 			default_outbound INTEGER NOT NULL DEFAULT 0,
+			gateway_inbound_mode TEXT NOT NULL DEFAULT '',
+			gateway_direct_target TEXT NOT NULL DEFAULT '',
+			gateway_ivr_enabled INTEGER NOT NULL DEFAULT 0,
+			gateway_ivr_sound TEXT NOT NULL DEFAULT '',
 			enabled     INTEGER NOT NULL DEFAULT 1,
 			created_at  DATETIME NOT NULL DEFAULT (datetime('now')),
 			updated_at  DATETIME NOT NULL DEFAULT (datetime('now'))
@@ -204,6 +217,18 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.ensureColumn("sip_endpoints", "default_outbound", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("sip_endpoints", "gateway_inbound_mode", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("sip_endpoints", "gateway_direct_target", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("sip_endpoints", "gateway_ivr_enabled", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("sip_endpoints", "gateway_ivr_sound", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return nil
@@ -417,11 +442,12 @@ func generateToken() (string, error) {
 // CreateSIPEndpoint inserts a new PJSIP endpoint record.
 func (s *Store) CreateSIPEndpoint(ep SIPEndpoint) error {
 	_, err := s.db.Exec(
-		`INSERT INTO sip_endpoints (id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, enabled)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sip_endpoints (id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, gateway_inbound_mode, gateway_direct_target, gateway_ivr_enabled, gateway_ivr_sound, enabled)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ep.ID, ep.AccountID, ep.Extension, ep.Username, ep.Password,
 		ep.Description, ep.RouteTo, boolInt(ep.VideoEnabled), boolInt(ep.AutoAnswer), ep.AutoAnswerCallers, boolInt(ep.AutoSpeaker), ep.AutoSpeakerCallers,
-		boolInt(ep.CallbackBridge), ep.CallbackBridgeCallers, boolInt(ep.CallbackCallerAutoAnswer), boolInt(ep.CallbackCallerAutoSpeaker), boolInt(ep.DefaultOutbound), boolInt(ep.Enabled),
+		boolInt(ep.CallbackBridge), ep.CallbackBridgeCallers, boolInt(ep.CallbackCallerAutoAnswer), boolInt(ep.CallbackCallerAutoSpeaker), boolInt(ep.DefaultOutbound),
+		ep.GatewayInboundMode, ep.GatewayDirectTarget, boolInt(ep.GatewayIVREnabled), ep.GatewayIVRSound, boolInt(ep.Enabled),
 	)
 	return err
 }
@@ -429,7 +455,7 @@ func (s *Store) CreateSIPEndpoint(ep SIPEndpoint) error {
 // GetSIPEndpoint returns a single endpoint by ID, or nil.
 func (s *Store) GetSIPEndpoint(id string) (*SIPEndpoint, error) {
 	row := s.db.QueryRow(
-		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, enabled, created_at, updated_at
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, gateway_inbound_mode, gateway_direct_target, gateway_ivr_enabled, gateway_ivr_sound, enabled, created_at, updated_at
 		 FROM sip_endpoints WHERE id = ?`, id)
 	return scanSIPEndpoint(row)
 }
@@ -437,7 +463,7 @@ func (s *Store) GetSIPEndpoint(id string) (*SIPEndpoint, error) {
 // GetSIPEndpointByExtension returns the first enabled endpoint with this extension, or nil.
 func (s *Store) GetSIPEndpointByExtension(extension string) (*SIPEndpoint, error) {
 	row := s.db.QueryRow(
-		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, enabled, created_at, updated_at
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, gateway_inbound_mode, gateway_direct_target, gateway_ivr_enabled, gateway_ivr_sound, enabled, created_at, updated_at
 		 FROM sip_endpoints WHERE extension = ? AND enabled = 1 LIMIT 1`, extension)
 	return scanSIPEndpoint(row)
 }
@@ -445,7 +471,7 @@ func (s *Store) GetSIPEndpointByExtension(extension string) (*SIPEndpoint, error
 // GetSIPEndpointByUsername returns the endpoint using this SIP auth username, or nil.
 func (s *Store) GetSIPEndpointByUsername(username string) (*SIPEndpoint, error) {
 	row := s.db.QueryRow(
-		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, enabled, created_at, updated_at
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, gateway_inbound_mode, gateway_direct_target, gateway_ivr_enabled, gateway_ivr_sound, enabled, created_at, updated_at
 		 FROM sip_endpoints WHERE username = ? LIMIT 1`, username)
 	return scanSIPEndpoint(row)
 }
@@ -453,7 +479,7 @@ func (s *Store) GetSIPEndpointByUsername(username string) (*SIPEndpoint, error) 
 // ListSIPEndpoints returns all endpoints for an account.
 func (s *Store) ListSIPEndpoints(accountID string) ([]SIPEndpoint, error) {
 	rows, err := s.db.Query(
-		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, enabled, created_at, updated_at
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, gateway_inbound_mode, gateway_direct_target, gateway_ivr_enabled, gateway_ivr_sound, enabled, created_at, updated_at
 		 FROM sip_endpoints WHERE account_id = ? ORDER BY extension`, accountID)
 	if err != nil {
 		return nil, err
@@ -474,7 +500,7 @@ func (s *Store) ListSIPEndpoints(accountID string) ([]SIPEndpoint, error) {
 // ListAllSIPEndpoints returns every endpoint (used for config generation).
 func (s *Store) ListAllSIPEndpoints() ([]SIPEndpoint, error) {
 	rows, err := s.db.Query(
-		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, enabled, created_at, updated_at
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, gateway_inbound_mode, gateway_direct_target, gateway_ivr_enabled, gateway_ivr_sound, enabled, created_at, updated_at
 		 FROM sip_endpoints ORDER BY account_id, extension`)
 	if err != nil {
 		return nil, err
@@ -503,6 +529,16 @@ func (s *Store) UpdateSIPEndpoint(id, description, password, routeTo string, vid
 	return err
 }
 
+// UpdateSIPEndpointGateway updates gateway-specific call handling fields.
+func (s *Store) UpdateSIPEndpointGateway(id, inboundMode, directTarget string, ivrEnabled bool, ivrSound string) error {
+	_, err := s.db.Exec(
+		`UPDATE sip_endpoints SET gateway_inbound_mode = ?, gateway_direct_target = ?, gateway_ivr_enabled = ?, gateway_ivr_sound = ?,
+		 updated_at = datetime('now') WHERE id = ?`,
+		inboundMode, directTarget, boolInt(ivrEnabled), ivrSound, id,
+	)
+	return err
+}
+
 // DeleteSIPEndpoint removes a SIP endpoint by ID.
 func (s *Store) DeleteSIPEndpoint(id string) error {
 	_, err := s.db.Exec(`DELETE FROM sip_endpoints WHERE id = ?`, id)
@@ -517,12 +553,13 @@ type rowScanner interface {
 
 func scanSIPEndpoint(row rowScanner) (*SIPEndpoint, error) {
 	ep := &SIPEndpoint{}
-	var videoEnabled, autoAnswer, autoSpeaker, callbackBridge, callbackCallerAutoAnswer, callbackCallerAutoSpeaker, defaultOutbound, enabled int
+	var videoEnabled, autoAnswer, autoSpeaker, callbackBridge, callbackCallerAutoAnswer, callbackCallerAutoSpeaker, defaultOutbound, gatewayIVREnabled, enabled int
 	err := row.Scan(
 		&ep.ID, &ep.AccountID, &ep.Extension, &ep.Username, &ep.Password,
 		&ep.Description, &ep.RouteTo, &videoEnabled, &autoAnswer, &ep.AutoAnswerCallers, &autoSpeaker, &ep.AutoSpeakerCallers,
 		&callbackBridge, &ep.CallbackBridgeCallers, &callbackCallerAutoAnswer, &callbackCallerAutoSpeaker,
-		&defaultOutbound, &enabled, &ep.CreatedAt, &ep.UpdatedAt,
+		&defaultOutbound, &ep.GatewayInboundMode, &ep.GatewayDirectTarget, &gatewayIVREnabled, &ep.GatewayIVRSound,
+		&enabled, &ep.CreatedAt, &ep.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -538,17 +575,19 @@ func scanSIPEndpoint(row rowScanner) (*SIPEndpoint, error) {
 	ep.CallbackCallerAutoAnswer = callbackCallerAutoAnswer == 1
 	ep.CallbackCallerAutoSpeaker = callbackCallerAutoSpeaker == 1
 	ep.DefaultOutbound = defaultOutbound == 1
+	ep.GatewayIVREnabled = gatewayIVREnabled == 1
 	return ep, nil
 }
 
 func scanSIPEndpointRow(rows *sql.Rows) (*SIPEndpoint, error) {
 	ep := &SIPEndpoint{}
-	var videoEnabled, autoAnswer, autoSpeaker, callbackBridge, callbackCallerAutoAnswer, callbackCallerAutoSpeaker, defaultOutbound, enabled int
+	var videoEnabled, autoAnswer, autoSpeaker, callbackBridge, callbackCallerAutoAnswer, callbackCallerAutoSpeaker, defaultOutbound, gatewayIVREnabled, enabled int
 	err := rows.Scan(
 		&ep.ID, &ep.AccountID, &ep.Extension, &ep.Username, &ep.Password,
 		&ep.Description, &ep.RouteTo, &videoEnabled, &autoAnswer, &ep.AutoAnswerCallers, &autoSpeaker, &ep.AutoSpeakerCallers,
 		&callbackBridge, &ep.CallbackBridgeCallers, &callbackCallerAutoAnswer, &callbackCallerAutoSpeaker,
-		&defaultOutbound, &enabled, &ep.CreatedAt, &ep.UpdatedAt,
+		&defaultOutbound, &ep.GatewayInboundMode, &ep.GatewayDirectTarget, &gatewayIVREnabled, &ep.GatewayIVRSound,
+		&enabled, &ep.CreatedAt, &ep.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -561,6 +600,7 @@ func scanSIPEndpointRow(rows *sql.Rows) (*SIPEndpoint, error) {
 	ep.CallbackCallerAutoAnswer = callbackCallerAutoAnswer == 1
 	ep.CallbackCallerAutoSpeaker = callbackCallerAutoSpeaker == 1
 	ep.DefaultOutbound = defaultOutbound == 1
+	ep.GatewayIVREnabled = gatewayIVREnabled == 1
 	return ep, nil
 }
 

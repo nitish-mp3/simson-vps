@@ -54,6 +54,8 @@ type SIPEndpointDef struct {
 	CallbackBridgeCallers     string
 	CallbackCallerAutoAnswer  bool
 	CallbackCallerAutoSpeaker bool
+	GatewayIVREnabled         bool
+	GatewayIVRSound           string
 	Enabled                   bool
 }
 
@@ -604,7 +606,7 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 
 	directEndpointRoutes := buildDirectEndpointDialplan(endpoints)
 	autoAnswerExtensionRoutes := buildAutoAnswerExtensionDialplan(endpoints)
-	anonymousRoutes := buildAnonymousInboundDialplan(noAuthInboundExtensions)
+	anonymousRoutes := buildAnonymousInboundDialplan(noAuthInboundExtensions, endpoints)
 	blfHints := buildBLFHintDialplan(endpoints)
 
 	content := fmt.Sprintf(
@@ -632,7 +634,6 @@ exten => _+X.,1,NoOp(Simson: incoming E.164 SIP call to ${EXTEN} from ${CALLERID
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
  same  => n,Set(JITTERBUFFER(adaptive)=default)
  same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
- same  => n,GosubIf($["${CHANNEL(pjsip,endpoint)}" = "${EXTEN}"]?simson-gateway-announcement,s,1)
  same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
  same  => n,Hangup()
 
@@ -640,7 +641,6 @@ exten => _X.,1,NoOp(Simson: incoming call to ${EXTEN} from ${CALLERID(num)})
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
  same  => n,Set(JITTERBUFFER(adaptive)=default)
  same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
- same  => n,GosubIf($["${CHANNEL(pjsip,endpoint)}" = "${EXTEN}"]?simson-gateway-announcement,s,1)
  same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
  same  => n,Hangup()
 
@@ -768,13 +768,13 @@ exten => s,1,NoOp(Simson outbound gateway post-answer DTMF ${ARG1})
  same  => n(done),Return()
 
 [simson-gateway-announcement]
-exten => s,1,NoOp(Simson inbound gateway welcome announcement)
- same  => n,Answer()
- same  => n,Wait(0.2)
- same  => n,GotoIf($["${STAT(e,/usr/share/asterisk/sounds/custom/simson-architech-welcome.wav)}" = "1"]?branded)
- same  => n,Playback(queue-thankyou&one-moment-please&pls-hold-while-try)
+exten => s,1,NoOp(Simson inbound gateway welcome announcement ${ARG1})
+ same  => n,GotoIf($["${ARG1}" = ""]?builtin)
+ same  => n,Progress()
+ same  => n,TryExec(Playback(${ARG1},noanswer))
  same  => n,Return()
- same  => n(branded),Playback(custom/simson-architech-welcome)
+ same  => n(builtin),Progress()
+ same  => n,TryExec(Playback(queue-thankyou&one-moment-please&pls-hold-while-try,noanswer))
  same  => n,Return()
 
 [simson-auto-answer]
@@ -973,7 +973,15 @@ func stringSet(values []string) map[string]struct{} {
 	return out
 }
 
-func buildAnonymousInboundDialplan(extensions []string) string {
+func buildAnonymousInboundDialplan(extensions []string, endpoints []SIPEndpointDef) string {
+	ivrByExt := map[string]string{}
+	for _, ep := range endpoints {
+		ext := sanitizeID(strings.TrimSpace(ep.Extension))
+		if ext == "" || !ep.GatewayIVREnabled {
+			continue
+		}
+		ivrByExt[ext] = sanitizeSoundName(ep.GatewayIVRSound)
+	}
 	seen := map[string]struct{}{}
 	var sb strings.Builder
 	for _, ext := range extensions {
@@ -988,9 +996,25 @@ func buildAnonymousInboundDialplan(extensions []string) string {
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson anonymous gateway call to ${EXTEN} from ${CALLERID(num)})\n", ext)
 		sb.WriteString(" same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})\n")
 		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},GatewaySource: ${EXTEN},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
-		sb.WriteString(" same  => n,Gosub(simson-gateway-announcement,s,1)\n")
+		if sound, ok := ivrByExt[ext]; ok {
+			fmt.Fprintf(&sb, " same  => n,Gosub(simson-gateway-announcement,s,1(%s))\n", sound)
+		}
 		sb.WriteString(" same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)\n")
 		sb.WriteString(" same  => n,Hangup()\n")
+	}
+	return sb.String()
+}
+
+func sanitizeSoundName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var sb strings.Builder
+	for _, r := range value {
+		if r == '/' || r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+		}
 	}
 	return sb.String()
 }
