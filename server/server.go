@@ -1231,6 +1231,7 @@ func (s *Server) handleCallReject(sess *hub.Session, env *protocol.Envelope) {
 
 	if existing.CallType == "sip" && s.asterisk != nil {
 		s.clearSIPOutboundRetry(payload.CallID)
+		s.releaseSIPBridgeTransferForCall(existing)
 		bridgeID := strings.TrimSpace(existing.SIPBridgeID)
 		go func() {
 			if err := s.asterisk.HangupCall(payload.CallID); err != nil {
@@ -1286,6 +1287,7 @@ func (s *Server) handleCallEnd(sess *hub.Session, env *protocol.Envelope) {
 
 	if existing.CallType == "sip" && s.asterisk != nil {
 		s.clearSIPOutboundRetry(payload.CallID)
+		s.releaseSIPBridgeTransferForCall(existing)
 		bridgeID := strings.TrimSpace(existing.SIPBridgeID)
 		go func() {
 			if err := s.asterisk.HangupCall(payload.CallID); err != nil {
@@ -1496,6 +1498,19 @@ func (s *Server) releaseSIPBridgeTransfer(bridgeID, ext string) {
 	s.sipBridgeTransfersMu.Lock()
 	delete(s.sipBridgeTransfers, key)
 	s.sipBridgeTransfersMu.Unlock()
+}
+
+func (s *Server) releaseSIPBridgeTransferForCall(c *calls.Call) {
+	if c == nil || strings.TrimSpace(c.SIPBridgeID) == "" {
+		return
+	}
+	for _, value := range []string{c.ToNode, c.FromNode} {
+		ext := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(value), "sip:"))
+		if ext == "" || !isLikelyInternalExtension(ext) {
+			continue
+		}
+		s.releaseSIPBridgeTransfer(c.SIPBridgeID, ext)
+	}
 }
 
 // --- WebRTC Signal Relay ---
@@ -2032,10 +2047,10 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 
 	if routeTo != "" {
 		if sipRouteExt, ok := normalizeSIPRouteTarget(routeTo); ok {
-			// This callback runs on the AMI read loop. Direct SIP routing uses AMI
-			// commands too, so it must run asynchronously or it can deadlock waiting
-			// for the response it is currently blocking from being read.
-			go s.routeIncomingSIPDirectToExtension(accountID, sipRouteExt, sourceExt, in)
+			// Track the source leg synchronously before any AMI originate work.
+			// Otherwise a fast caller-side CANCEL/BYE can arrive before the
+			// direct SIP target leg exists, leaving the gateway port busy.
+			s.routeIncomingSIPDirectToExtension(accountID, sipRouteExt, sourceExt, in)
 			return
 		}
 	}
@@ -2207,9 +2222,6 @@ func (s *Server) routeIncomingSIPDirectToExtension(accountID, ext, sourceExt str
 	if ep == nil || ep.AccountID != accountID || !ep.Enabled {
 		return failDirectRoute("target unavailable in account", map[string]any{"account": accountID})
 	}
-	if !s.asterisk.EndpointHasContacts(ext) {
-		return failDirectRoute("target is not registered", map[string]any{"account": accountID})
-	}
 	if !s.reserveSIPBridgeTransfer(in.BridgeID, ext) {
 		s.log.Warn("suppressing duplicate direct SIP route",
 			map[string]any{"bridge": in.BridgeID, "target_ext": ext, "extension": in.Extension})
@@ -2233,33 +2245,69 @@ func (s *Server) routeIncomingSIPDirectToExtension(accountID, ext, sourceExt str
 	}
 
 	s.asterisk.TrackCall(callID, in.Channel)
-	callerID := formatSIPCallerID(in.CallerID, in.CallerID)
-	if strings.TrimSpace(in.CallerID) == "" {
-		callerID = formatSIPCallerID("Gateway call", sourceExt)
-	}
-	_, err = s.asterisk.OriginateToExtension(
-		ext,
-		s.cfg.Asterisk.NodeContext,
-		in.BridgeID,
-		callerID,
-		callID,
-		"gateway:"+sourceExt,
-		s.cfg.CallTimeoutSec,
-	)
-	if err != nil {
-		s.calls.End(callID, "originate_failed")
-		s.asterisk.UntrackCall(callID)
-		s.releaseSIPBridgeTransfer(in.BridgeID, ext)
-		s.log.Error("direct SIP route originate failed",
-			map[string]any{"call_id": callID, "target_ext": ext, "err": err.Error()})
-		s.hangupAsteriskChannelAsync(in.Channel, "direct SIP route originate failed")
-		return false
-	}
+	s.asterisk.TrackPendingPrefix(callID, fmt.Sprintf("Local/%s@from-simson-extension-", ext))
+	s.asterisk.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", ext))
 
 	s.store.WriteAudit(accountID, "sip:"+sourceExt, "sip_incoming_direct_sip_route",
 		fmt.Sprintf("call=%s source=%s target=%s bridge=%s", callID, sourceExt, ext, in.BridgeID), "")
 	s.log.Info("incoming SIP call routed directly to SIP target",
 		map[string]any{"call_id": callID, "source_ext": sourceExt, "target_ext": ext, "extension": in.Extension})
+
+	go func() {
+		failStartedRoute := func(reason string, fields map[string]any) {
+			if fields == nil {
+				fields = map[string]any{}
+			}
+			fields["call_id"] = callID
+			fields["source_ext"] = sourceExt
+			fields["target_ext"] = ext
+			s.log.Warn("direct SIP route failed after source leg was tracked", map[string]any{"reason": reason, "fields": fields})
+			if ended, ok := s.calls.End(callID, reason); ok {
+				s.notifyCallStatus(ended)
+			}
+			if err := s.asterisk.HangupCall(callID); err != nil {
+				s.log.Warn("failed to hang up tracked direct SIP route after failure",
+					map[string]any{"call_id": callID, "err": err.Error()})
+			}
+			if strings.TrimSpace(in.BridgeID) != "" {
+				if err := s.asterisk.HangupBridge(in.BridgeID, ""); err != nil {
+					s.log.Warn("failed to hang up direct SIP route bridge after failure",
+						map[string]any{"call_id": callID, "bridge": in.BridgeID, "err": err.Error()})
+				}
+			}
+			s.asterisk.UntrackCall(callID)
+			s.releaseSIPBridgeTransfer(in.BridgeID, ext)
+		}
+
+		if current := s.calls.Get(callID); current == nil || current.State == calls.StateEnded {
+			s.releaseSIPBridgeTransfer(in.BridgeID, ext)
+			s.asterisk.UntrackCall(callID)
+			return
+		}
+		if !s.asterisk.EndpointHasContacts(ext) {
+			failStartedRoute("target is not registered", map[string]any{"account": accountID})
+			return
+		}
+		callerID := formatSIPCallerID(in.CallerID, in.CallerID)
+		if strings.TrimSpace(in.CallerID) == "" {
+			callerID = formatSIPCallerID("Gateway call", sourceExt)
+		}
+		_, err := s.asterisk.OriginateToExtension(
+			ext,
+			s.cfg.Asterisk.NodeContext,
+			in.BridgeID,
+			callerID,
+			callID,
+			"gateway:"+sourceExt,
+			s.cfg.CallTimeoutSec,
+		)
+		if err != nil {
+			s.log.Error("direct SIP route originate failed",
+				map[string]any{"call_id": callID, "target_ext": ext, "err": err.Error()})
+			failStartedRoute("originate_failed", map[string]any{"err": err.Error()})
+			return
+		}
+	}()
 	return true
 }
 
@@ -3134,6 +3182,7 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 		return
 	}
 	s.finishSIPIntercomCallback(callID, "", false)
+	s.releaseSIPBridgeTransferForCall(c)
 	s.notifyCallStatus(c)
 	go func() {
 		if err := s.asterisk.HangupCallExcept(callID, channel); err != nil {
@@ -3205,6 +3254,7 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 		if ended {
 			s.clearSIPOutboundRetry(callID)
 			s.finishSIPIntercomCallback(callID, "", true)
+			s.releaseSIPBridgeTransferForCall(c)
 			s.notifyCallStatus(c)
 			if s.asterisk != nil {
 				bridgeID := strings.TrimSpace(c.SIPBridgeID)
