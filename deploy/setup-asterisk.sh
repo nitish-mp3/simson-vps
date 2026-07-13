@@ -62,8 +62,14 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     asterisk-modules \
     asterisk-config \
     asterisk-core-sounds-en \
+	    espeak-ng \
+	    sox \
     coturn \
     fail2ban
+
+if id simson >/dev/null 2>&1; then
+    install -d -o simson -g asterisk -m 0755 /var/lib/asterisk/sounds/simson
+fi
 
 # ── Generate credentials ─────────────────────────────────────
 section "Generating credentials"

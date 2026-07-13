@@ -56,7 +56,10 @@ type SIPEndpointDef struct {
 	CallbackCallerAutoSpeaker bool
 	GatewayIVREnabled         bool
 	GatewayIVRSound           string
-	Enabled                   bool
+	// AnswerAnnouncement is played to the receiving phone after answer and
+	// before bridging. It is never played to the caller.
+	AnswerAnnouncement string
+	Enabled            bool
 }
 
 // Setup writes all Asterisk config files needed by the Simson VPS and reloads
@@ -1109,7 +1112,8 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^)))\n")
 		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE})))\n")
-		sb.WriteString(" same  => n(simson-dial),Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},${SIMSON_DIAL_OPTIONS})\n")
+		appendCalledPartyAnnouncement(&sb, ep.AnswerAnnouncement)
+		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},${SIMSON_DIAL_OPTIONS})\n")
 		sb.WriteString(" same  => n,Hangup()\n")
 		if ep.CallbackBridge {
 			fmt.Fprintf(&sb, "exten => *%s,1,NoOp(Simson callback feature code ${CALLERID(num)} -> %s)\n", ext, ext)
@@ -1249,7 +1253,7 @@ func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
 	seen := map[string]struct{}{}
 	var sb strings.Builder
 	for _, ep := range endpoints {
-		if !ep.Enabled || !ep.AutoAnswer {
+		if !ep.Enabled || (!ep.AutoAnswer && strings.TrimSpace(ep.AnswerAnnouncement) == "") {
 			continue
 		}
 		ext := sanitizeID(strings.TrimSpace(ep.Extension))
@@ -1260,15 +1264,33 @@ func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
 			continue
 		}
 		seen[ext] = struct{}{}
-		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson dial auto-answer SIP endpoint ${EXTEN})\n", ext)
-		appendConditionalAutoAnswerMode(&sb, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.AutoSpeakerCallers)
+		if ep.AutoAnswer {
+			fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson dial auto-answer SIP endpoint ${EXTEN})\n", ext)
+			appendConditionalAutoAnswerMode(&sb, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.AutoSpeakerCallers)
+		} else {
+			fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson called-party prompt SIP endpoint ${EXTEN})\n", ext)
+			sb.WriteString(" same  => n,Set(SIMSON_AUTO_ANSWER_MODE=)\n")
+		}
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))\n")
 		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE})))\n")
-		sb.WriteString(" same  => n(simson-dial),Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=120},${SIMSON_DIAL_OPTIONS})\n")
+		appendCalledPartyAnnouncement(&sb, ep.AnswerAnnouncement)
+		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=120},${SIMSON_DIAL_OPTIONS})\n")
 		sb.WriteString(" same  => n,Hangup()\n\n")
 	}
 	return sb.String()
+}
+
+// appendCalledPartyAnnouncement adds Dial's A(x) option. Asterisk plays x only
+// to the called endpoint after it answers and bridges the caller afterwards.
+// The sound name is generated from an admin-validated, extension-free path.
+func appendCalledPartyAnnouncement(sb *strings.Builder, sound string) {
+	sound = sanitizeSoundName(sound)
+	if sound == "" {
+		sb.WriteString(" same  => n(simson-dial),NoOp(Simson called-party prompt disabled)\n")
+		return
+	}
+	fmt.Fprintf(sb, " same  => n(simson-dial),Set(SIMSON_DIAL_OPTIONS=${SIMSON_DIAL_OPTIONS}A(%s))\n", sound)
 }
 
 func parseAutoAnswerCallers(callers string) []string {

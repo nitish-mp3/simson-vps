@@ -80,7 +80,7 @@ _try_download_release() {
 # --- System packages ---
 echo "[1/8] Installing system packages..."
 apt-get update -qq
-apt-get install -y -qq curl sqlite3 git ufw
+apt-get install -y -qq curl sqlite3 git ufw espeak-ng sox
 
 # Open ports required by Caddy.
 # SSH (22) is explicitly allowed first so you can't lock yourself out.
@@ -169,6 +169,9 @@ fi
 # --- Create directories ---
 echo "[4/8] Setting up directories..."
 mkdir -p "$INSTALL_DIR"
+if getent group asterisk >/dev/null 2>&1; then
+    install -d -o "$SERVICE_USER" -g asterisk -m 0755 /var/lib/asterisk/sounds/simson
+fi
 
 # --- Get source code (needed for config even if we download a binary) ---
 echo "[5/8] Getting source code..."

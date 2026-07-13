@@ -48,6 +48,12 @@ func TestOpenMigratesLegacySIPEndpointsWithVideoFlag(t *testing.T) {
 	if door.AutoAnswer {
 		t.Fatal("legacy SIP endpoint should not auto-answer by default")
 	}
+	if door.AnswerAnnouncement != "" {
+		t.Fatalf("legacy SIP endpoint should not gain an answer announcement: %q", door.AnswerAnnouncement)
+	}
+	if door.AnswerAnnouncementText != "" {
+		t.Fatalf("legacy SIP endpoint should not gain answer prompt text: %q", door.AnswerAnnouncementText)
+	}
 
 	if err := store.UpdateSIPEndpoint(door.ID, door.Description, door.Password, door.RouteTo, true, true, "1025", true, "1602", true, "1025", true, true, false, door.Enabled); err != nil {
 		t.Fatal(err)
@@ -73,5 +79,18 @@ func TestOpenMigratesLegacySIPEndpointsWithVideoFlag(t *testing.T) {
 	}
 	if !door.CallbackBridge || door.CallbackBridgeCallers != "1025" || !door.CallbackCallerAutoAnswer || !door.CallbackCallerAutoSpeaker {
 		t.Fatalf("callback bridge fields were not persisted: %#v", door)
+	}
+	if err := store.UpdateSIPEndpointAnnouncement(door.ID, "simson/site-a/call_for_amit", "Call for Amit."); err != nil {
+		t.Fatal(err)
+	}
+	door, err = store.GetSIPEndpoint("door")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if door.AnswerAnnouncement != "simson/site-a/call_for_amit" {
+		t.Fatalf("answer announcement update was not persisted: %q", door.AnswerAnnouncement)
+	}
+	if door.AnswerAnnouncementText != "Call for Amit." {
+		t.Fatalf("answer prompt text update was not persisted: %q", door.AnswerAnnouncementText)
 	}
 }

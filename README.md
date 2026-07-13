@@ -229,6 +229,9 @@ Environment overrides (in `/opt/simson/.env`):
 | `SIMSON_ADMIN_TOKEN` | Admin API bearer token |
 | `SIMSON_DB_PATH` | SQLite database path |
 | `SIMSON_LISTEN` | Listen address |
+| `SIMSON_TTS_SOUND_DIR` | Generated Asterisk prompt cache (default `/var/lib/asterisk/sounds/simson`) |
+| `SIMSON_TTS_VOICE` | Offline eSpeak NG voice (default `en-us`) |
+| `SIMSON_TTS_RATE` | Prompt speed in words per minute (default `150`) |
 
 ## Monitoring
 

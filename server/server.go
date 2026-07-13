@@ -3743,6 +3743,7 @@ func (s *Server) configureAsteriskFromStore() {
 			CallbackCallerAutoSpeaker: ep.CallbackCallerAutoSpeaker,
 			GatewayIVREnabled:         ep.GatewayIVREnabled,
 			GatewayIVRSound:           ep.GatewayIVRSound,
+			AnswerAnnouncement:        ep.AnswerAnnouncement,
 			Enabled:                   ep.Enabled,
 		})
 	}

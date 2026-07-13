@@ -27,13 +27,20 @@ type API struct {
 	calls    *calls.Manager
 	log      *logging.Logger
 	asterisk *asterisk.Router // nil when Asterisk disabled
+	tts      *promptSynthesizer
 	doorMu   sync.Mutex
 	doorLast map[string]time.Time
 }
 
 // New creates an admin API.
 func New(cfg *config.Config, st *store.Store, h *hub.Hub, cm *calls.Manager, log *logging.Logger) *API {
-	return &API{cfg: cfg, store: st, hub: h, calls: cm, log: log, doorLast: make(map[string]time.Time)}
+	tts := newPromptSynthesizer()
+	if tts.Available() {
+		log.Info("offline SIP prompt speech engine ready", map[string]any{"voice": tts.voice, "rate": tts.rate})
+	} else {
+		log.Warn("offline SIP prompt speech engine unavailable", map[string]any{"required": "espeak-ng and sox"})
+	}
+	return &API{cfg: cfg, store: st, hub: h, calls: cm, log: log, tts: tts, doorLast: make(map[string]time.Time)}
 }
 
 // SetAsterisk injects the AMI router so admin endpoints can trigger reloads.
@@ -450,7 +457,11 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		GatewayDirectTarget       string `json:"gateway_direct_target"`
 		GatewayIVREnabled         *bool  `json:"gateway_ivr_enabled"`
 		GatewayIVRSound           string `json:"gateway_ivr_sound"`
-		Enabled                   *bool  `json:"enabled"`
+		AnswerAnnouncementText    string `json:"answer_announcement_text"`
+		// AnswerAnnouncement is retained for backward compatibility with an
+		// older admin UI that exposed Asterisk sound paths directly.
+		AnswerAnnouncement string `json:"answer_announcement"`
+		Enabled            *bool  `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -492,6 +503,16 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	gatewayIVRSound, ok := normalizeGatewayIVRSound(body.GatewayIVRSound)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_ivr_sound must be an Asterisk sound name such as custom/site_welcome"})
+		return
+	}
+	answerAnnouncement, ok := normalizeGatewayIVRSound(body.AnswerAnnouncement)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "answer_announcement must be an Asterisk sound name such as custom/call_for_amit"})
+		return
+	}
+	answerAnnouncementText, err := normalizeAnswerPromptText(body.AnswerAnnouncementText)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
 	if body.Extension == "" || body.Username == "" || body.Password == "" {
@@ -578,11 +599,20 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if body.GatewayIVREnabled != nil {
 		gatewayIVREnabled = *body.GatewayIVREnabled
 	}
-	// Generate a random ID
+	// Generate a random ID before synthesis so the cache remains stable if the
+	// extension or label changes later.
 	idb := make([]byte, 16)
 	rand.Read(idb) //nolint:errcheck
+	endpointID := hex.EncodeToString(idb)
+	if answerAnnouncementText != "" {
+		answerAnnouncement, err = a.tts.Generate(r.Context(), accountID, endpointID, answerAnnouncementText)
+		if err != nil {
+			a.writePromptTTSError(w, err)
+			return
+		}
+	}
 	ep := store.SIPEndpoint{
-		ID:                        hex.EncodeToString(idb),
+		ID:                        endpointID,
 		AccountID:                 accountID,
 		Extension:                 body.Extension,
 		Username:                  body.Username,
@@ -603,9 +633,12 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		GatewayDirectTarget:       gatewayDirectTarget,
 		GatewayIVREnabled:         gatewayIVREnabled,
 		GatewayIVRSound:           gatewayIVRSound,
+		AnswerAnnouncement:        answerAnnouncement,
+		AnswerAnnouncementText:    answerAnnouncementText,
 		Enabled:                   enabled,
 	}
 	if err := a.store.CreateSIPEndpoint(ep); err != nil {
+		a.tts.CleanupEndpoint(accountID, endpointID, "")
 		a.log.Error("create sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
@@ -667,6 +700,8 @@ func (a *API) enrichSIPEndpoints(eps []store.SIPEndpoint) []map[string]any {
 			"gateway_direct_target":        ep.GatewayDirectTarget,
 			"gateway_ivr_enabled":          ep.GatewayIVREnabled,
 			"gateway_ivr_sound":            ep.GatewayIVRSound,
+			"answer_announcement":          ep.AnswerAnnouncement,
+			"answer_announcement_text":     ep.AnswerAnnouncementText,
 			"enabled":                      ep.Enabled,
 			"created_at":                   ep.CreatedAt,
 			"updated_at":                   ep.UpdatedAt,
@@ -707,6 +742,7 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 		return
 	}
+	previousAnswerAnnouncement := ep.AnswerAnnouncement
 	var body struct {
 		Description               *string `json:"description"`
 		Password                  *string `json:"password"`
@@ -725,6 +761,8 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		GatewayDirectTarget       *string `json:"gateway_direct_target"`
 		GatewayIVREnabled         *bool   `json:"gateway_ivr_enabled"`
 		GatewayIVRSound           *string `json:"gateway_ivr_sound"`
+		AnswerAnnouncement        *string `json:"answer_announcement"`
+		AnswerAnnouncementText    *string `json:"answer_announcement_text"`
 		Enabled                   *bool   `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -820,20 +858,69 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		ep.GatewayIVRSound = sound
 		gatewayFieldsChanged = true
 	}
+	announcementChanged := false
+	generatedAnnouncement := false
+	if body.AnswerAnnouncementText != nil {
+		text, err := normalizeAnswerPromptText(*body.AnswerAnnouncementText)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		sound := ""
+		if text != "" {
+			sound, err = a.tts.Generate(r.Context(), ep.AccountID, ep.ID, text)
+			if err != nil {
+				a.writePromptTTSError(w, err)
+				return
+			}
+		}
+		ep.AnswerAnnouncement = sound
+		ep.AnswerAnnouncementText = text
+		announcementChanged = true
+		generatedAnnouncement = true
+	} else if body.AnswerAnnouncement != nil {
+		sound, ok := normalizeGatewayIVRSound(*body.AnswerAnnouncement)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "answer_announcement must be an Asterisk sound name such as custom/call_for_amit"})
+			return
+		}
+		ep.AnswerAnnouncement = sound
+		ep.AnswerAnnouncementText = ""
+		announcementChanged = true
+	}
 	if body.Enabled != nil {
 		ep.Enabled = *body.Enabled
 	}
 	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.VideoEnabled, ep.AutoAnswer, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.AutoSpeakerCallers, ep.CallbackBridge, ep.CallbackBridgeCallers, ep.CallbackCallerAutoAnswer, ep.CallbackCallerAutoSpeaker, ep.DefaultOutbound, ep.Enabled); err != nil {
+		if generatedAnnouncement {
+			a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement)
+		}
 		a.log.Error("update sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
 	}
 	if gatewayFieldsChanged {
 		if err := a.store.UpdateSIPEndpointGateway(ep.ID, ep.GatewayInboundMode, ep.GatewayDirectTarget, ep.GatewayIVREnabled, ep.GatewayIVRSound); err != nil {
+			if generatedAnnouncement {
+				a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement)
+			}
 			a.log.Error("update sip gateway settings", map[string]any{"err": err.Error()})
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 			return
 		}
+	}
+	if announcementChanged {
+		if err := a.store.UpdateSIPEndpointAnnouncement(ep.ID, ep.AnswerAnnouncement, ep.AnswerAnnouncementText); err != nil {
+			if generatedAnnouncement {
+				a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement)
+			}
+			a.log.Error("update SIP answer announcement", map[string]any{"err": err.Error()})
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+			return
+		}
+		// The cache is endpoint-scoped, so this also safely removes an older
+		// generated file when a legacy client switches back to a manual sound.
+		a.tts.CleanupEndpoint(ep.AccountID, ep.ID, ep.AnswerAnnouncement)
 	}
 	if ep.DefaultOutbound {
 		a.clearOtherDefaultOutboundGateways(ep.AccountID, ep.ID)
@@ -876,10 +963,19 @@ func (a *API) clearOtherDefaultOutboundGateways(accountID, keepID string) {
 
 func (a *API) handleDeleteSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	ep, err := a.store.GetSIPEndpoint(id)
+	if err != nil {
+		a.log.Error("load sip endpoint before delete", map[string]any{"err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
 	if err := a.store.DeleteSIPEndpoint(id); err != nil {
 		a.log.Error("delete sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
+	}
+	if ep != nil {
+		a.tts.CleanupEndpoint(ep.AccountID, ep.ID, "")
 	}
 	a.reconfigureAsterisk()
 	w.WriteHeader(http.StatusNoContent)
@@ -1286,6 +1382,7 @@ func (a *API) reconfigureAsterisk() {
 			CallbackCallerAutoSpeaker: ep.CallbackCallerAutoSpeaker,
 			GatewayIVREnabled:         ep.GatewayIVREnabled,
 			GatewayIVRSound:           ep.GatewayIVRSound,
+			AnswerAnnouncement:        ep.AnswerAnnouncement,
 			Enabled:                   ep.Enabled,
 		})
 	}

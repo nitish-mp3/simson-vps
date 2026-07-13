@@ -279,6 +279,45 @@ func TestRouteSpecificAutoAnswerHeadersAreConditional(t *testing.T) {
 	}
 }
 
+func TestReceivingPhoneAnnouncementIsCalledPartyOnly(t *testing.T) {
+	root := t.TempDir()
+	cfg := SetupConfig{
+		SIPDomain:   "simson-vps.vipsy.in",
+		InContext:   "from-simson-sip",
+		NodeContext: "from-simson-node",
+		OutContext:  "from-simson-out",
+	}
+	endpoints := []SIPEndpointDef{
+		{ID: "caller", Extension: "1025", Username: "1025", Password: "secret", Enabled: true},
+		{
+			ID:                 "target",
+			Extension:          "1603",
+			Username:           "1603",
+			Password:           "secret",
+			AnswerAnnouncement: "custom/call_for_amit",
+			Enabled:            true,
+		},
+	}
+	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, "7009", nil, endpoints); err != nil {
+		t.Fatal(err)
+	}
+
+	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
+	direct := section(dialplan, "exten => 1603,1,NoOp(Simson direct SIP endpoint", "exten => _+X.")
+	if !strings.Contains(direct, "A(custom/call_for_amit)") {
+		t.Fatal("direct SIP route must play the target endpoint announcement")
+	}
+	if strings.Contains(direct, "A(custom/call_for_amit:") {
+		t.Fatal("announcement must not define a caller-side sound")
+	}
+
+	nodeRoute := section(dialplan, "[from-simson-extension]", "[from-simson-out]")
+	if !strings.Contains(nodeRoute, "exten => 1603,1,NoOp(Simson called-party prompt SIP endpoint") ||
+		!strings.Contains(nodeRoute, "A(custom/call_for_amit)") {
+		t.Fatal("node/VPS-originated route must preserve the receiving-phone announcement")
+	}
+}
+
 func TestCallbackBridgeDialplanIsAllowlistedAndCarriesBothAutoModes(t *testing.T) {
 	root := t.TempDir()
 	cfg := SetupConfig{
