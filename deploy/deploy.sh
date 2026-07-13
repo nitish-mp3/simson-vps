@@ -328,7 +328,9 @@ EnvironmentFile=/opt/simson/.env
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/simson
+# Generated receiving-phone prompts are written here and read by Asterisk.
+# Keep this narrow exception rather than weakening ProtectSystem=strict.
+ReadWritePaths=/opt/simson /var/lib/asterisk/sounds/simson
 PrivateTmp=true
 StandardOutput=journal
 StandardError=journal

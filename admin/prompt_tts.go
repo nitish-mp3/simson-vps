@@ -20,6 +20,7 @@ import (
 const maxAnswerPromptRunes = 300
 
 var errPromptTTSEngineUnavailable = errors.New("offline prompt speech engine is unavailable")
+var errPromptStorageUnavailable = errors.New("prompt sound storage is unavailable")
 
 // promptSynthesizer turns account-scoped endpoint text into an Asterisk sound.
 // Commands receive text as a direct argv value, never through a shell.
@@ -98,12 +99,12 @@ func (p *promptSynthesizer) Generate(ctx context.Context, accountID, endpointID,
 		return soundName, nil
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("create prompt cache: %w", err)
+		return "", fmt.Errorf("%w: create prompt cache: %v", errPromptStorageUnavailable, err)
 	}
 
 	rawFile, err := os.CreateTemp(dir, ".speech-*.wav")
 	if err != nil {
-		return "", fmt.Errorf("create speech temporary file: %w", err)
+		return "", fmt.Errorf("%w: create speech temporary file: %v", errPromptStorageUnavailable, err)
 	}
 	rawPath := rawFile.Name()
 	if err := rawFile.Close(); err != nil {
@@ -112,7 +113,7 @@ func (p *promptSynthesizer) Generate(ctx context.Context, accountID, endpointID,
 	convertedFile, err := os.CreateTemp(dir, ".prompt-*.wav")
 	if err != nil {
 		_ = os.Remove(rawPath)
-		return "", fmt.Errorf("create prompt temporary file: %w", err)
+		return "", fmt.Errorf("%w: create prompt temporary file: %v", errPromptStorageUnavailable, err)
 	}
 	convertedPath := convertedFile.Name()
 	_ = convertedFile.Close()
@@ -133,10 +134,10 @@ func (p *promptSynthesizer) Generate(ctx context.Context, accountID, endpointID,
 		return "", fmt.Errorf("convert speech for Asterisk: %w: %s", err, clippedCommandOutput(output))
 	}
 	if err := os.Chmod(convertedPath, 0o644); err != nil {
-		return "", fmt.Errorf("set prompt permissions: %w", err)
+		return "", fmt.Errorf("%w: set prompt permissions: %v", errPromptStorageUnavailable, err)
 	}
 	if err := os.Rename(convertedPath, finalPath); err != nil {
-		return "", fmt.Errorf("publish prompt atomically: %w", err)
+		return "", fmt.Errorf("%w: publish prompt atomically: %v", errPromptStorageUnavailable, err)
 	}
 	return soundName, nil
 }
@@ -180,6 +181,12 @@ func (a *API) writePromptTTSError(w http.ResponseWriter, err error) {
 	if errors.Is(err, errPromptTTSEngineUnavailable) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error": "prompt speech generation is not installed on the VPS; install espeak-ng and sox",
+		})
+		return
+	}
+	if errors.Is(err, errPromptStorageUnavailable) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "receiving-phone prompt storage is unavailable on the VPS; check the simson service write-path configuration",
 		})
 		return
 	}

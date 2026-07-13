@@ -30,6 +30,24 @@ func TestPromptSynthesizerFailsClosedWithoutEngine(t *testing.T) {
 	}
 }
 
+func TestPromptSynthesizerClassifiesReadOnlyStorage(t *testing.T) {
+	// A regular file cannot contain the account-scoped prompt directory. This
+	// produces the same MkdirAll failure on Windows and Unix without relying on
+	// chmod semantics or the user running the test.
+	root := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(root, []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := &promptSynthesizer{
+		root: root, voice: "en-us", rate: "150",
+		espeak: "unused-espeak", sox: "unused-sox",
+	}
+	_, err := p.Generate(context.Background(), "site-a", "endpoint-a", "Call for Amit.")
+	if !errors.Is(err, errPromptStorageUnavailable) {
+		t.Fatalf("expected storage-unavailable error, got %v", err)
+	}
+}
+
 func TestPromptCleanupIsEndpointAndAccountScoped(t *testing.T) {
 	root := t.TempDir()
 	p := &promptSynthesizer{root: root}
