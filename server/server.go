@@ -131,6 +131,43 @@ func (s *Server) Store() *store.Store { return s.store }
 // Asterisk returns the AMI router, or nil if Asterisk is disabled.
 func (s *Server) Asterisk() *asterisk.Router { return s.asterisk }
 
+// Shutdown clears Simson-owned media legs before the control plane exits.
+// Asterisk channels can outlive this process during a deploy/restart; if a
+// gateway call survives that window, some FXO devices keep the physical line
+// seized until the gateway is manually cleared. Keep this scoped to calls that
+// Simson created/tracked so unrelated PBX traffic is not touched.
+func (s *Server) Shutdown() {
+	if s.asterisk == nil {
+		return
+	}
+
+	active := s.calls.ListAll()
+	cleared := 0
+	for _, c := range active {
+		if c == nil || c.CallType != "sip" || (c.State != calls.StateRinging && c.State != calls.StateActive) {
+			continue
+		}
+		if err := s.asterisk.HangupCall(c.ID); err != nil {
+			s.log.Warn("failed to hang up SIP call during shutdown",
+				map[string]any{"call_id": c.ID, "err": err.Error()})
+		}
+		if c.SIPBridgeID != "" {
+			if err := s.asterisk.HangupBridge(c.SIPBridgeID, ""); err != nil {
+				s.log.Warn("failed to hang up SIP bridge during shutdown",
+					map[string]any{"call_id": c.ID, "bridge": c.SIPBridgeID, "err": err.Error()})
+			}
+		}
+		if ended, ok := s.calls.End(c.ID, "server_shutdown"); ok {
+			s.notifyCallStatus(ended)
+		}
+		s.asterisk.UntrackCall(c.ID)
+		cleared++
+	}
+	if cleared > 0 {
+		s.log.Warn("shutdown cleared active Simson SIP calls", map[string]any{"calls": cleared})
+	}
+}
+
 // HandleNodeWebRTCConfig returns ICE/TURN and SIP-over-WebSocket credentials
 // to an authenticated addon node. This lets browser cards join the central
 // Asterisk ConfBridge without users manually copying SIP passwords into each
@@ -3113,10 +3150,11 @@ func (s *Server) hangupAsteriskChannelAsync(channel, reason string) {
 }
 
 // handleSIPChannelHangup cleans up a call when the SIP channel hangs up.
-func (s *Server) handleSIPChannelHangup(channel string) {
+func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 	if s.asterisk == nil {
 		return
 	}
+	channel := info.Channel
 	if s.shouldIgnoreSIPIntercomOriginalHangup(channel) {
 		s.log.Debug("ignoring original caller-leg hangup after callback replacement",
 			map[string]any{"channel": channel})
@@ -3184,20 +3222,68 @@ func (s *Server) handleSIPChannelHangup(channel string) {
 	s.finishSIPIntercomCallback(callID, "", false)
 	s.releaseSIPBridgeTransferForCall(c)
 	s.notifyCallStatus(c)
-	go func() {
-		if err := s.asterisk.HangupCallExcept(callID, channel); err != nil {
+
+	exceptChannel := channel
+	if s.isDirectGatewaySIPRoute(c) {
+		// FXO/GSM gateways can keep the physical line seized if we exclude the
+		// channel that emitted Hangup while Asterisk is still unwinding Local/
+		// PJSIP bridge legs. For direct gateway routes, any side hanging up is
+		// final, so aggressively clear every tracked/bridged leg.
+		exceptChannel = ""
+	}
+	cleanupSIPBridge := func(attempt int) {
+		if exceptChannel == "" {
+			if err := s.asterisk.HangupCall(callID); err != nil {
+				s.log.Warn("failed to force hang up SIP bridge legs",
+					map[string]any{"call_id": callID, "attempt": attempt, "err": err.Error()})
+			}
+		} else if err := s.asterisk.HangupCallExcept(callID, exceptChannel); err != nil {
 			s.log.Warn("failed to hang up remaining SIP bridge legs",
-				map[string]any{"call_id": callID, "channel": channel, "err": err.Error()})
+				map[string]any{"call_id": callID, "channel": channel, "attempt": attempt, "err": err.Error()})
 		}
 		if c.SIPBridgeID != "" {
-			if err := s.asterisk.HangupBridge(c.SIPBridgeID, channel); err != nil {
+			if err := s.asterisk.HangupBridge(c.SIPBridgeID, exceptChannel); err != nil {
 				s.log.Warn("failed to hang up remaining ConfBridge legs",
-					map[string]any{"call_id": callID, "bridge": c.SIPBridgeID, "channel": channel, "err": err.Error()})
+					map[string]any{"call_id": callID, "bridge": c.SIPBridgeID, "channel": channel, "attempt": attempt, "err": err.Error()})
 			}
+		}
+	}
+	if exceptChannel == "" {
+		// This runs on Asterisk's AMI event reader. Never call a synchronous AMI
+		// action from here: it would wait for a response that this same reader must
+		// consume. Send immediate non-blocking BYEs for the tracked gateway legs,
+		// then let the delayed cleanup below catch any late Local/ConfBridge legs.
+		if err := s.asterisk.HangupTrackedCallNoWait(callID, ""); err != nil {
+			s.log.Warn("failed to send immediate direct gateway cleanup",
+				map[string]any{"call_id": callID, "err": err.Error()})
+		}
+	}
+	go func() {
+		startAttempt := 1
+		endAttempt := 2
+		if exceptChannel == "" {
+			// Give the AMI event loop a chance to consume the no-wait Hangup
+			// responses before issuing the slower sweep for late bridge legs.
+			time.Sleep(300 * time.Millisecond)
+			startAttempt = 1
+			endAttempt = 3
+		}
+		for attempt := startAttempt; attempt <= endAttempt; attempt++ {
+			if attempt > 1 {
+				time.Sleep(650 * time.Millisecond)
+			}
+			cleanupSIPBridge(attempt)
 		}
 		s.asterisk.UntrackCall(callID)
 	}()
-	s.log.Info("SIP call ended by channel hangup", map[string]any{"call_id": callID, "channel": channel})
+	s.log.Info("SIP call ended by channel hangup", map[string]any{
+		"call_id":    callID,
+		"channel":    channel,
+		"cause":      info.Cause,
+		"cause_text": info.CauseText,
+		"unique_id":  info.UniqueID,
+		"linked_id":  info.LinkedID,
+	})
 }
 
 // handleSIPOriginateResult is the AMI callback when an async Originate

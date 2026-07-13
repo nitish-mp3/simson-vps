@@ -43,6 +43,17 @@ type ContactStatus struct {
 	LatencyMS  string `json:"latency_ms,omitempty"`
 }
 
+// ChannelHangup describes why Asterisk tore down a channel. Retaining the AMI
+// cause fields is important for distinguishing a handset BYE from network loss,
+// malformed SIP, congestion, or a server-initiated cleanup.
+type ChannelHangup struct {
+	Channel   string
+	Cause     string
+	CauseText string
+	UniqueID  string
+	LinkedID  string
+}
+
 // Router orchestrates call routing between VPS Asterisk (via AMI) and the
 // Simson WebSocket nodes.
 //
@@ -57,7 +68,7 @@ type Router struct {
 	// Callbacks set by server.go after construction.
 	OnIncomingCall     func(in IncomingSIPCall)                    // SIP phone dialled in
 	OnIntercomCallback func(req IntercomCallbackRequest)           // SIP direct route requested callback bridge
-	OnChannelHangup    func(channel string)                        // SIP channel hung up
+	OnChannelHangup    func(info ChannelHangup)                    // SIP channel hung up
 	OnOriginateResult  func(callID string, ok bool, reason string) // async Originate outcome
 
 	// call tracking
@@ -461,6 +472,37 @@ func (r *Router) HangupCall(callID string) error {
 // the channel that emitted the event.
 func (r *Router) HangupCallExcept(callID, exceptChannel string) error {
 	return r.hangupCall(callID, exceptChannel)
+}
+
+// HangupTrackedCallNoWait sends hangup requests only for channels already
+// tracked in memory. It deliberately does not issue AMI Command actions or
+// wait for replies, so it is safe to call from an AMI event callback.
+//
+// The AMI reader invokes callbacks serially. Waiting for an AMI response from
+// inside one of those callbacks deadlocks the reader until its timeout expires.
+func (r *Router) HangupTrackedCallNoWait(callID, exceptChannel string) error {
+	exceptChannel = normalizeChannel(exceptChannel)
+	channels := r.ChannelsForCall(callID)
+	if len(channels) == 0 {
+		return nil
+	}
+
+	var firstErr error
+	seen := make(map[string]struct{}, len(channels))
+	for _, ch := range channels {
+		ch = normalizeChannel(ch)
+		if ch == "" || (exceptChannel != "" && ch == exceptChannel) {
+			continue
+		}
+		if _, ok := seen[ch]; ok {
+			continue
+		}
+		seen[ch] = struct{}{}
+		if err := r.ami.HangupChannelNoWait(ch); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // HangupBridge hangs up every active Asterisk channel currently parked in a
@@ -906,10 +948,34 @@ func (r *Router) handleHangup(ev Event) {
 		return
 	}
 
-	r.log.Debug("asterisk channel hangup", map[string]any{"channel": channel})
+	info := ChannelHangup{
+		Channel:   channel,
+		Cause:     strings.TrimSpace(ev.Fields["Cause"]),
+		CauseText: strings.TrimSpace(ev.Fields["Cause-txt"]),
+		UniqueID:  strings.TrimSpace(ev.Fields["Uniqueid"]),
+		LinkedID:  strings.TrimSpace(ev.Fields["Linkedid"]),
+	}
+	r.mu.RLock()
+	_, _, tracked := r.findCallByChannelLocked(channel)
+	r.mu.RUnlock()
+	fields := map[string]any{
+		"channel":    info.Channel,
+		"cause":      info.Cause,
+		"cause_text": info.CauseText,
+		"unique_id":  info.UniqueID,
+		"linked_id":  info.LinkedID,
+	}
+	if tracked {
+		r.log.Info("asterisk channel hangup", fields)
+	} else {
+		// Public SIP scanners generate a large volume of rejected anonymous
+		// channels. They are useful at debug level, but must not crowd out real
+		// call diagnostics or grow production journals at INFO level.
+		r.log.Debug("untracked asterisk channel hangup", fields)
+	}
 
 	if r.OnChannelHangup != nil {
-		r.OnChannelHangup(channel)
+		r.OnChannelHangup(info)
 	}
 
 	// Clean up tracking.

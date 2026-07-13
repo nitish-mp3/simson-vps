@@ -311,6 +311,8 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 			"direct_media=no\n" +
 			"rtp_symmetric=yes\n" +
 			"rtp_keepalive=2\n" +
+			"rtp_timeout=0\n" +
+			"rtp_timeout_hold=0\n" +
 			"force_rport=yes\n" +
 			"rewrite_contact=yes\n" +
 			"identify_by=auth_username,username\n" +
@@ -334,6 +336,8 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 			"direct_media=no\n" +
 			"rtp_symmetric=yes\n" +
 			"rtp_keepalive=2\n" +
+			"rtp_timeout=0\n" +
+			"rtp_timeout_hold=0\n" +
 			"force_rport=yes\n" +
 			"rewrite_contact=yes\n" +
 			"identify_by=ip\n" +
@@ -351,6 +355,8 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 				"direct_media=no\n" +
 				"rtp_symmetric=yes\n" +
 				"rtp_keepalive=2\n" +
+				"rtp_timeout=0\n" +
+				"rtp_timeout_hold=0\n" +
 				"force_rport=yes\n" +
 				"rewrite_contact=yes\n" +
 				"ice_support=no\n" +
@@ -367,6 +373,8 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 			"direct_media=no\n" +
 			"rtp_symmetric=yes\n" +
 			"rtp_keepalive=2\n" +
+			"rtp_timeout=0\n" +
+			"rtp_timeout_hold=0\n" +
 			"force_rport=yes\n" +
 			"rewrite_contact=yes\n" +
 			"identify_by=auth_username,username\n" +
@@ -510,9 +518,10 @@ internal_sample_rate=8000
 mixing_interval=20
 
 ; User profile — applied to every participant in a Simson ConfBridge.
-; Keep RTP flowing while a caller is alone in the bridge. Some SIP clients hang
-; up after a few seconds of silence/no RTP while the browser is still doing
-; REGISTER, DTLS, and ICE.
+; RTP NAT bindings are maintained by the endpoint-level rtp_keepalive setting.
+; Do not add another jitter buffer here: every real media channel receives one
+; adaptive buffer in the dialplan. Do not inject hold music while a participant
+; is alone because it can leak ringback/hold audio across bridge transitions.
 [simson_user]
 type=user
 quiet=yes
@@ -520,8 +529,7 @@ announce_join_leave=no
 announce_only_user=no
 wait_marked=no
 end_marked=no
-music_on_hold_when_empty=yes
-jitterbuffer=yes
+music_on_hold_when_empty=no
 `
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(content), 0640)
@@ -1081,6 +1089,7 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		}
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
+		sb.WriteString(" same  => n,Set(JITTERBUFFER(adaptive)=default)\n")
 		targetAutoModePrepared := false
 		if ep.CallbackBridge {
 			if aa, ok := autoAnswer[ext]; ok {
@@ -1094,9 +1103,12 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		if aa, ok := autoAnswer[ext]; ok && !targetAutoModePrepared {
 			appendConditionalAutoAnswerMode(&sb, aa.AutoAnswerCallers, aa.AutoSpeaker, aa.AutoSpeakerCallers)
 		}
-		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=T)\n")
+		// Apply one adaptive buffer to the called RTP leg too. The inbound
+		// caller received its buffer above, so each direction is protected
+		// without stacking a second ConfBridge jitter buffer.
+		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^)))\n")
 		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
-		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-auto-answer^s^1(${SIMSON_AUTO_ANSWER_MODE})))\n")
+		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE})))\n")
 		sb.WriteString(" same  => n(simson-dial),Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},${SIMSON_DIAL_OPTIONS})\n")
 		sb.WriteString(" same  => n,Hangup()\n")
 		if ep.CallbackBridge {

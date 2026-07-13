@@ -60,12 +60,35 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	if !strings.Contains(dialplan, "Set(JITTERBUFFER(adaptive)=default)") {
 		t.Fatal("generated dialplan should enable adaptive jitter buffering on bridge media paths")
 	}
+	directDesk := section(dialplan, "exten => 1025,1,NoOp(Simson direct SIP endpoint", "exten => _+X.")
+	if strings.Count(directDesk, "Set(JITTERBUFFER(adaptive)=default)") != 1 {
+		t.Fatalf("direct SIP caller leg should receive exactly one adaptive jitter buffer:\n%s", directDesk)
+	}
+	if !strings.Contains(directDesk, "Tb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^))") {
+		t.Fatalf("direct SIP called leg should receive the media pre-dial handler:\n%s", directDesk)
+	}
 	inboundSIP := section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n")
 	if strings.Contains(inboundSIP, "@7009") {
 		t.Fatal("SIP-phone PSTN calls should route through SimsonRoute, not a hardwired default trunk")
 	}
 	if !strings.Contains(inboundSIP, "UserEvent(SimsonRoute") {
 		t.Fatal("SIP-phone PSTN calls must reach SimsonRoute for per-account gateway selection")
+	}
+}
+
+func TestConfBridgeDoesNotStackJitterOrInjectHoldAudio(t *testing.T) {
+	root := t.TempDir()
+	if err := writeConfBridgeConf(root); err != nil {
+		t.Fatal(err)
+	}
+
+	conf := readTestFile(t, filepath.Join(root, "confbridge.conf.d", "simson.conf"))
+	user := section(conf, "[simson_user]", "\n[nonexistent]")
+	if strings.Contains(user, "jitterbuffer=yes") {
+		t.Fatalf("ConfBridge must not stack a second jitter buffer on dialplan-buffered channels:\n%s", user)
+	}
+	if !strings.Contains(user, "music_on_hold_when_empty=no") {
+		t.Fatalf("ConfBridge must not leak hold/ringback audio while a participant is alone:\n%s", user)
 	}
 }
 
@@ -213,8 +236,8 @@ func TestRouteSpecificAutoAnswerHeadersAreConditional(t *testing.T) {
 	if !strings.Contains(target, "SIMSON_AUTO_ANSWER_MODE=speaker") {
 		t.Fatal("route-specific auto-speaker should set speaker mode only after caller match")
 	}
-	if !strings.Contains(target, "b(simson-auto-answer^s^1(${SIMSON_AUTO_ANSWER_MODE}))") {
-		t.Fatal("direct SIP route should inject auto-answer headers with a called-channel pre-dial handler")
+	if !strings.Contains(target, "b(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE}))") {
+		t.Fatal("direct SIP route should apply called-leg jitter and auto-answer headers in one pre-dial handler")
 	}
 	if !strings.Contains(target, "Goto(simson-auto-answer-done)") {
 		t.Fatal("route-specific auto-answer must fall through to a normal dial when caller does not match")

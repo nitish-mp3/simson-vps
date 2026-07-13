@@ -186,6 +186,7 @@ func main() {
 	select {
 	case <-done:
 		log.Info("shutting down", nil)
+		srv.Shutdown()
 	case err := <-listenErr:
 		log.Error("listen error", map[string]any{"err": err.Error()})
 		os.Exit(1)
