@@ -1011,7 +1011,19 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		a.clearOtherDefaultOutboundGateways(ep.AccountID, ep.ID)
 	}
 	a.reconfigureAsterisk()
-	writeJSON(w, http.StatusOK, ep)
+	// Return the committed database row, not the in-memory candidate. This lets
+	// the addon verify that the deployed VPS persisted every new field.
+	fresh, err := a.store.GetSIPEndpoint(ep.ID)
+	if err != nil || fresh == nil {
+		fields := map[string]any{"id": ep.ID}
+		if err != nil {
+			fields["err"] = err.Error()
+		}
+		a.log.Error("reload sip endpoint after update", fields)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "SIP device was updated but could not be verified"})
+		return
+	}
+	writeJSON(w, http.StatusOK, a.enrichSIPEndpoints([]store.SIPEndpoint{*fresh})[0])
 }
 
 func (a *API) clearOtherDefaultOutboundGateways(accountID, keepID string) {
