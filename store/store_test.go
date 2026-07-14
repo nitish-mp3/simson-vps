@@ -54,6 +54,12 @@ func TestOpenMigratesLegacySIPEndpointsWithVideoFlag(t *testing.T) {
 	if door.AnswerAnnouncementText != "" {
 		t.Fatalf("legacy SIP endpoint should not gain answer prompt text: %q", door.AnswerAnnouncementText)
 	}
+	if door.PreRingAnnouncement != "" || door.PreRingAnnouncementText != "" {
+		t.Fatalf("legacy SIP endpoint should not gain a pre-ring prompt: %#v", door)
+	}
+	if door.CallDurationRules != "{}" {
+		t.Fatalf("legacy SIP endpoint should default to unlimited calls, got %q", door.CallDurationRules)
+	}
 
 	if err := store.UpdateSIPEndpoint(door.ID, door.Description, door.Password, door.RouteTo, true, true, "1025", true, "1602", true, "1025", true, true, false, door.Enabled); err != nil {
 		t.Fatal(err)
@@ -92,5 +98,29 @@ func TestOpenMigratesLegacySIPEndpointsWithVideoFlag(t *testing.T) {
 	}
 	if door.AnswerAnnouncementText != "Call for Amit." {
 		t.Fatalf("answer prompt text update was not persisted: %q", door.AnswerAnnouncementText)
+	}
+
+	if err := store.UpdateSIPEndpointCallBehavior(
+		door.ID,
+		"simson/site-a/after_answer",
+		"Call for Amit.",
+		"simson/site-a/before_ring",
+		"Please wait while I call Amit.",
+		`{"1025":15}`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	door, err = store.GetSIPEndpoint("door")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if door.AnswerAnnouncement != "simson/site-a/after_answer" || door.AnswerAnnouncementText != "Call for Amit." {
+		t.Fatalf("answer-stage prompt was not persisted: %#v", door)
+	}
+	if door.PreRingAnnouncement != "simson/site-a/before_ring" || door.PreRingAnnouncementText != "Please wait while I call Amit." {
+		t.Fatalf("pre-ring prompt was not persisted: %#v", door)
+	}
+	if door.CallDurationRules != `{"1025":15}` {
+		t.Fatalf("route duration rules were not persisted: %q", door.CallDurationRules)
 	}
 }

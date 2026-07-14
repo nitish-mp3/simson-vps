@@ -505,7 +505,8 @@ func (s *Server) HandleNodeSIPIntercom(w http.ResponseWriter, r *http.Request) {
 
 	sourceLegCallerID := target
 	targetLegCallerName := firstNonBlank(body.CallerID, sourceLabel, source)
-	if _, err := s.asterisk.OriginateIntercomCallback(source, target, sourceLegCallerID, source, targetLegCallerName, callID, sourceMode, targetMode, timeoutSec); err != nil {
+	maxConnectedSec := endpointCallDurationForSource(targetEP, source)
+	if _, err := s.asterisk.OriginateIntercomCallback(source, target, sourceLegCallerID, source, targetLegCallerName, callID, sourceMode, targetMode, targetEP.PreRingAnnouncement, maxConnectedSec, timeoutSec); err != nil {
 		if ended, ok := s.calls.End(callID, "originate_failed"); ok {
 			s.notifyCallStatus(ended)
 		}
@@ -2457,7 +2458,8 @@ func (s *Server) handleSIPIntercomCallback(req asterisk.IntercomCallbackRequest)
 				time.Sleep(900 * time.Millisecond)
 			}
 		}
-		if _, err := s.asterisk.OriginateIntercomCallback(source, target, sourceLegCallerID, source, targetLegCallerName, callID, sourceMode, targetMode, s.cfg.CallTimeoutSec); err != nil {
+		maxConnectedSec := endpointCallDurationForSource(targetEP, source)
+		if _, err := s.asterisk.OriginateIntercomCallback(source, target, sourceLegCallerID, source, targetLegCallerName, callID, sourceMode, targetMode, "", maxConnectedSec, s.cfg.CallTimeoutSec); err != nil {
 			if ended, ok := s.calls.End(callID, "originate_failed"); ok {
 				s.notifyCallStatus(ended)
 			}
@@ -2622,6 +2624,21 @@ func autoAnswerModeForEndpointCaller(ep *store.SIPEndpoint, source string) strin
 		return "speaker"
 	}
 	return "normal"
+}
+
+func endpointCallDurationForSource(ep *store.SIPEndpoint, source string) int {
+	if ep == nil {
+		return 0
+	}
+	rules := map[string]int{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(ep.CallDurationRules)), &rules); err != nil {
+		return 0
+	}
+	seconds := rules[strings.TrimSpace(source)]
+	if seconds < 1 || seconds > 86400 {
+		return 0
+	}
+	return seconds
 }
 
 func callerAllowedForAutoAnswer(source, allowlist string) bool {
@@ -3744,6 +3761,8 @@ func (s *Server) configureAsteriskFromStore() {
 			GatewayIVREnabled:         ep.GatewayIVREnabled,
 			GatewayIVRSound:           ep.GatewayIVRSound,
 			AnswerAnnouncement:        ep.AnswerAnnouncement,
+			PreRingAnnouncement:       ep.PreRingAnnouncement,
+			CallDurationRules:         ep.CallDurationRules,
 			Enabled:                   ep.Enabled,
 		})
 	}

@@ -115,6 +115,20 @@ on that answered SIP leg. Simson then rings the configured indoor SIP phone
 through a native `Dial` bridge so compatible devices negotiate live audio and
 H.264 video without changing the existing browser or gateway audio paths.
 
+## SIP Call Stages and Route Limits
+
+SIP endpoint policy supports two independent generated prompts. A **before
+ringing** prompt is sent to the caller as early media and completes before the
+destination starts ringing. The existing **after answer** prompt uses
+Asterisk's called-party-only `Dial(A(...))` option, so only the receiving phone
+hears it before the caller is bridged.
+
+An endpoint can also store exact source-to-target connected-call limits. These
+are account-scoped rules such as `1027 -> 1028 = 15 seconds`; Asterisk applies
+`Dial(L(...))` only when the source matches, and starts the timer after answer.
+Unlisted routes remain unlimited, and ringing or prompt playback does not
+consume the connected-call allowance.
+
 ## Quick Start
 
 ### 1. Build
@@ -229,7 +243,7 @@ Environment overrides (in `/opt/simson/.env`):
 | `SIMSON_ADMIN_TOKEN` | Admin API bearer token |
 | `SIMSON_DB_PATH` | SQLite database path |
 | `SIMSON_LISTEN` | Listen address |
-| `SIMSON_TTS_SOUND_DIR` | Generated Asterisk prompt cache (default `/var/lib/asterisk/sounds/simson`) |
+| `SIMSON_TTS_SOUND_DIR` | Generated Asterisk prompt cache (default `/usr/share/asterisk/sounds/simson`) |
 | `SIMSON_TTS_VOICE` | Offline eSpeak NG voice (default `en-us`) |
 | `SIMSON_TTS_RATE` | Prompt speed in words per minute (default `150`) |
 

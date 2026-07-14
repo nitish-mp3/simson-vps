@@ -68,7 +68,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     fail2ban
 
 if id simson >/dev/null 2>&1; then
-    install -d -o simson -g asterisk -m 0755 /var/lib/asterisk/sounds/simson
+    install -d -o simson -g asterisk -m 0755 /usr/share/asterisk/sounds/simson
 fi
 
 # ── Generate credentials ─────────────────────────────────────

@@ -30,6 +30,14 @@ func TestPromptSynthesizerFailsClosedWithoutEngine(t *testing.T) {
 	}
 }
 
+func TestPromptSynthesizerUsesAsteriskDataSoundRoot(t *testing.T) {
+	t.Setenv("SIMSON_TTS_SOUND_DIR", "")
+	p := newPromptSynthesizer()
+	if p.root != defaultPromptSoundRoot {
+		t.Fatalf("unexpected default prompt root: %q", p.root)
+	}
+}
+
 func TestPromptSynthesizerClassifiesReadOnlyStorage(t *testing.T) {
 	// A regular file cannot contain the account-scoped prompt directory. This
 	// produces the same MkdirAll failure on Windows and Unix without relying on
@@ -58,16 +66,25 @@ func TestPromptCleanupIsEndpointAndAccountScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 	keep := "endpoint_" + endpoint + "_keep.wav"
+	secondKeep := "endpoint_" + endpoint + "_second.wav"
 	remove := "endpoint_" + endpoint + "_old.wav"
 	other := "endpoint_" + shortPromptHash("endpoint-b", 16) + "_other.wav"
-	for _, name := range []string{keep, remove, other} {
+	for _, name := range []string{keep, secondKeep, remove, other} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("wav"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	p.CleanupEndpoint("site-a", "endpoint-a", filepath.ToSlash(filepath.Join("simson", account, strings.TrimSuffix(keep, ".wav"))))
+	p.CleanupEndpoint(
+		"site-a",
+		"endpoint-a",
+		filepath.ToSlash(filepath.Join("simson", account, strings.TrimSuffix(keep, ".wav"))),
+		filepath.ToSlash(filepath.Join("simson", account, strings.TrimSuffix(secondKeep, ".wav"))),
+	)
 	if _, err := os.Stat(filepath.Join(dir, keep)); err != nil {
 		t.Fatalf("current prompt was removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, secondKeep)); err != nil {
+		t.Fatalf("second current prompt was removed: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, remove)); !os.IsNotExist(err) {
 		t.Fatalf("stale prompt was not removed: %v", err)

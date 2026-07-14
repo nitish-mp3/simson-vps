@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -438,30 +439,33 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Extension                 string `json:"extension"`
-		Username                  string `json:"username"`
-		Password                  string `json:"password"`
-		Description               string `json:"description"`
-		RouteTo                   string `json:"route_to"`
-		VideoEnabled              *bool  `json:"video_enabled"`
-		AutoAnswer                *bool  `json:"auto_answer"`
-		AutoAnswerCallers         string `json:"auto_answer_callers"`
-		AutoSpeaker               *bool  `json:"auto_speaker"`
-		AutoSpeakerCallers        string `json:"auto_speaker_callers"`
-		CallbackBridge            *bool  `json:"callback_bridge"`
-		CallbackBridgeCallers     string `json:"callback_bridge_callers"`
-		CallbackCallerAutoAnswer  *bool  `json:"callback_caller_auto_answer"`
-		CallbackCallerAutoSpeaker *bool  `json:"callback_caller_auto_speaker"`
-		DefaultOutbound           *bool  `json:"default_outbound"`
-		GatewayInboundMode        string `json:"gateway_inbound_mode"`
-		GatewayDirectTarget       string `json:"gateway_direct_target"`
-		GatewayIVREnabled         *bool  `json:"gateway_ivr_enabled"`
-		GatewayIVRSound           string `json:"gateway_ivr_sound"`
-		AnswerAnnouncementText    string `json:"answer_announcement_text"`
+		Extension                 string         `json:"extension"`
+		Username                  string         `json:"username"`
+		Password                  string         `json:"password"`
+		Description               string         `json:"description"`
+		RouteTo                   string         `json:"route_to"`
+		VideoEnabled              *bool          `json:"video_enabled"`
+		AutoAnswer                *bool          `json:"auto_answer"`
+		AutoAnswerCallers         string         `json:"auto_answer_callers"`
+		AutoSpeaker               *bool          `json:"auto_speaker"`
+		AutoSpeakerCallers        string         `json:"auto_speaker_callers"`
+		CallbackBridge            *bool          `json:"callback_bridge"`
+		CallbackBridgeCallers     string         `json:"callback_bridge_callers"`
+		CallbackCallerAutoAnswer  *bool          `json:"callback_caller_auto_answer"`
+		CallbackCallerAutoSpeaker *bool          `json:"callback_caller_auto_speaker"`
+		DefaultOutbound           *bool          `json:"default_outbound"`
+		GatewayInboundMode        string         `json:"gateway_inbound_mode"`
+		GatewayDirectTarget       string         `json:"gateway_direct_target"`
+		GatewayIVREnabled         *bool          `json:"gateway_ivr_enabled"`
+		GatewayIVRSound           string         `json:"gateway_ivr_sound"`
+		AnswerAnnouncementText    string         `json:"answer_announcement_text"`
+		PreRingAnnouncementText   string         `json:"pre_ring_announcement_text"`
+		CallDurationRules         map[string]int `json:"call_duration_rules"`
 		// AnswerAnnouncement is retained for backward compatibility with an
 		// older admin UI that exposed Asterisk sound paths directly.
-		AnswerAnnouncement string `json:"answer_announcement"`
-		Enabled            *bool  `json:"enabled"`
+		AnswerAnnouncement  string `json:"answer_announcement"`
+		PreRingAnnouncement string `json:"pre_ring_announcement"`
+		Enabled             *bool  `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -511,6 +515,16 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	answerAnnouncementText, err := normalizeAnswerPromptText(body.AnswerAnnouncementText)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	preRingAnnouncement, ok := normalizeGatewayIVRSound(body.PreRingAnnouncement)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "pre_ring_announcement must be an Asterisk sound name such as custom/please_wait"})
+		return
+	}
+	preRingAnnouncementText, err := normalizeAnswerPromptText(body.PreRingAnnouncementText)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
@@ -611,6 +625,20 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if preRingAnnouncementText != "" {
+		preRingAnnouncement, err = a.tts.Generate(r.Context(), accountID, endpointID, preRingAnnouncementText)
+		if err != nil {
+			a.tts.CleanupEndpoint(accountID, endpointID)
+			a.writePromptTTSError(w, err)
+			return
+		}
+	}
+	callDurationRules, err := a.normalizeCallDurationRules(accountID, body.Extension, body.CallDurationRules)
+	if err != nil {
+		a.tts.CleanupEndpoint(accountID, endpointID)
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
 	ep := store.SIPEndpoint{
 		ID:                        endpointID,
 		AccountID:                 accountID,
@@ -635,10 +663,13 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		GatewayIVRSound:           gatewayIVRSound,
 		AnswerAnnouncement:        answerAnnouncement,
 		AnswerAnnouncementText:    answerAnnouncementText,
+		PreRingAnnouncement:       preRingAnnouncement,
+		PreRingAnnouncementText:   preRingAnnouncementText,
+		CallDurationRules:         callDurationRules,
 		Enabled:                   enabled,
 	}
 	if err := a.store.CreateSIPEndpoint(ep); err != nil {
-		a.tts.CleanupEndpoint(accountID, endpointID, "")
+		a.tts.CleanupEndpoint(accountID, endpointID)
 		a.log.Error("create sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
@@ -702,6 +733,9 @@ func (a *API) enrichSIPEndpoints(eps []store.SIPEndpoint) []map[string]any {
 			"gateway_ivr_sound":            ep.GatewayIVRSound,
 			"answer_announcement":          ep.AnswerAnnouncement,
 			"answer_announcement_text":     ep.AnswerAnnouncementText,
+			"pre_ring_announcement":        ep.PreRingAnnouncement,
+			"pre_ring_announcement_text":   ep.PreRingAnnouncementText,
+			"call_duration_rules":          ep.CallDurationRules,
 			"enabled":                      ep.Enabled,
 			"created_at":                   ep.CreatedAt,
 			"updated_at":                   ep.UpdatedAt,
@@ -743,27 +777,31 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	previousAnswerAnnouncement := ep.AnswerAnnouncement
+	previousPreRingAnnouncement := ep.PreRingAnnouncement
 	var body struct {
-		Description               *string `json:"description"`
-		Password                  *string `json:"password"`
-		RouteTo                   *string `json:"route_to"`
-		VideoEnabled              *bool   `json:"video_enabled"`
-		AutoAnswer                *bool   `json:"auto_answer"`
-		AutoAnswerCallers         *string `json:"auto_answer_callers"`
-		AutoSpeaker               *bool   `json:"auto_speaker"`
-		AutoSpeakerCallers        *string `json:"auto_speaker_callers"`
-		CallbackBridge            *bool   `json:"callback_bridge"`
-		CallbackBridgeCallers     *string `json:"callback_bridge_callers"`
-		CallbackCallerAutoAnswer  *bool   `json:"callback_caller_auto_answer"`
-		CallbackCallerAutoSpeaker *bool   `json:"callback_caller_auto_speaker"`
-		DefaultOutbound           *bool   `json:"default_outbound"`
-		GatewayInboundMode        *string `json:"gateway_inbound_mode"`
-		GatewayDirectTarget       *string `json:"gateway_direct_target"`
-		GatewayIVREnabled         *bool   `json:"gateway_ivr_enabled"`
-		GatewayIVRSound           *string `json:"gateway_ivr_sound"`
-		AnswerAnnouncement        *string `json:"answer_announcement"`
-		AnswerAnnouncementText    *string `json:"answer_announcement_text"`
-		Enabled                   *bool   `json:"enabled"`
+		Description               *string         `json:"description"`
+		Password                  *string         `json:"password"`
+		RouteTo                   *string         `json:"route_to"`
+		VideoEnabled              *bool           `json:"video_enabled"`
+		AutoAnswer                *bool           `json:"auto_answer"`
+		AutoAnswerCallers         *string         `json:"auto_answer_callers"`
+		AutoSpeaker               *bool           `json:"auto_speaker"`
+		AutoSpeakerCallers        *string         `json:"auto_speaker_callers"`
+		CallbackBridge            *bool           `json:"callback_bridge"`
+		CallbackBridgeCallers     *string         `json:"callback_bridge_callers"`
+		CallbackCallerAutoAnswer  *bool           `json:"callback_caller_auto_answer"`
+		CallbackCallerAutoSpeaker *bool           `json:"callback_caller_auto_speaker"`
+		DefaultOutbound           *bool           `json:"default_outbound"`
+		GatewayInboundMode        *string         `json:"gateway_inbound_mode"`
+		GatewayDirectTarget       *string         `json:"gateway_direct_target"`
+		GatewayIVREnabled         *bool           `json:"gateway_ivr_enabled"`
+		GatewayIVRSound           *string         `json:"gateway_ivr_sound"`
+		AnswerAnnouncement        *string         `json:"answer_announcement"`
+		AnswerAnnouncementText    *string         `json:"answer_announcement_text"`
+		PreRingAnnouncement       *string         `json:"pre_ring_announcement"`
+		PreRingAnnouncementText   *string         `json:"pre_ring_announcement_text"`
+		CallDurationRules         *map[string]int `json:"call_duration_rules"`
+		Enabled                   *bool           `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -858,7 +896,7 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		ep.GatewayIVRSound = sound
 		gatewayFieldsChanged = true
 	}
-	announcementChanged := false
+	callBehaviorChanged := false
 	generatedAnnouncement := false
 	if body.AnswerAnnouncementText != nil {
 		text, err := normalizeAnswerPromptText(*body.AnswerAnnouncementText)
@@ -876,7 +914,7 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		}
 		ep.AnswerAnnouncement = sound
 		ep.AnswerAnnouncementText = text
-		announcementChanged = true
+		callBehaviorChanged = true
 		generatedAnnouncement = true
 	} else if body.AnswerAnnouncement != nil {
 		sound, ok := normalizeGatewayIVRSound(*body.AnswerAnnouncement)
@@ -886,14 +924,61 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		}
 		ep.AnswerAnnouncement = sound
 		ep.AnswerAnnouncementText = ""
-		announcementChanged = true
+		callBehaviorChanged = true
+	}
+	if body.PreRingAnnouncementText != nil {
+		text, err := normalizeAnswerPromptText(*body.PreRingAnnouncementText)
+		if err != nil {
+			if generatedAnnouncement {
+				a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement, previousPreRingAnnouncement)
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		sound := ""
+		if text != "" {
+			sound, err = a.tts.Generate(r.Context(), ep.AccountID, ep.ID, text)
+			if err != nil {
+				a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement, previousPreRingAnnouncement)
+				a.writePromptTTSError(w, err)
+				return
+			}
+		}
+		ep.PreRingAnnouncement = sound
+		ep.PreRingAnnouncementText = text
+		callBehaviorChanged = true
+		generatedAnnouncement = true
+	} else if body.PreRingAnnouncement != nil {
+		sound, ok := normalizeGatewayIVRSound(*body.PreRingAnnouncement)
+		if !ok {
+			if generatedAnnouncement {
+				a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement, previousPreRingAnnouncement)
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "pre_ring_announcement must be an Asterisk sound name such as custom/please_wait"})
+			return
+		}
+		ep.PreRingAnnouncement = sound
+		ep.PreRingAnnouncementText = ""
+		callBehaviorChanged = true
+	}
+	if body.CallDurationRules != nil {
+		rules, err := a.normalizeCallDurationRules(ep.AccountID, ep.Extension, *body.CallDurationRules)
+		if err != nil {
+			if generatedAnnouncement {
+				a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement, previousPreRingAnnouncement)
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		ep.CallDurationRules = rules
+		callBehaviorChanged = true
 	}
 	if body.Enabled != nil {
 		ep.Enabled = *body.Enabled
 	}
 	if err := a.store.UpdateSIPEndpoint(ep.ID, ep.Description, ep.Password, ep.RouteTo, ep.VideoEnabled, ep.AutoAnswer, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.AutoSpeakerCallers, ep.CallbackBridge, ep.CallbackBridgeCallers, ep.CallbackCallerAutoAnswer, ep.CallbackCallerAutoSpeaker, ep.DefaultOutbound, ep.Enabled); err != nil {
 		if generatedAnnouncement {
-			a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement)
+			a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement, previousPreRingAnnouncement)
 		}
 		a.log.Error("update sip endpoint", map[string]any{"err": err.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
@@ -902,25 +987,25 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	if gatewayFieldsChanged {
 		if err := a.store.UpdateSIPEndpointGateway(ep.ID, ep.GatewayInboundMode, ep.GatewayDirectTarget, ep.GatewayIVREnabled, ep.GatewayIVRSound); err != nil {
 			if generatedAnnouncement {
-				a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement)
+				a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement, previousPreRingAnnouncement)
 			}
 			a.log.Error("update sip gateway settings", map[string]any{"err": err.Error()})
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 			return
 		}
 	}
-	if announcementChanged {
-		if err := a.store.UpdateSIPEndpointAnnouncement(ep.ID, ep.AnswerAnnouncement, ep.AnswerAnnouncementText); err != nil {
+	if callBehaviorChanged {
+		if err := a.store.UpdateSIPEndpointCallBehavior(ep.ID, ep.AnswerAnnouncement, ep.AnswerAnnouncementText, ep.PreRingAnnouncement, ep.PreRingAnnouncementText, ep.CallDurationRules); err != nil {
 			if generatedAnnouncement {
-				a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement)
+				a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement, previousPreRingAnnouncement)
 			}
-			a.log.Error("update SIP answer announcement", map[string]any{"err": err.Error()})
+			a.log.Error("update SIP call behavior", map[string]any{"err": err.Error()})
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 			return
 		}
-		// The cache is endpoint-scoped, so this also safely removes an older
-		// generated file when a legacy client switches back to a manual sound.
-		a.tts.CleanupEndpoint(ep.AccountID, ep.ID, ep.AnswerAnnouncement)
+		// The cache is endpoint-scoped, preserving the two active prompt files
+		// while removing older generated revisions.
+		a.tts.CleanupEndpoint(ep.AccountID, ep.ID, ep.AnswerAnnouncement, ep.PreRingAnnouncement)
 	}
 	if ep.DefaultOutbound {
 		a.clearOtherDefaultOutboundGateways(ep.AccountID, ep.ID)
@@ -1098,6 +1183,44 @@ func isSafeSIPExtension(extension string) bool {
 		}
 	}
 	return true
+}
+
+func (a *API) normalizeCallDurationRules(accountID, targetExtension string, rules map[string]int) (string, error) {
+	if len(rules) == 0 {
+		return "{}", nil
+	}
+	endpoints, err := a.store.ListSIPEndpoints(accountID)
+	if err != nil {
+		return "", fmt.Errorf("could not validate call duration routes")
+	}
+	knownSources := make(map[string]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpoint.Enabled && isSafeSIPExtension(endpoint.Extension) {
+			knownSources[endpoint.Extension] = struct{}{}
+		}
+	}
+	normalized := make(map[string]int, len(rules))
+	for rawSource, seconds := range rules {
+		source := strings.TrimSpace(rawSource)
+		if !isSafeSIPExtension(source) {
+			return "", fmt.Errorf("call duration source %q must be an existing 2-12 digit SIP extension", rawSource)
+		}
+		if source == targetExtension {
+			return "", fmt.Errorf("call duration source and target cannot both be %s", source)
+		}
+		if _, ok := knownSources[source]; !ok {
+			return "", fmt.Errorf("call duration source %s is not an enabled SIP phone on this site", source)
+		}
+		if seconds < 1 || seconds > 86400 {
+			return "", fmt.Errorf("call duration for %s must be between 1 and 86400 seconds", source)
+		}
+		normalized[source] = seconds
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return "", fmt.Errorf("could not encode call duration routes")
+	}
+	return string(encoded), nil
 }
 
 func isSafeSIPUsername(username string) bool {
@@ -1383,6 +1506,8 @@ func (a *API) reconfigureAsterisk() {
 			GatewayIVREnabled:         ep.GatewayIVREnabled,
 			GatewayIVRSound:           ep.GatewayIVRSound,
 			AnswerAnnouncement:        ep.AnswerAnnouncement,
+			PreRingAnnouncement:       ep.PreRingAnnouncement,
+			CallDurationRules:         ep.CallDurationRules,
 			Enabled:                   ep.Enabled,
 		})
 	}

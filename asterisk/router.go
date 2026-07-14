@@ -326,7 +326,7 @@ func (r *Router) OriginateDoorStationToBridge(sourceExtension, bridgeExt, caller
 // OriginateIntercomCallback calls the original source phone back first and, once
 // answered, dials the target extension. This enables caller-side intercom
 // headers because the source phone becomes a called leg.
-func (r *Router) OriginateIntercomCallback(sourceExtension, targetExtension, sourceLegCallerID, targetLegCallerNum, targetLegCallerName, callID, sourceAutoMode, targetAutoMode string, timeoutSec int) (string, error) {
+func (r *Router) OriginateIntercomCallback(sourceExtension, targetExtension, sourceLegCallerID, targetLegCallerNum, targetLegCallerName, callID, sourceAutoMode, targetAutoMode, preRingAnnouncement string, maxConnectedSec, timeoutSec int) (string, error) {
 	// Speaker mode on the original caller is only reliable when that phone is the
 	// first fresh called leg. Target-first callback can preserve target timing,
 	// but several SIP handsets ignore intercom/speaker hints on the later source
@@ -343,15 +343,19 @@ func (r *Router) OriginateIntercomCallback(sourceExtension, targetExtension, sou
 	r.originateMu.Unlock()
 
 	vars := map[string]string{
-		"SIMSON_CALL_ID":                callID,
-		"__SIMSON_CALL_ID":              callID,
-		"SIMSON_WAIT_TIMEOUT":           fmt.Sprintf("%d", timeoutSec),
-		"SIMSON_SOURCE_AUTO_MODE":       sourceAutoMode,
-		"__SIMSON_SOURCE_AUTO_MODE":     sourceAutoMode,
-		"SIMSON_TARGET_AUTO_MODE":       targetAutoMode,
-		"__SIMSON_TARGET_AUTO_MODE":     targetAutoMode,
-		"SIMSON_TARGET_LEG_CALLER_NUM":  targetLegCallerNum,
-		"SIMSON_TARGET_LEG_CALLER_NAME": targetLegCallerName,
+		"SIMSON_CALL_ID":                 callID,
+		"__SIMSON_CALL_ID":               callID,
+		"SIMSON_WAIT_TIMEOUT":            fmt.Sprintf("%d", timeoutSec),
+		"SIMSON_SOURCE_AUTO_MODE":        sourceAutoMode,
+		"__SIMSON_SOURCE_AUTO_MODE":      sourceAutoMode,
+		"SIMSON_TARGET_AUTO_MODE":        targetAutoMode,
+		"__SIMSON_TARGET_AUTO_MODE":      targetAutoMode,
+		"SIMSON_TARGET_LEG_CALLER_NUM":   targetLegCallerNum,
+		"SIMSON_TARGET_LEG_CALLER_NAME":  targetLegCallerName,
+		"SIMSON_PRE_RING_ANNOUNCEMENT":   sanitizeSoundName(preRingAnnouncement),
+		"__SIMSON_PRE_RING_ANNOUNCEMENT": sanitizeSoundName(preRingAnnouncement),
+		"SIMSON_MAX_CONNECTED_MS":        fmt.Sprintf("%d", maxConnectedSec*1000),
+		"__SIMSON_MAX_CONNECTED_MS":      fmt.Sprintf("%d", maxConnectedSec*1000),
 	}
 	_, err := r.ami.OriginateWithVars(
 		channel,

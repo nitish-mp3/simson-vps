@@ -22,7 +22,7 @@ ProtectSystem=strict
 ProtectHome=true
 # Generated receiving-phone prompts are written here and read by Asterisk.
 # Keep this narrow exception rather than weakening ProtectSystem=strict.
-ReadWritePaths=/opt/simson /var/lib/asterisk/sounds/simson
+ReadWritePaths=/opt/simson /usr/share/asterisk/sounds/simson
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

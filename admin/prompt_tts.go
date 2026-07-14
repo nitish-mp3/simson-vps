@@ -17,7 +17,10 @@ import (
 	"unicode/utf8"
 )
 
-const maxAnswerPromptRunes = 300
+const (
+	maxAnswerPromptRunes   = 300
+	defaultPromptSoundRoot = "/usr/share/asterisk/sounds/simson"
+)
 
 var errPromptTTSEngineUnavailable = errors.New("offline prompt speech engine is unavailable")
 var errPromptStorageUnavailable = errors.New("prompt sound storage is unavailable")
@@ -36,7 +39,7 @@ type promptSynthesizer struct {
 func newPromptSynthesizer() *promptSynthesizer {
 	root := strings.TrimSpace(os.Getenv("SIMSON_TTS_SOUND_DIR"))
 	if root == "" {
-		root = "/var/lib/asterisk/sounds/simson"
+		root = defaultPromptSoundRoot
 	}
 	voice := strings.TrimSpace(os.Getenv("SIMSON_TTS_VOICE"))
 	if voice == "" {
@@ -143,16 +146,22 @@ func (p *promptSynthesizer) Generate(ctx context.Context, accountID, endpointID,
 }
 
 // CleanupEndpoint removes obsolete cached prompts only after the database has
-// committed the new sound. It never touches another account or endpoint.
-func (p *promptSynthesizer) CleanupEndpoint(accountID, endpointID, keepSound string) {
+// committed the new sounds. It never touches another account or endpoint.
+func (p *promptSynthesizer) CleanupEndpoint(accountID, endpointID string, keepSounds ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	dir := filepath.Join(p.root, shortPromptHash(accountID, 16))
 	pattern := filepath.Join(dir, "endpoint_"+shortPromptHash(endpointID, 16)+"_*.wav")
 	paths, _ := filepath.Glob(pattern)
-	keepBase := filepath.Base(strings.TrimSpace(keepSound)) + ".wav"
+	keepBases := make(map[string]struct{}, len(keepSounds))
+	for _, sound := range keepSounds {
+		sound = strings.TrimSpace(sound)
+		if sound != "" {
+			keepBases[filepath.Base(sound)+".wav"] = struct{}{}
+		}
+	}
 	for _, path := range paths {
-		if keepSound != "" && filepath.Base(path) == keepBase {
+		if _, keep := keepBases[filepath.Base(path)]; keep {
 			continue
 		}
 		_ = os.Remove(path)
@@ -177,7 +186,7 @@ func clippedCommandOutput(output []byte) string {
 }
 
 func (a *API) writePromptTTSError(w http.ResponseWriter, err error) {
-	a.log.Error("generate SIP receiving-phone prompt", map[string]any{"err": err.Error()})
+	a.log.Error("generate SIP prompt", map[string]any{"err": err.Error()})
 	if errors.Is(err, errPromptTTSEngineUnavailable) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error": "prompt speech generation is not installed on the VPS; install espeak-ng and sox",
@@ -186,11 +195,11 @@ func (a *API) writePromptTTSError(w http.ResponseWriter, err error) {
 	}
 	if errors.Is(err, errPromptStorageUnavailable) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": "receiving-phone prompt storage is unavailable on the VPS; check the simson service write-path configuration",
+			"error": "SIP prompt storage is unavailable on the VPS; check the simson service write-path configuration",
 		})
 		return
 	}
 	writeJSON(w, http.StatusInternalServerError, map[string]any{
-		"error": "could not generate the receiving-phone prompt",
+		"error": "could not generate the SIP prompt",
 	})
 }

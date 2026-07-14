@@ -290,12 +290,14 @@ func TestReceivingPhoneAnnouncementIsCalledPartyOnly(t *testing.T) {
 	endpoints := []SIPEndpointDef{
 		{ID: "caller", Extension: "1025", Username: "1025", Password: "secret", Enabled: true},
 		{
-			ID:                 "target",
-			Extension:          "1603",
-			Username:           "1603",
-			Password:           "secret",
-			AnswerAnnouncement: "custom/call_for_amit",
-			Enabled:            true,
+			ID:                  "target",
+			Extension:           "1603",
+			Username:            "1603",
+			Password:            "secret",
+			AnswerAnnouncement:  "custom/call_for_amit",
+			PreRingAnnouncement: "custom/please_wait",
+			CallDurationRules:   `{"1025":15}`,
+			Enabled:             true,
 		},
 	}
 	if err := writeDialplanConf(root, cfg.InContext, cfg.NodeContext, cfg.OutContext, "7009", nil, endpoints); err != nil {
@@ -310,11 +312,31 @@ func TestReceivingPhoneAnnouncementIsCalledPartyOnly(t *testing.T) {
 	if strings.Contains(direct, "A(custom/call_for_amit:") {
 		t.Fatal("announcement must not define a caller-side sound")
 	}
+	preRingIdx := strings.Index(direct, "Playback(custom/please_wait,noanswer)")
+	dialIdx := strings.Index(direct, "Dial(PJSIP/${EXTEN}")
+	if preRingIdx < 0 || dialIdx < 0 || preRingIdx > dialIdx {
+		t.Fatalf("caller pre-ring prompt must finish before the target starts ringing:\n%s", direct)
+	}
+	for _, want := range []string{
+		`"${SIMSON_CALLER_ENDPOINT}" = "1025"`,
+		`Set(SIMSON_ROUTE_LIMIT_MS=15000)`,
+		`L(${SIMSON_ROUTE_LIMIT_MS})`,
+	} {
+		if !strings.Contains(direct, want) {
+			t.Fatalf("exact connected-call limit missing %q:\n%s", want, direct)
+		}
+	}
 
 	nodeRoute := section(dialplan, "[from-simson-extension]", "[from-simson-out]")
-	if !strings.Contains(nodeRoute, "exten => 1603,1,NoOp(Simson called-party prompt SIP endpoint") ||
-		!strings.Contains(nodeRoute, "A(custom/call_for_amit)") {
-		t.Fatal("node/VPS-originated route must preserve the receiving-phone announcement")
+	if !strings.Contains(nodeRoute, "exten => 1603,1,NoOp(Simson call policy SIP endpoint") ||
+		!strings.Contains(nodeRoute, "A(custom/call_for_amit)") ||
+		!strings.Contains(nodeRoute, "Playback(custom/please_wait,noanswer)") ||
+		!strings.Contains(nodeRoute, "L(${SIMSON_ROUTE_LIMIT_MS})") {
+		t.Fatal("node/VPS-originated route must preserve prompts and exact duration policy")
+	}
+	callerRoute := section(dialplan, "exten => 1025,1,NoOp(Simson direct SIP endpoint", "exten => 1603,1,NoOp")
+	if strings.Contains(callerRoute, "please_wait") || strings.Contains(callerRoute, "SIMSON_ROUTE_LIMIT_MS") {
+		t.Fatal("target call policy leaked onto an unrelated SIP endpoint")
 	}
 }
 
@@ -409,6 +431,8 @@ func TestCallbackBridgeDialplanIsAllowlistedAndCarriesBothAutoModes(t *testing.T
 		`Set(CALLERID(num)=${SIMSON_TARGET_LEG_CALLER_NUM})`,
 		`Set(CALLERID(name)=${SIMSON_TARGET_LEG_CALLER_NAME})`,
 		`Tb(simson-auto-answer^s^1(${SIMSON_TARGET_AUTO_MODE}))`,
+		`Playback(${SIMSON_PRE_RING_ANNOUNCEMENT})`,
+		`L(${SIMSON_MAX_CONNECTED_MS})`,
 	} {
 		if !strings.Contains(callbackTarget, want) {
 			t.Fatalf("callback target dialplan missing %q:\n%s", want, callbackTarget)

@@ -1,11 +1,13 @@
 package asterisk
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/nitish-mp3/simson-vps/logging"
@@ -59,7 +61,13 @@ type SIPEndpointDef struct {
 	// AnswerAnnouncement is played to the receiving phone after answer and
 	// before bridging. It is never played to the caller.
 	AnswerAnnouncement string
-	Enabled            bool
+	// PreRingAnnouncement is played to the caller before this endpoint starts
+	// ringing. It is intentionally separate from AnswerAnnouncement.
+	PreRingAnnouncement string
+	// CallDurationRules maps exact source SIP extensions to the maximum
+	// connected-call duration for this target, encoded as validated JSON.
+	CallDurationRules string
+	Enabled           bool
 }
 
 // Setup writes all Asterisk config files needed by the Simson VPS and reloads
@@ -718,11 +726,13 @@ exten => _X.,1,NoOp(Simson callback bridge target ${EXTEN})
  same  => n,Set(CALLERID(num)=${SIMSON_TARGET_LEG_CALLER_NUM})
  same  => n,GotoIf($["${SIMSON_TARGET_LEG_CALLER_NAME}" = ""]?caller-ready)
  same  => n,Set(CALLERID(name)=${SIMSON_TARGET_LEG_CALLER_NAME})
- same  => n(caller-ready),Set(SIMSON_DIAL_OPTIONS=T)
+ same  => n(caller-ready),ExecIf($["${SIMSON_PRE_RING_ANNOUNCEMENT}" != ""]?Playback(${SIMSON_PRE_RING_ANNOUNCEMENT}))
+ same  => n,Set(SIMSON_DIAL_OPTIONS=T)
  same  => n,GotoIf($["${SIMSON_TARGET_AUTO_MODE}" = ""]?dial)
  same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-auto-answer^s^1(${SIMSON_TARGET_AUTO_MODE})))
  same  => n,NoOp(Simson callback target caller ${CALLERID(all)})
- same  => n(dial),Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},${SIMSON_DIAL_OPTIONS})
+ same  => n(dial),ExecIf($[${SIMSON_MAX_CONNECTED_MS} > 0]?Set(SIMSON_DIAL_OPTIONS=${SIMSON_DIAL_OPTIONS}L(${SIMSON_MAX_CONNECTED_MS})))
+ same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=30},${SIMSON_DIAL_OPTIONS})
  same  => n,Hangup()
 
 [from-simson-callback-target-first]
@@ -1093,6 +1103,7 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
 		sb.WriteString(" same  => n,Set(JITTERBUFFER(adaptive)=default)\n")
+		appendCallerPreRingAnnouncement(&sb, ep.PreRingAnnouncement)
 		targetAutoModePrepared := false
 		if ep.CallbackBridge {
 			if aa, ok := autoAnswer[ext]; ok {
@@ -1113,6 +1124,7 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE})))\n")
 		appendCalledPartyAnnouncement(&sb, ep.AnswerAnnouncement)
+		appendCallDurationRules(&sb, ep.CallDurationRules)
 		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},${SIMSON_DIAL_OPTIONS})\n")
 		sb.WriteString(" same  => n,Hangup()\n")
 		if ep.CallbackBridge {
@@ -1253,7 +1265,7 @@ func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
 	seen := map[string]struct{}{}
 	var sb strings.Builder
 	for _, ep := range endpoints {
-		if !ep.Enabled || (!ep.AutoAnswer && strings.TrimSpace(ep.AnswerAnnouncement) == "") {
+		if !ep.Enabled || (!ep.AutoAnswer && strings.TrimSpace(ep.AnswerAnnouncement) == "" && strings.TrimSpace(ep.PreRingAnnouncement) == "" && len(parseCallDurationRules(ep.CallDurationRules)) == 0) {
 			continue
 		}
 		ext := sanitizeID(strings.TrimSpace(ep.Extension))
@@ -1268,13 +1280,15 @@ func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
 			fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson dial auto-answer SIP endpoint ${EXTEN})\n", ext)
 			appendConditionalAutoAnswerMode(&sb, ep.AutoAnswerCallers, ep.AutoSpeaker, ep.AutoSpeakerCallers)
 		} else {
-			fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson called-party prompt SIP endpoint ${EXTEN})\n", ext)
+			fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson call policy SIP endpoint ${EXTEN})\n", ext)
 			sb.WriteString(" same  => n,Set(SIMSON_AUTO_ANSWER_MODE=)\n")
 		}
+		appendCallerPreRingAnnouncement(&sb, ep.PreRingAnnouncement)
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))\n")
 		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE})))\n")
 		appendCalledPartyAnnouncement(&sb, ep.AnswerAnnouncement)
+		appendCallDurationRules(&sb, ep.CallDurationRules)
 		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=120},${SIMSON_DIAL_OPTIONS})\n")
 		sb.WriteString(" same  => n,Hangup()\n\n")
 	}
@@ -1291,6 +1305,61 @@ func appendCalledPartyAnnouncement(sb *strings.Builder, sound string) {
 		return
 	}
 	fmt.Fprintf(sb, " same  => n(simson-dial),Set(SIMSON_DIAL_OPTIONS=${SIMSON_DIAL_OPTIONS}A(%s))\n", sound)
+}
+
+// appendCallerPreRingAnnouncement emits early media to the caller before any
+// target Dial is started. The receiving phone therefore does not ring until
+// the announcement completes. This is distinct from Dial's A() option, which
+// remains private to the receiving phone after it answers.
+func appendCallerPreRingAnnouncement(sb *strings.Builder, sound string) {
+	sound = sanitizeSoundName(sound)
+	if sound == "" {
+		return
+	}
+	sb.WriteString(" same  => n,Progress()\n")
+	fmt.Fprintf(sb, " same  => n,Playback(%s,noanswer)\n", sound)
+}
+
+// appendCallDurationRules adds Dial's L(milliseconds) option only for an exact
+// configured source extension. L starts its limit when the called party
+// answers, so ringing and a caller-side pre-ring announcement do not consume
+// the configured connected-call duration.
+func appendCallDurationRules(sb *strings.Builder, encoded string) {
+	rules := parseCallDurationRules(encoded)
+	if len(rules) == 0 {
+		return
+	}
+	appendCallerIdentityVars(sb)
+	sb.WriteString(" same  => n,Set(SIMSON_ROUTE_LIMIT_MS=)\n")
+	for _, source := range sortedMapKeys(rules) {
+		milliseconds := rules[source] * 1000
+		fmt.Fprintf(sb, " same  => n,ExecIf($[\"${SIMSON_CALLER_ENDPOINT}\" = \"%s\"]?Set(SIMSON_ROUTE_LIMIT_MS=%d))\n", source, milliseconds)
+		fmt.Fprintf(sb, " same  => n,ExecIf($[\"${SIMSON_SOURCE_EXTENSION}\" = \"%s\"]?Set(SIMSON_ROUTE_LIMIT_MS=%d))\n", source, milliseconds)
+		fmt.Fprintf(sb, " same  => n,ExecIf($[\"${CALLERID(num)}\" = \"%s\"]?Set(SIMSON_ROUTE_LIMIT_MS=%d))\n", source, milliseconds)
+	}
+	sb.WriteString(" same  => n,ExecIf($[\"${SIMSON_ROUTE_LIMIT_MS}\" != \"\"]?Set(SIMSON_DIAL_OPTIONS=${SIMSON_DIAL_OPTIONS}L(${SIMSON_ROUTE_LIMIT_MS})))\n")
+}
+
+func parseCallDurationRules(encoded string) map[string]int {
+	rules := map[string]int{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(encoded)), &rules); err != nil {
+		return map[string]int{}
+	}
+	for source, seconds := range rules {
+		if sanitizeID(source) != source || seconds < 1 || seconds > 86400 {
+			delete(rules, source)
+		}
+	}
+	return rules
+}
+
+func sortedMapKeys(values map[string]int) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func parseAutoAnswerCallers(callers string) []string {

@@ -170,7 +170,7 @@ fi
 echo "[4/8] Setting up directories..."
 mkdir -p "$INSTALL_DIR"
 if getent group asterisk >/dev/null 2>&1; then
-    install -d -o "$SERVICE_USER" -g asterisk -m 0755 /var/lib/asterisk/sounds/simson
+    install -d -o "$SERVICE_USER" -g asterisk -m 0755 /usr/share/asterisk/sounds/simson
 fi
 
 # --- Get source code (needed for config even if we download a binary) ---
@@ -330,7 +330,7 @@ ProtectSystem=strict
 ProtectHome=true
 # Generated receiving-phone prompts are written here and read by Asterisk.
 # Keep this narrow exception rather than weakening ProtectSystem=strict.
-ReadWritePaths=/opt/simson /var/lib/asterisk/sounds/simson
+ReadWritePaths=/opt/simson /usr/share/asterisk/sounds/simson
 PrivateTmp=true
 StandardOutput=journal
 StandardError=journal
