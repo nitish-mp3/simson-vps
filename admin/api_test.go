@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 
@@ -65,5 +67,90 @@ func TestCallDurationRulesAreExactAndAccountScoped(t *testing.T) {
 		if _, err := api.normalizeCallDurationRules("site-a", "1028", rules); err == nil {
 			t.Fatalf("expected rules %#v to be rejected", rules)
 		}
+	}
+}
+
+func TestAdvancedRouteValidationIsAccountScopedAndCapabilitySafe(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "advanced-route-validation.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, account := range []string{"site-a", "site-b"} {
+		if err := st.CreateAccount(account, account, 10, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, endpoint := range []store.SIPEndpoint{
+		{ID: "gateway-a", AccountID: "site-a", Extension: "7001", Username: "site-a-7001", Password: "secret", Enabled: true, CallDurationRules: "{}"},
+		{ID: "phone-a-1", AccountID: "site-a", Extension: "1025", Username: "site-a-1025", Password: "secret", Enabled: true, CallDurationRules: "{}"},
+		{ID: "phone-a-2", AccountID: "site-a", Extension: "1026", Username: "site-a-1026", Password: "secret", Enabled: true, CallDurationRules: "{}"},
+		{ID: "phone-a-3", AccountID: "site-a", Extension: "1027", Username: "site-a-1027", Password: "secret", Enabled: true, CallDurationRules: "{}"},
+		{ID: "phone-b", AccountID: "site-b", Extension: "2025", Username: "site-b-2025", Password: "secret", Enabled: true, CallDurationRules: "{}"},
+	} {
+		if err := st.CreateSIPEndpoint(endpoint); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	api := &API{store: st}
+	route := store.AdvancedRoute{
+		ID: "route-a", AccountID: "site-a", Name: "Main", IngressKind: "gateway", IngressValue: "7001", Enabled: true,
+		Stages: []store.RouteStage{{
+			Name: "Reception", RingSeconds: 10, AnswerMode: "first_answer",
+			Targets: []store.RouteTarget{{Kind: "sip", Value: "1025", Enabled: true}},
+		}},
+	}
+	if err := api.validateAdvancedRoute(&route); err != nil {
+		t.Fatalf("valid first-answer route rejected: %v", err)
+	}
+	if route.Stages[0].MaxAnswered != 1 {
+		t.Fatalf("first-answer route did not normalize max_answered: %#v", route.Stages[0])
+	}
+
+	crossAccount := route
+	crossAccount.Stages = []store.RouteStage{{
+		Name: "Wrong site", RingSeconds: 10, AnswerMode: "first_answer",
+		Targets: []store.RouteTarget{{Kind: "sip", Value: "2025", Enabled: true}},
+	}}
+	if err := api.validateAdvancedRoute(&crossAccount); err == nil {
+		t.Fatal("cross-account SIP target was accepted")
+	}
+
+	privateHub := route
+	privateHub.Enabled = false
+	privateHub.Stages = []store.RouteStage{{
+		Name: "Private operator", RingSeconds: 15, AnswerMode: "private_hub", MaxAnswered: 3,
+		Targets: []store.RouteTarget{
+			{Kind: "sip", Value: "1025", Role: "hub", Enabled: true},
+			{Kind: "sip", Value: "1026", Role: "spoke", Enabled: true},
+			{Kind: "sip", Value: "1027", Role: "spoke", Enabled: true},
+		},
+	}}
+	if err := api.validateAdvancedRoute(&privateHub); err != nil {
+		t.Fatalf("disabled, structurally valid private hub rejected: %v", err)
+	}
+	privateHub.Enabled = true
+	if err := api.validateAdvancedRoute(&privateHub); err == nil {
+		t.Fatal("private hub was enabled without isolated-media capability")
+	}
+
+	manual := route
+	manual.IngressKind = "manual"
+	manual.IngressValue = "security_alert"
+	if err := api.validateAdvancedRoute(&manual); err == nil {
+		t.Fatal("enabled manual route was accepted without a runtime trigger")
+	}
+
+	if err := st.CreateAdvancedRoute(route); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.SetPathValue("accountId", "site-b")
+	request.SetPathValue("id", route.ID)
+	response := httptest.NewRecorder()
+	api.handleGetAdvancedRoute(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("cross-account route read status = %d, want %d", response.Code, http.StatusNotFound)
 	}
 }

@@ -84,6 +84,14 @@ func (a *API) Router() http.Handler {
 	mux.HandleFunc("DELETE /admin/sip-endpoints/{id}", a.auth(a.handleDeleteSIPEndpoint))
 	mux.HandleFunc("POST /admin/accounts/{accountId}/door-events", a.auth(a.handleDoorEvent))
 
+	// Advanced account-scoped call routes. These are deliberately separate
+	// from SIP endpoint CRUD so a route can be edited without reloading PJSIP.
+	mux.HandleFunc("POST /admin/accounts/{accountId}/advanced-routes", a.auth(a.handleCreateAdvancedRoute))
+	mux.HandleFunc("GET /admin/accounts/{accountId}/advanced-routes", a.auth(a.handleListAdvancedRoutes))
+	mux.HandleFunc("GET /admin/accounts/{accountId}/advanced-routes/{id}", a.auth(a.handleGetAdvancedRoute))
+	mux.HandleFunc("PUT /admin/accounts/{accountId}/advanced-routes/{id}", a.auth(a.handleUpdateAdvancedRoute))
+	mux.HandleFunc("DELETE /admin/accounts/{accountId}/advanced-routes/{id}", a.auth(a.handleDeleteAdvancedRoute))
+
 	// Asterisk management
 	mux.HandleFunc("POST /admin/asterisk/reload-sip", a.auth(a.handleAsteriskReloadSIP))
 	mux.HandleFunc("POST /admin/asterisk/reload-dialplan", a.auth(a.handleAsteriskReloadDialplan))

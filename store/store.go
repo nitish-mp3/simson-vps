@@ -203,6 +203,20 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_sip_account   ON sip_endpoints(account_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_sip_extension ON sip_endpoints(extension)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sip_username ON sip_endpoints(username)`,
+		`CREATE TABLE IF NOT EXISTS advanced_routes (
+			id            TEXT PRIMARY KEY,
+			account_id    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+			name          TEXT NOT NULL,
+			ingress_kind  TEXT NOT NULL,
+			ingress_value TEXT NOT NULL,
+			stages_json   TEXT NOT NULL DEFAULT '[]',
+			enabled       INTEGER NOT NULL DEFAULT 1,
+			created_at    DATETIME NOT NULL DEFAULT (datetime('now')),
+			updated_at    DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(account_id, ingress_kind, ingress_value)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_advanced_routes_account ON advanced_routes(account_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_advanced_routes_ingress ON advanced_routes(account_id, ingress_kind, ingress_value)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {

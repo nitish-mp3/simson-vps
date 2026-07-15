@@ -124,3 +124,59 @@ func TestOpenMigratesLegacySIPEndpointsWithVideoFlag(t *testing.T) {
 		t.Fatalf("route duration rules were not persisted: %q", door.CallDurationRules)
 	}
 }
+
+func TestAdvancedRouteCRUDAndIngressLookup(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "advanced-routes.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.CreateAccount("site-a", "Site A", 10, 10); err != nil {
+		t.Fatal(err)
+	}
+
+	route := AdvancedRoute{
+		ID: "route-main", AccountID: "site-a", Name: "Main line", IngressKind: "gateway", IngressValue: "7001", Enabled: true,
+		Stages: []RouteStage{{
+			ID: "stage-1", Name: "Reception", RingSeconds: 15, AnswerMode: "first_answer", MaxAnswered: 1,
+			Targets: []RouteTarget{{ID: "target-1", Kind: "sip", Value: "1025", Enabled: true}},
+		}},
+	}
+	if err := st.CreateAdvancedRoute(route); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetAdvancedRouteByIngress("site-a", "gateway", "7001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Name != "Main line" || len(got.Stages) != 1 || got.Stages[0].Targets[0].Value != "1025" {
+		t.Fatalf("unexpected route after create: %#v", got)
+	}
+
+	route.Name = "Main line escalation"
+	route.Stages = append(route.Stages, RouteStage{
+		ID: "stage-2", Name: "Backup", RingSeconds: 20, AnswerMode: "conference", MaxAnswered: 2,
+		Targets: []RouteTarget{{ID: "target-2", Kind: "sip", Value: "1026", Enabled: true}},
+	})
+	if err := st.UpdateAdvancedRoute(route); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := st.ListAdvancedRoutes("site-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].Name != route.Name || len(routes[0].Stages) != 2 {
+		t.Fatalf("unexpected routes after update: %#v", routes)
+	}
+
+	if err := st.DeleteAdvancedRoute(route.ID, route.AccountID); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetAdvancedRoute(route.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("route still exists after delete: %#v", got)
+	}
+}

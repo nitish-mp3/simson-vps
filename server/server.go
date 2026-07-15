@@ -61,6 +61,10 @@ type Server struct {
 	doorEventMu   sync.Mutex
 	doorEventLast map[string]time.Time
 
+	advancedRoutesMu sync.Mutex
+	advancedRoutes   map[string]*advancedRouteRun
+	advancedRouteLeg map[string]*advancedRouteLeg
+
 	asteriskStartupCleanupDone bool
 }
 
@@ -93,6 +97,8 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 		sipIntercomIgnoredHangups:    make(map[string]time.Time),
 		sipIntercomOriginalRelease:   make(map[string]chan struct{}),
 		doorEventLast:                make(map[string]time.Time),
+		advancedRoutes:               make(map[string]*advancedRouteRun),
+		advancedRouteLeg:             make(map[string]*advancedRouteLeg),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -1150,7 +1156,6 @@ func (s *Server) handleCallAccept(sess *hub.Session, env *protocol.Envelope) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "not the call target")
 		return
 	}
-
 	invitedNodes := s.calls.Invitees(payload.CallID)
 	c, ok := s.calls.Accept(payload.CallID, sess.NodeID)
 	if !ok {
@@ -1172,6 +1177,11 @@ func (s *Server) handleCallAccept(sess *hub.Session, env *protocol.Envelope) {
 		}
 		return
 	}
+	// Claim the advanced-route winner only after the call manager has completed
+	// its authoritative ringing -> active transition. Doing this before Accept
+	// lets the asynchronous route worker win the same transition and can make
+	// this handler incorrectly treat a normal answer as a transfer.
+	s.claimAdvancedRouteHAOSAnswer(payload.CallID, sess.NodeID)
 
 	s.store.WriteAudit(sess.AccountID, sess.NodeID, "call_accepted", "call="+payload.CallID, sess.RemoteIP)
 	s.log.Info("call accepted", map[string]any{"call_id": payload.CallID, "answered_by": payload.AnsweredByUserID})
@@ -2057,6 +2067,12 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		if s.asterisk != nil {
 			s.hangupAsteriskChannelAsync(in.Channel, "no route target")
 		}
+		return
+	}
+
+	// Advanced routes are additive. If no enabled plan exactly matches this
+	// account and source endpoint, the established routing path remains intact.
+	if s.tryStartAdvancedRoute(accountID, sourceExt, in) {
 		return
 	}
 
@@ -3181,6 +3197,9 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 	if !ok {
 		return
 	}
+	if s.handleAdvancedRouteHangup(callID, channel) {
+		return
+	}
 	call := s.calls.Get(callID)
 	if call != nil && strings.HasPrefix(channel, "Local/") && (call.State == calls.StateRinging || call.State == calls.StateActive) {
 		if s.isDirectGatewaySIPRoute(call) {
@@ -3306,6 +3325,9 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 // handleSIPOriginateResult is the AMI callback when an async Originate
 // (outbound call to an IP phone) either connects or fails.
 func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string) {
+	if s.handleAdvancedRouteOriginateResult(callID, ok, reason) {
+		return
+	}
 	if ok {
 		s.clearSIPOutboundRetry(callID)
 		// Phone answered — transition call to active.
