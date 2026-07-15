@@ -108,6 +108,21 @@ func TestAdvancedRouteValidationIsAccountScopedAndCapabilitySafe(t *testing.T) {
 		t.Fatalf("first-answer route did not normalize max_answered: %#v", route.Stages[0])
 	}
 
+	repeatedAcrossStages := route
+	repeatedAcrossStages.Stages = []store.RouteStage{
+		{
+			Name: "Reception", RingSeconds: 10, AnswerMode: "first_answer",
+			Targets: []store.RouteTarget{{Kind: "sip", Value: "1025", Enabled: true}},
+		},
+		{
+			Name: "Fallback", RingSeconds: 10, AnswerMode: "first_answer",
+			Targets: []store.RouteTarget{{Kind: "sip", Value: "1025", Enabled: true}},
+		},
+	}
+	if err := api.validateAdvancedRoute(&repeatedAcrossStages); err == nil {
+		t.Fatal("same SIP destination was accepted in multiple route stages")
+	}
+
 	crossAccount := route
 	crossAccount.Stages = []store.RouteStage{{
 		Name: "Wrong site", RingSeconds: 10, AnswerMode: "first_answer",

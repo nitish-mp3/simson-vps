@@ -94,6 +94,7 @@ func (s *Server) tryStartAdvancedRoute(accountID, sourceExt string, in asterisk.
 }
 
 func (s *Server) executeAdvancedRoute(run *advancedRouteRun, in asterisk.IncomingSIPCall, sourceExt string) {
+	seenTargets := make(map[string]bool)
 	for stageIndex, stage := range run.plan.Stages {
 		if s.advancedRouteClosed(run) {
 			return
@@ -115,6 +116,22 @@ func (s *Server) executeAdvancedRoute(run *advancedRouteRun, in asterisk.Incomin
 			if !target.Enabled || target.Value == "" {
 				continue
 			}
+			key := advancedRouteTargetKey(target)
+			if seenTargets[key] {
+				s.log.Warn("advanced route skipped repeated legacy target", map[string]any{
+					"call_id": run.parentID, "route_id": run.plan.ID,
+					"stage": stageIndex + 1, "kind": target.Kind, "target": target.Value,
+				})
+				continue
+			}
+			if (target.Kind == "sip" || target.Kind == "gateway") && target.Value == sourceExt {
+				s.log.Warn("advanced route skipped ingress loop", map[string]any{
+					"call_id": run.parentID, "route_id": run.plan.ID,
+					"stage": stageIndex + 1, "target": target.Value,
+				})
+				continue
+			}
+			seenTargets[key] = true
 			switch target.Kind {
 			case "haos":
 				if s.inviteAdvancedRouteNode(run, target, in, sourceExt, stageIndex) {
@@ -172,6 +189,13 @@ func (s *Server) executeAdvancedRoute(run *advancedRouteRun, in asterisk.Incomin
 		s.cancelAdvancedRoutePending(run, "stage_timeout")
 	}
 	s.endAdvancedRoute(run, "route_exhausted", true)
+}
+
+func advancedRouteTargetKey(target store.RouteTarget) string {
+	if target.Kind == "sip" || target.Kind == "gateway" {
+		return "endpoint:" + target.Value
+	}
+	return target.Kind + ":" + target.Value + ":" + target.Trunk
 }
 
 func (s *Server) inviteAdvancedRouteNode(run *advancedRouteRun, target store.RouteTarget, in asterisk.IncomingSIPCall, sourceExt string, stageIndex int) bool {

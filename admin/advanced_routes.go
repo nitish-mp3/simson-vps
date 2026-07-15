@@ -154,6 +154,7 @@ func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {
 		return fmt.Errorf("a route must contain between 1 and 10 stages")
 	}
 	totalRing := 0
+	seenRouteTargets := map[string]int{}
 	for stageIndex := range route.Stages {
 		stage := &route.Stages[stageIndex]
 		stage.ID = strings.TrimSpace(stage.ID)
@@ -213,10 +214,26 @@ func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {
 				}
 			}
 			key := target.Kind + ":" + target.Value + ":" + target.Trunk
+			if target.Kind == "sip" || target.Kind == "gateway" {
+				// SIP and gateway are UI roles for the same endpoint namespace.
+				// Treating 1025 as two different destinations merely because one
+				// stage labels it "sip" and another labels it "gateway" creates a
+				// repeated-ring loop.
+				key = "endpoint:" + target.Value
+			}
 			if seen[key] {
 				return fmt.Errorf("stage %d contains duplicate target %s", stageIndex+1, target.Value)
 			}
 			seen[key] = true
+			if previousStage, exists := seenRouteTargets[key]; exists {
+				return fmt.Errorf(
+					"target %s is repeated in stages %d and %d; each destination may appear only once per route",
+					target.Value,
+					previousStage,
+					stageIndex+1,
+				)
+			}
+			seenRouteTargets[key] = stageIndex + 1
 			if err := a.validateAdvancedRouteTarget(route, stage, target); err != nil {
 				return fmt.Errorf("stage %d target %d: %w", stageIndex+1, targetIndex+1, err)
 			}

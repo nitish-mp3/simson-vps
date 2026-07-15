@@ -158,6 +158,19 @@ func TestAdvancedRouteDeclineEndsAtFinalDestination(t *testing.T) {
 	}
 }
 
+func TestAdvancedRouteTargetKeyTreatsSIPAndGatewayAsSameEndpoint(t *testing.T) {
+	sipKey := advancedRouteTargetKey(store.RouteTarget{Kind: "sip", Value: "1025"})
+	gatewayKey := advancedRouteTargetKey(store.RouteTarget{Kind: "gateway", Value: "1025"})
+	if sipKey != gatewayKey {
+		t.Fatalf("SIP and gateway aliases produced different keys: %q != %q", sipKey, gatewayKey)
+	}
+	externalA := advancedRouteTargetKey(store.RouteTarget{Kind: "external", Value: "919123208334", Trunk: "7009"})
+	externalB := advancedRouteTargetKey(store.RouteTarget{Kind: "external", Value: "919123208334", Trunk: "7013"})
+	if externalA == externalB {
+		t.Fatalf("external targets on different trunks collided: %q", externalA)
+	}
+}
+
 func newServerTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "simson.db"))
