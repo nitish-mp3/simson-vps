@@ -114,6 +114,50 @@ func TestGatewaySelectionDoesNotLeakDefaultTrunkAcrossAccounts(t *testing.T) {
 	}
 }
 
+func TestAdvancedRouteDeclineKeepsOtherHAOSDestination(t *testing.T) {
+	run := &advancedRouteRun{
+		invitedNodes: map[string]bool{"haos-a": true, "haos-b": true},
+		children:     map[string]*advancedRouteLeg{},
+	}
+	s := &Server{advancedRoutes: map[string]*advancedRouteRun{"call-1": run}}
+
+	gotRun, keepRouting, handled := s.declineAdvancedRouteNode("call-1", "haos-a")
+	if !handled || !keepRouting || gotRun != run {
+		t.Fatalf("decline result = run:%p keep:%t handled:%t", gotRun, keepRouting, handled)
+	}
+	if run.invitedNodes["haos-a"] || !run.invitedNodes["haos-b"] {
+		t.Fatalf("remaining invitees = %#v", run.invitedNodes)
+	}
+}
+
+func TestAdvancedRouteDeclineKeepsRingingSIPDestination(t *testing.T) {
+	run := &advancedRouteRun{
+		invitedNodes: map[string]bool{"haos-a": true},
+		children: map[string]*advancedRouteLeg{
+			"leg-1": {parentID: "call-1"},
+		},
+	}
+	s := &Server{advancedRoutes: map[string]*advancedRouteRun{"call-1": run}}
+
+	_, keepRouting, handled := s.declineAdvancedRouteNode("call-1", "haos-a")
+	if !handled || !keepRouting {
+		t.Fatalf("decline with SIP child = keep:%t handled:%t", keepRouting, handled)
+	}
+}
+
+func TestAdvancedRouteDeclineEndsAtFinalDestination(t *testing.T) {
+	run := &advancedRouteRun{
+		invitedNodes: map[string]bool{"haos-a": true},
+		children:     map[string]*advancedRouteLeg{},
+	}
+	s := &Server{advancedRoutes: map[string]*advancedRouteRun{"call-1": run}}
+
+	_, keepRouting, handled := s.declineAdvancedRouteNode("call-1", "haos-a")
+	if !handled || keepRouting {
+		t.Fatalf("final decline = keep:%t handled:%t", keepRouting, handled)
+	}
+}
+
 func newServerTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "simson.db"))

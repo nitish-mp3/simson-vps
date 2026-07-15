@@ -822,10 +822,15 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		ep.Password = *body.Password
 	}
 	if body.RouteTo != nil {
-		ep.RouteTo = strings.TrimSpace(*body.RouteTo)
-		if !a.validRouteToNode(w, ep.AccountID, ep.RouteTo) {
+		nextRouteTo := strings.TrimSpace(*body.RouteTo)
+		// Older endpoints may still reference a node that has since been
+		// disabled or removed. Do not make an unrelated password, media, or
+		// gateway edit impossible merely because the UI echoed that existing
+		// value back. A newly selected route is still fully account-scoped.
+		if nextRouteTo != strings.TrimSpace(ep.RouteTo) && !a.validRouteToNode(w, ep.AccountID, nextRouteTo) {
 			return
 		}
+		ep.RouteTo = nextRouteTo
 	}
 	if body.VideoEnabled != nil {
 		ep.VideoEnabled = *body.VideoEnabled
@@ -1367,9 +1372,12 @@ func (a *API) validRouteToNode(w http.ResponseWriter, accountID, routeTo string)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return false
 	}
-	if node == nil || node.AccountID != accountID || !node.Enabled {
+	// Availability is runtime state, not configuration validity. A disabled
+	// HAOS node remains a legitimate same-site destination and can be enabled
+	// again later without rewriting every SIP endpoint that references it.
+	if node == nil || node.AccountID != accountID || node.NodeType != "haos" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error":    "route_to must be blank or an enabled HAOS node in this same site/account",
+			"error":    "route_to must be blank or a HAOS node in this same site/account",
 			"route_to": routeTo,
 		})
 		return false

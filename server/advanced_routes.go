@@ -40,6 +40,7 @@ type advancedRouteRun struct {
 	winner        string
 	conference    bool
 	closed        bool
+	done          chan struct{}
 }
 
 func (s *Server) tryStartAdvancedRoute(accountID, sourceExt string, in asterisk.IncomingSIPCall) bool {
@@ -76,7 +77,7 @@ func (s *Server) tryStartAdvancedRoute(accountID, sourceExt string, in asterisk.
 		parentID: callID, accountID: accountID, bridgeID: in.BridgeID,
 		sourceChannel: in.Channel, plan: *plan, events: make(chan advancedRouteEvent, 64),
 		children: make(map[string]*advancedRouteLeg), invitedNodes: make(map[string]bool),
-		answered: make(map[string]bool),
+		answered: make(map[string]bool), done: make(chan struct{}),
 	}
 	s.asterisk.TrackCall(callID, in.Channel)
 	s.advancedRoutesMu.Lock()
@@ -134,6 +135,9 @@ func (s *Server) executeAdvancedRoute(run *advancedRouteRun, in asterisk.Incomin
 	waitStage:
 		for {
 			select {
+			case <-run.done:
+				timer.Stop()
+				return
 			case event := <-run.events:
 				if !event.ok {
 					continue
@@ -405,6 +409,35 @@ func (s *Server) handleAdvancedRouteHangup(callID, channel string) bool {
 	return true
 }
 
+// declineAdvancedRouteNode removes one HAOS destination from an in-flight
+// route. It returns handled=true for advanced calls and keepRouting=true when
+// another HAOS or SIP destination can still answer. The source bridge is only
+// terminated when the declining card was the final destination.
+func (s *Server) declineAdvancedRouteNode(callID, nodeID string) (run *advancedRouteRun, keepRouting, handled bool) {
+	s.advancedRoutesMu.Lock()
+	run = s.advancedRoutes[callID]
+	s.advancedRoutesMu.Unlock()
+	if run == nil {
+		return nil, false, false
+	}
+
+	run.mu.Lock()
+	if run.closed || !run.invitedNodes[nodeID] {
+		run.mu.Unlock()
+		return run, false, true
+	}
+	delete(run.invitedNodes, nodeID)
+	keepRouting = len(run.invitedNodes) > 0 || len(run.children) > 0
+	run.mu.Unlock()
+	return run, keepRouting, true
+}
+
+func (s *Server) advancedRouteForCall(callID string) *advancedRouteRun {
+	s.advancedRoutesMu.Lock()
+	defer s.advancedRoutesMu.Unlock()
+	return s.advancedRoutes[callID]
+}
+
 func (s *Server) endAdvancedRoute(run *advancedRouteRun, reason string, hangupBridge bool) {
 	if run == nil {
 		return
@@ -415,6 +448,9 @@ func (s *Server) endAdvancedRoute(run *advancedRouteRun, reason string, hangupBr
 		return
 	}
 	run.closed = true
+	if run.done != nil {
+		close(run.done)
+	}
 	children := make([]string, 0, len(run.children))
 	for id := range run.children {
 		children = append(children, id)
@@ -424,16 +460,20 @@ func (s *Server) endAdvancedRoute(run *advancedRouteRun, reason string, hangupBr
 		s.notifyCallStatus(call)
 	}
 	for _, id := range children {
-		_ = s.asterisk.HangupCall(id)
+		if s.asterisk != nil {
+			_ = s.asterisk.HangupCall(id)
+		}
 		s.removeAdvancedRouteLeg(id)
 	}
-	if hangupBridge {
+	if hangupBridge && s.asterisk != nil {
 		_ = s.asterisk.HangupCall(run.parentID)
 		if run.bridgeID != "" {
 			_ = s.asterisk.HangupBridge(run.bridgeID, "")
 		}
 	}
-	s.asterisk.UntrackCall(run.parentID)
+	if s.asterisk != nil {
+		s.asterisk.UntrackCall(run.parentID)
+	}
 	s.advancedRoutesMu.Lock()
 	delete(s.advancedRoutes, run.parentID)
 	s.advancedRoutesMu.Unlock()

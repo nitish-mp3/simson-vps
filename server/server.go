@@ -1254,6 +1254,25 @@ func (s *Server) handleCallReject(sess *hub.Session, env *protocol.Envelope) {
 		return
 	}
 
+	// Advanced fan-out owns SIP child legs separately from the parent call.
+	// Removing only the parent invite leaves those legs (or the source bridge)
+	// ringing. Remove this HAOS destination from the route and end the bridge
+	// only when no other configured destination remains.
+	if run, keepRouting, handled := s.declineAdvancedRouteNode(payload.CallID, sess.NodeID); handled {
+		c, ok := s.calls.RemoveInvitee(payload.CallID, sess.NodeID)
+		if !ok {
+			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found or already ended")
+			return
+		}
+		s.store.WriteAudit(sess.AccountID, sess.NodeID, "call_rejected", "call="+payload.CallID+" reason="+payload.Reason, sess.RemoteIP)
+		s.log.Info("advanced route invite rejected", map[string]any{"call_id": payload.CallID, "node_id": sess.NodeID, "keep_routing": keepRouting})
+		s.notifyCallStatusToNode(sess.NodeID, c, string(calls.StateEnded), "rejected", "")
+		if !keepRouting {
+			s.endAdvancedRoute(run, "rejected", true)
+		}
+		return
+	}
+
 	// In a SIP fan-out call, one support node declining should not cancel the
 	// caller for every other available support node.
 	if len(existing.InviteNodes) > 1 {
@@ -1324,6 +1343,16 @@ func (s *Server) handleCallEnd(sess *hub.Session, env *protocol.Envelope) {
 	}
 	if sess.NodeID != existing.FromNode && sess.NodeID != existing.ToNode && !existing.CanNodeAnswer(sess.NodeID) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "not a participant")
+		return
+	}
+
+	// A user pressing Hang Up means the whole advanced call must end. The
+	// route runner otherwise still owns its SIP legs and can keep the source
+	// phone connected after the HAOS card has gone idle.
+	if run := s.advancedRouteForCall(payload.CallID); run != nil {
+		s.store.WriteAudit(sess.AccountID, sess.NodeID, "call_ended", "call="+payload.CallID+" reason="+reason, sess.RemoteIP)
+		s.log.Info("advanced route ended by participant", map[string]any{"call_id": payload.CallID, "node_id": sess.NodeID, "reason": reason})
+		s.endAdvancedRoute(run, reason, true)
 		return
 	}
 

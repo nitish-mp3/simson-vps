@@ -154,3 +154,46 @@ func TestAdvancedRouteValidationIsAccountScopedAndCapabilitySafe(t *testing.T) {
 		t.Fatalf("cross-account route read status = %d, want %d", response.Code, http.StatusNotFound)
 	}
 }
+
+func TestRouteToValidationIsAccountScopedButNotAvailabilityScoped(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "route-to-validation.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, account := range []string{"site-a", "site-b"} {
+		if err := st.CreateAccount(account, account, 10, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, node := range []struct {
+		id, accountID, nodeType string
+	}{
+		{id: "haos-a", accountID: "site-a", nodeType: "haos"},
+		{id: "haos-b", accountID: "site-b", nodeType: "haos"},
+		{id: "asterisk-a", accountID: "site-a", nodeType: "asterisk"},
+	} {
+		if _, err := st.CreateNode(node.id, node.accountID, node.id, node.nodeType, `[]`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.SetNodeEnabled("haos-a", false); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &API{store: st}
+	response := httptest.NewRecorder()
+	if !api.validRouteToNode(response, "site-a", "haos-a") {
+		t.Fatalf("disabled same-account HAOS node was rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	for _, routeTo := range []string{"haos-b", "asterisk-a", "missing"} {
+		response = httptest.NewRecorder()
+		if api.validRouteToNode(response, "site-a", routeTo) {
+			t.Fatalf("invalid route_to %q was accepted", routeTo)
+		}
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("route_to %q status=%d, want %d", routeTo, response.Code, http.StatusBadRequest)
+		}
+	}
+}
