@@ -2099,9 +2099,14 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		return
 	}
 
+	// Advanced plans are keyed by the endpoint that placed the call, not by the
+	// number it dialled. When 1027 calls 1028, the plan for source 1027 must run;
+	// using the destination endpoint here silently bypasses parallel/conference
+	// routing and only rings 1028.
+	advancedSourceExt := s.resolveAdvancedRouteSource(accountID, sourceExt, in)
 	// Advanced routes are additive. If no enabled plan exactly matches this
 	// account and source endpoint, the established routing path remains intact.
-	if s.tryStartAdvancedRoute(accountID, sourceExt, in) {
+	if s.tryStartAdvancedRoute(accountID, advancedSourceExt, in) {
 		return
 	}
 
@@ -2775,6 +2780,14 @@ func (s *Server) resolveIncomingSIPCallerEndpoint(in asterisk.IncomingSIPCall) (
 		}
 	}
 	return "", nil
+}
+
+func (s *Server) resolveAdvancedRouteSource(accountID, fallback string, in asterisk.IncomingSIPCall) string {
+	_, caller := s.resolveIncomingSIPCallerEndpoint(in)
+	if caller != nil && caller.AccountID == accountID {
+		return strings.TrimSpace(caller.Extension)
+	}
+	return strings.TrimSpace(fallback)
 }
 
 func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, callerEP *store.SIPEndpoint) {

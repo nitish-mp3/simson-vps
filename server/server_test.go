@@ -171,6 +171,53 @@ func TestAdvancedRouteTargetKeyTreatsSIPAndGatewayAsSameEndpoint(t *testing.T) {
 	}
 }
 
+func TestAdvancedRouteSourceUsesCallingPhoneNotDialledDestination(t *testing.T) {
+	st := newServerTestStore(t)
+	if err := st.CreateAccount("site-a", "Site A", 10, 5); err != nil {
+		t.Fatal(err)
+	}
+	for _, extension := range []string{"1027", "1028"} {
+		if err := st.CreateSIPEndpoint(store.SIPEndpoint{
+			ID: extension, AccountID: "site-a", Extension: extension,
+			Username: extension, Password: "secret", Enabled: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &Server{store: st, cfg: config.DefaultConfig()}
+	in := asterisk.IncomingSIPCall{
+		Channel:        "PJSIP/1027-00000001",
+		CallerEndpoint: "1027",
+		CallerID:       "1027",
+		Extension:      "1028",
+	}
+	if got := s.resolveAdvancedRouteSource("site-a", "1028", in); got != "1027" {
+		t.Fatalf("advanced route source = %q, want calling phone 1027", got)
+	}
+}
+
+func TestAdvancedRouteSourceDoesNotCrossAccountBoundary(t *testing.T) {
+	st := newServerTestStore(t)
+	for _, account := range []string{"site-a", "site-b"} {
+		if err := st.CreateAccount(account, account, 10, 5); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.CreateSIPEndpoint(store.SIPEndpoint{
+		ID: "phone-b", AccountID: "site-b", Extension: "2027",
+		Username: "2027", Password: "secret", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{store: st, cfg: config.DefaultConfig()}
+	in := asterisk.IncomingSIPCall{
+		Channel: "PJSIP/2027-00000001", CallerEndpoint: "2027", Extension: "1028",
+	}
+	if got := s.resolveAdvancedRouteSource("site-a", "1028", in); got != "1028" {
+		t.Fatalf("cross-account source = %q, want safe fallback 1028", got)
+	}
+}
+
 func newServerTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "simson.db"))
