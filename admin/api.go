@@ -125,7 +125,7 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":           "ok",
-		"server_version":   "1.3.0",
+		"server_version":   "1.5.0",
 		"protocol_version": "1.0.0",
 	})
 }

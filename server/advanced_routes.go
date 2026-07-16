@@ -170,12 +170,12 @@ func (s *Server) executeAdvancedRoute(run *advancedRouteRun, in asterisk.Incomin
 				run.mu.Unlock()
 				if stage.AnswerMode == "first_answer" {
 					timer.Stop()
-					s.activateAdvancedRoute(run, event.legID, "sip:"+event.target.Value)
+					s.activateAdvancedRoute(run, event.legID, "sip:"+event.target.Value, stage.MaxCallSeconds)
 					return
 				}
 				if stageAnswered >= stage.MaxAnswered {
 					timer.Stop()
-					s.activateAdvancedRoute(run, "", "conference")
+					s.activateAdvancedRoute(run, "", "conference", stage.MaxCallSeconds)
 					return
 				}
 			case <-timer.C:
@@ -183,7 +183,7 @@ func (s *Server) executeAdvancedRoute(run *advancedRouteRun, in asterisk.Incomin
 			}
 		}
 		if stageAnswered > 0 {
-			s.activateAdvancedRoute(run, "", "conference")
+			s.activateAdvancedRoute(run, "", "conference", stage.MaxCallSeconds)
 			return
 		}
 		s.cancelAdvancedRoutePending(run, "stage_timeout")
@@ -316,7 +316,7 @@ func (s *Server) claimAdvancedRouteHAOSAnswer(callID, nodeID string) {
 	}
 }
 
-func (s *Server) activateAdvancedRoute(run *advancedRouteRun, winner, answeredBy string) {
+func (s *Server) activateAdvancedRoute(run *advancedRouteRun, winner, answeredBy string, maxCallSeconds int) {
 	if winner != "" {
 		run.mu.Lock()
 		if run.winner == "" {
@@ -331,6 +331,26 @@ func (s *Server) activateAdvancedRoute(run *advancedRouteRun, winner, answeredBy
 	s.log.Info("advanced route answered", map[string]any{
 		"call_id": run.parentID, "route_id": run.plan.ID, "answered_by": answeredBy,
 	})
+	if maxCallSeconds > 0 {
+		go s.enforceAdvancedRouteCallLimit(run, time.Duration(maxCallSeconds)*time.Second)
+	}
+}
+
+func (s *Server) enforceAdvancedRouteCallLimit(run *advancedRouteRun, limit time.Duration) {
+	if run == nil || limit <= 0 {
+		return
+	}
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	select {
+	case <-run.done:
+		return
+	case <-timer.C:
+		s.log.Info("advanced route connected-call limit reached", map[string]any{
+			"call_id": run.parentID, "route_id": run.plan.ID, "limit_seconds": int(limit.Seconds()),
+		})
+		s.endAdvancedRoute(run, "call_time_limit", true)
+	}
 }
 
 func (s *Server) cancelAdvancedRouteLosers(run *advancedRouteRun, winner string) {

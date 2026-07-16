@@ -21,12 +21,13 @@ type RouteTarget struct {
 
 // RouteStage is an ordered routing level. Targets inside a stage ring together.
 type RouteStage struct {
-	ID          string        `json:"id"`
-	Name        string        `json:"name"`
-	RingSeconds int           `json:"ring_seconds"`
-	AnswerMode  string        `json:"answer_mode"` // first_answer, conference, private_hub
-	MaxAnswered int           `json:"max_answered"`
-	Targets     []RouteTarget `json:"targets"`
+	ID             string        `json:"id"`
+	Name           string        `json:"name"`
+	RingSeconds    int           `json:"ring_seconds"`
+	MaxCallSeconds int           `json:"max_call_seconds,omitempty"` // 0 keeps the connected call unlimited
+	AnswerMode     string        `json:"answer_mode"`                // first_answer, conference, private_hub
+	MaxAnswered    int           `json:"max_answered"`
+	Targets        []RouteTarget `json:"targets"`
 }
 
 // AdvancedRoute is an account-scoped, ordered call route.

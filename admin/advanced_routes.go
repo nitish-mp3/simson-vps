@@ -168,6 +168,9 @@ func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {
 		if stage.RingSeconds < 3 || stage.RingSeconds > 300 {
 			return fmt.Errorf("stage %d ring_seconds must be between 3 and 300", stageIndex+1)
 		}
+		if stage.MaxCallSeconds < 0 || stage.MaxCallSeconds > 86400 || (stage.MaxCallSeconds > 0 && stage.MaxCallSeconds < 10) {
+			return fmt.Errorf("stage %d max_call_seconds must be 0 (unlimited) or between 10 and 86400", stageIndex+1)
+		}
 		totalRing += stage.RingSeconds
 		stage.AnswerMode = strings.ToLower(strings.TrimSpace(stage.AnswerMode))
 		if stage.AnswerMode == "" {

@@ -1,6 +1,0 @@
-./ami.go
-./router.go
-./setup.go
-./ami_test.go
-./router_test.go
-./setup_test.go

@@ -1,0 +1,5 @@
+# test log
+getenv GOTMPDIR
+open C:\Users\Lenovo\AppData\Local\Temp
+getenv GOTMPDIR
+open C:\Users\Lenovo\AppData\Local\Temp

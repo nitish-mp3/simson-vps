@@ -107,6 +107,18 @@ func TestAdvancedRouteValidationIsAccountScopedAndCapabilitySafe(t *testing.T) {
 	if route.Stages[0].MaxAnswered != 1 {
 		t.Fatalf("first-answer route did not normalize max_answered: %#v", route.Stages[0])
 	}
+	invalidCallLimit := route
+	invalidCallLimit.Stages = append([]store.RouteStage(nil), route.Stages...)
+	invalidCallLimit.Stages[0].MaxCallSeconds = 5
+	if err := api.validateAdvancedRoute(&invalidCallLimit); err == nil {
+		t.Fatal("unsafe connected-call limit below 10 seconds was accepted")
+	}
+	validCallLimit := route
+	validCallLimit.Stages = append([]store.RouteStage(nil), route.Stages...)
+	validCallLimit.Stages[0].MaxCallSeconds = 30
+	if err := api.validateAdvancedRoute(&validCallLimit); err != nil {
+		t.Fatalf("valid connected-call limit rejected: %v", err)
+	}
 
 	repeatedAcrossStages := route
 	repeatedAcrossStages.Stages = []store.RouteStage{
