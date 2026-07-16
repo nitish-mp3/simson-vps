@@ -136,6 +136,10 @@ func (s *Server) executeAdvancedRoute(run *advancedRouteRun, in asterisk.Incomin
 			case "haos":
 				if s.inviteAdvancedRouteNode(run, target, in, sourceExt, stageIndex) {
 					activeTargets++
+					s.log.Info("advanced route HAOS destination invited", map[string]any{
+						"call_id": run.parentID, "route_id": run.plan.ID,
+						"stage": stageIndex + 1, "target": target.Value,
+					})
 				}
 			case "sip", "gateway", "external":
 				if s.originateAdvancedRouteLeg(run, target, in, sourceExt, stage.RingSeconds) {
@@ -225,6 +229,10 @@ func (s *Server) inviteAdvancedRouteNode(run *advancedRouteRun, target store.Rou
 
 func (s *Server) originateAdvancedRouteLeg(run *advancedRouteRun, target store.RouteTarget, in asterisk.IncomingSIPCall, sourceExt string, timeout int) bool {
 	if target.Kind != "external" && !s.asterisk.EndpointHasContacts(target.Value) {
+		s.log.Warn("advanced route destination has no registered SIP contact", map[string]any{
+			"call_id": run.parentID, "route_id": run.plan.ID,
+			"kind": target.Kind, "target": target.Value,
+		})
 		return false
 	}
 	legID := "route_leg_" + uuid.NewString()
@@ -257,6 +265,11 @@ func (s *Server) originateAdvancedRouteLeg(run *advancedRouteRun, target store.R
 		})
 		return false
 	}
+	s.log.Info("advanced route SIP destination ringing", map[string]any{
+		"call_id": run.parentID, "route_id": run.plan.ID,
+		"leg_id": legID, "kind": target.Kind, "target": target.Value,
+		"timeout_seconds": timeout,
+	})
 	return true
 }
 

@@ -2106,7 +2106,7 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	advancedSourceExt := s.resolveAdvancedRouteSource(accountID, sourceExt, in)
 	// Advanced routes are additive. If no enabled plan exactly matches this
 	// account and source endpoint, the established routing path remains intact.
-	if s.tryStartAdvancedRoute(accountID, advancedSourceExt, in) {
+	if !isHAOSBypassCode(in.Extension) && s.tryStartAdvancedRoute(accountID, advancedSourceExt, in) {
 		return
 	}
 
@@ -3184,7 +3184,9 @@ func (s *Server) shouldSuppressIncomingSIPInvite(accountID string, in asterisk.I
 		}
 	}
 	if ts, ok := s.recentSIPInvites[key]; ok && now.Sub(ts) < 4*time.Second {
-		s.recentSIPInvites[key] = now
+		// Do not slide the debounce window forward for every suppressed retry.
+		// A handset that retries every few seconds must recover once the first
+		// invite's fixed window expires instead of being blocked indefinitely.
 		s.recentSIPInvitesMu.Unlock()
 		return true
 	}
@@ -3473,7 +3475,16 @@ func isLikelyInternalExtension(ext string) bool {
 }
 
 func isHAOSRingCode(ext string) bool {
-	return strings.TrimSpace(ext) == "100"
+	switch strings.TrimSpace(ext) {
+	case "100", "*100":
+		return true
+	default:
+		return false
+	}
+}
+
+func isHAOSBypassCode(ext string) bool {
+	return strings.TrimSpace(ext) == "*100"
 }
 
 func isSafeDialNumber(number string) bool {

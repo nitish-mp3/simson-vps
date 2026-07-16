@@ -60,7 +60,7 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	if !strings.Contains(dialplan, "Set(JITTERBUFFER(adaptive)=default)") {
 		t.Fatal("generated dialplan should enable adaptive jitter buffering on bridge media paths")
 	}
-	directDesk := section(dialplan, "exten => 1025,1,NoOp(Simson direct SIP endpoint", "exten => _+X.")
+	directDesk := section(dialplan, "exten => 1025,1,NoOp(Simson direct SIP endpoint", "; Explicit HAOS-card bypass.")
 	if strings.Count(directDesk, "Set(JITTERBUFFER(adaptive)=default)") != 1 {
 		t.Fatalf("direct SIP caller leg should receive exactly one adaptive jitter buffer:\n%s", directDesk)
 	}
@@ -73,6 +73,9 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	}
 	if !strings.Contains(inboundSIP, "UserEvent(SimsonRoute") {
 		t.Fatal("SIP-phone PSTN calls must reach SimsonRoute for per-account gateway selection")
+	}
+	if !strings.Contains(inboundSIP, "exten => *100,1,NoOp(Simson: explicit HAOS card bypass") {
+		t.Fatal("*100 must provide an explicit HAOS-card bypass for phones with a live advanced route")
 	}
 }
 

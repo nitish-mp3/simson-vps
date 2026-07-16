@@ -73,8 +73,35 @@ func TestHAOSRingCode(t *testing.T) {
 	if !isHAOSRingCode("100") {
 		t.Fatal("100 should be the reserved HAOS ring code")
 	}
+	if !isHAOSRingCode("*100") || !isHAOSBypassCode("*100") {
+		t.Fatal("*100 should explicitly bypass advanced SIP routes and ring HAOS")
+	}
+	if isHAOSBypassCode("100") {
+		t.Fatal("100 remains available as the advanced route trigger")
+	}
 	if isHAOSRingCode("1001") {
 		t.Fatal("normal SIP extensions must not be treated as the HAOS ring code")
+	}
+}
+
+func TestSuppressIncomingSIPInviteUsesFixedDebounceWindow(t *testing.T) {
+	s := &Server{calls: calls.NewManager(), recentSIPInvites: map[string]time.Time{}}
+	in := asterisk.IncomingSIPCall{
+		Channel:   "PJSIP/1027-00000001",
+		Extension: "100",
+		CallerID:  "1027",
+		BridgeID:  "bridge-1",
+	}
+	if s.shouldSuppressIncomingSIPInvite("acct", in, "1027") {
+		t.Fatal("first invite should not be suppressed")
+	}
+	key := "acct|100|1027|1027"
+	original := s.recentSIPInvites[key]
+	if !s.shouldSuppressIncomingSIPInvite("acct", in, "1027") {
+		t.Fatal("immediate duplicate should be suppressed")
+	}
+	if got := s.recentSIPInvites[key]; !got.Equal(original) {
+		t.Fatalf("suppressed retry moved debounce timestamp from %v to %v", original, got)
 	}
 }
 

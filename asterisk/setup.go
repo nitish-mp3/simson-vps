@@ -645,6 +645,15 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 ; a registered phone dialing it should ring that phone directly. Endpoints with
 ; RouteTo set are ingress/routing endpoints and continue through SimsonRoute.
 %s
+; Explicit HAOS-card bypass. A live advanced route may use 100 as its
+; source-phone trigger; *100 always skips that plan and rings the HAOS card.
+exten => *100,1,NoOp(Simson: explicit HAOS card bypass from ${CALLERID(num)})
+ same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
+ same  => n,Set(JITTERBUFFER(adaptive)=default)
+ same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
+ same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
+ same  => n,Hangup()
+
 ; SIP-phone outside dialing is intentionally routed through the catch-all
 ; SimsonRoute event below. The VPS then chooses an enabled gateway trunk scoped
 ; to the caller's account/site instead of hardwiring a global default trunk.
