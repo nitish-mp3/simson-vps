@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,20 @@ type API struct {
 	tts      *promptSynthesizer
 	doorMu   sync.Mutex
 	doorLast map[string]time.Time
+}
+
+// sipSupervisionConfig controls feature-code call supervision for one
+// authenticated supervisor endpoint. Targets are always validated against the
+// same account before this configuration reaches Asterisk.
+type sipSupervisionConfig struct {
+	Enabled    bool     `json:"enabled"`
+	Listen     bool     `json:"listen"`
+	ListenKey  string   `json:"listen_key"`
+	Whisper    bool     `json:"whisper"`
+	WhisperKey string   `json:"whisper_key"`
+	Barge      bool     `json:"barge"`
+	BargeKey   string   `json:"barge_key"`
+	Targets    []string `json:"targets"`
 }
 
 // New creates an admin API.
@@ -447,28 +462,29 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Extension                 string         `json:"extension"`
-		Username                  string         `json:"username"`
-		Password                  string         `json:"password"`
-		Description               string         `json:"description"`
-		RouteTo                   string         `json:"route_to"`
-		VideoEnabled              *bool          `json:"video_enabled"`
-		AutoAnswer                *bool          `json:"auto_answer"`
-		AutoAnswerCallers         string         `json:"auto_answer_callers"`
-		AutoSpeaker               *bool          `json:"auto_speaker"`
-		AutoSpeakerCallers        string         `json:"auto_speaker_callers"`
-		CallbackBridge            *bool          `json:"callback_bridge"`
-		CallbackBridgeCallers     string         `json:"callback_bridge_callers"`
-		CallbackCallerAutoAnswer  *bool          `json:"callback_caller_auto_answer"`
-		CallbackCallerAutoSpeaker *bool          `json:"callback_caller_auto_speaker"`
-		DefaultOutbound           *bool          `json:"default_outbound"`
-		GatewayInboundMode        string         `json:"gateway_inbound_mode"`
-		GatewayDirectTarget       string         `json:"gateway_direct_target"`
-		GatewayIVREnabled         *bool          `json:"gateway_ivr_enabled"`
-		GatewayIVRSound           string         `json:"gateway_ivr_sound"`
-		AnswerAnnouncementText    string         `json:"answer_announcement_text"`
-		PreRingAnnouncementText   string         `json:"pre_ring_announcement_text"`
-		CallDurationRules         map[string]int `json:"call_duration_rules"`
+		Extension                 string               `json:"extension"`
+		Username                  string               `json:"username"`
+		Password                  string               `json:"password"`
+		Description               string               `json:"description"`
+		RouteTo                   string               `json:"route_to"`
+		VideoEnabled              *bool                `json:"video_enabled"`
+		AutoAnswer                *bool                `json:"auto_answer"`
+		AutoAnswerCallers         string               `json:"auto_answer_callers"`
+		AutoSpeaker               *bool                `json:"auto_speaker"`
+		AutoSpeakerCallers        string               `json:"auto_speaker_callers"`
+		CallbackBridge            *bool                `json:"callback_bridge"`
+		CallbackBridgeCallers     string               `json:"callback_bridge_callers"`
+		CallbackCallerAutoAnswer  *bool                `json:"callback_caller_auto_answer"`
+		CallbackCallerAutoSpeaker *bool                `json:"callback_caller_auto_speaker"`
+		DefaultOutbound           *bool                `json:"default_outbound"`
+		GatewayInboundMode        string               `json:"gateway_inbound_mode"`
+		GatewayDirectTarget       string               `json:"gateway_direct_target"`
+		GatewayIVREnabled         *bool                `json:"gateway_ivr_enabled"`
+		GatewayIVRSound           string               `json:"gateway_ivr_sound"`
+		AnswerAnnouncementText    string               `json:"answer_announcement_text"`
+		PreRingAnnouncementText   string               `json:"pre_ring_announcement_text"`
+		CallDurationRules         map[string]int       `json:"call_duration_rules"`
+		Supervision               sipSupervisionConfig `json:"supervision"`
 		// AnswerAnnouncement is retained for backward compatibility with an
 		// older admin UI that exposed Asterisk sound paths directly.
 		AnswerAnnouncement  string `json:"answer_announcement"`
@@ -647,6 +663,12 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	supervisionConfig, err := a.normalizeSupervisionConfig(accountID, body.Extension, body.Supervision)
+	if err != nil {
+		a.tts.CleanupEndpoint(accountID, endpointID)
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
 	ep := store.SIPEndpoint{
 		ID:                        endpointID,
 		AccountID:                 accountID,
@@ -674,6 +696,7 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		PreRingAnnouncement:       preRingAnnouncement,
 		PreRingAnnouncementText:   preRingAnnouncementText,
 		CallDurationRules:         callDurationRules,
+		SupervisionConfig:         supervisionConfig,
 		Enabled:                   enabled,
 	}
 	if err := a.store.CreateSIPEndpoint(ep); err != nil {
@@ -686,7 +709,7 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		a.clearOtherDefaultOutboundGateways(ep.AccountID, ep.ID)
 	}
 	a.reconfigureAsterisk()
-	writeJSON(w, http.StatusCreated, ep)
+	writeJSON(w, http.StatusCreated, a.enrichSIPEndpoints([]store.SIPEndpoint{ep})[0])
 }
 
 func (a *API) handleListSIPEndpoints(w http.ResponseWriter, r *http.Request) {
@@ -712,6 +735,7 @@ func (a *API) enrichSIPEndpoints(eps []store.SIPEndpoint) []map[string]any {
 
 	out := make([]map[string]any, 0, len(eps))
 	for _, ep := range eps {
+		supervision := decodeSupervisionConfig(ep.SupervisionConfig)
 		contact := contacts[ep.Username]
 		if !contact.Registered {
 			if byExt, ok := contacts[ep.Extension]; ok {
@@ -744,6 +768,7 @@ func (a *API) enrichSIPEndpoints(eps []store.SIPEndpoint) []map[string]any {
 			"pre_ring_announcement":        ep.PreRingAnnouncement,
 			"pre_ring_announcement_text":   ep.PreRingAnnouncementText,
 			"call_duration_rules":          ep.CallDurationRules,
+			"supervision":                  supervision,
 			"enabled":                      ep.Enabled,
 			"created_at":                   ep.CreatedAt,
 			"updated_at":                   ep.UpdatedAt,
@@ -787,29 +812,30 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	previousAnswerAnnouncement := ep.AnswerAnnouncement
 	previousPreRingAnnouncement := ep.PreRingAnnouncement
 	var body struct {
-		Description               *string         `json:"description"`
-		Password                  *string         `json:"password"`
-		RouteTo                   *string         `json:"route_to"`
-		VideoEnabled              *bool           `json:"video_enabled"`
-		AutoAnswer                *bool           `json:"auto_answer"`
-		AutoAnswerCallers         *string         `json:"auto_answer_callers"`
-		AutoSpeaker               *bool           `json:"auto_speaker"`
-		AutoSpeakerCallers        *string         `json:"auto_speaker_callers"`
-		CallbackBridge            *bool           `json:"callback_bridge"`
-		CallbackBridgeCallers     *string         `json:"callback_bridge_callers"`
-		CallbackCallerAutoAnswer  *bool           `json:"callback_caller_auto_answer"`
-		CallbackCallerAutoSpeaker *bool           `json:"callback_caller_auto_speaker"`
-		DefaultOutbound           *bool           `json:"default_outbound"`
-		GatewayInboundMode        *string         `json:"gateway_inbound_mode"`
-		GatewayDirectTarget       *string         `json:"gateway_direct_target"`
-		GatewayIVREnabled         *bool           `json:"gateway_ivr_enabled"`
-		GatewayIVRSound           *string         `json:"gateway_ivr_sound"`
-		AnswerAnnouncement        *string         `json:"answer_announcement"`
-		AnswerAnnouncementText    *string         `json:"answer_announcement_text"`
-		PreRingAnnouncement       *string         `json:"pre_ring_announcement"`
-		PreRingAnnouncementText   *string         `json:"pre_ring_announcement_text"`
-		CallDurationRules         *map[string]int `json:"call_duration_rules"`
-		Enabled                   *bool           `json:"enabled"`
+		Description               *string               `json:"description"`
+		Password                  *string               `json:"password"`
+		RouteTo                   *string               `json:"route_to"`
+		VideoEnabled              *bool                 `json:"video_enabled"`
+		AutoAnswer                *bool                 `json:"auto_answer"`
+		AutoAnswerCallers         *string               `json:"auto_answer_callers"`
+		AutoSpeaker               *bool                 `json:"auto_speaker"`
+		AutoSpeakerCallers        *string               `json:"auto_speaker_callers"`
+		CallbackBridge            *bool                 `json:"callback_bridge"`
+		CallbackBridgeCallers     *string               `json:"callback_bridge_callers"`
+		CallbackCallerAutoAnswer  *bool                 `json:"callback_caller_auto_answer"`
+		CallbackCallerAutoSpeaker *bool                 `json:"callback_caller_auto_speaker"`
+		DefaultOutbound           *bool                 `json:"default_outbound"`
+		GatewayInboundMode        *string               `json:"gateway_inbound_mode"`
+		GatewayDirectTarget       *string               `json:"gateway_direct_target"`
+		GatewayIVREnabled         *bool                 `json:"gateway_ivr_enabled"`
+		GatewayIVRSound           *string               `json:"gateway_ivr_sound"`
+		AnswerAnnouncement        *string               `json:"answer_announcement"`
+		AnswerAnnouncementText    *string               `json:"answer_announcement_text"`
+		PreRingAnnouncement       *string               `json:"pre_ring_announcement"`
+		PreRingAnnouncementText   *string               `json:"pre_ring_announcement_text"`
+		CallDurationRules         *map[string]int       `json:"call_duration_rules"`
+		Supervision               *sipSupervisionConfig `json:"supervision"`
+		Enabled                   *bool                 `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
@@ -986,6 +1012,19 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		ep.CallDurationRules = rules
 		callBehaviorChanged = true
 	}
+	supervisionChanged := false
+	if body.Supervision != nil {
+		config, err := a.normalizeSupervisionConfig(ep.AccountID, ep.Extension, *body.Supervision)
+		if err != nil {
+			if generatedAnnouncement {
+				a.tts.CleanupEndpoint(ep.AccountID, ep.ID, previousAnswerAnnouncement, previousPreRingAnnouncement)
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		ep.SupervisionConfig = config
+		supervisionChanged = true
+	}
 	if body.Enabled != nil {
 		ep.Enabled = *body.Enabled
 	}
@@ -1019,6 +1058,13 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		// The cache is endpoint-scoped, preserving the two active prompt files
 		// while removing older generated revisions.
 		a.tts.CleanupEndpoint(ep.AccountID, ep.ID, ep.AnswerAnnouncement, ep.PreRingAnnouncement)
+	}
+	if supervisionChanged {
+		if err := a.store.UpdateSIPEndpointSupervision(ep.ID, ep.SupervisionConfig); err != nil {
+			a.log.Error("update SIP supervision settings", map[string]any{"err": err.Error()})
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+			return
+		}
 	}
 	if ep.DefaultOutbound {
 		a.clearOtherDefaultOutboundGateways(ep.AccountID, ep.ID)
@@ -1244,6 +1290,116 @@ func (a *API) normalizeCallDurationRules(accountID, targetExtension string, rule
 	encoded, err := json.Marshal(normalized)
 	if err != nil {
 		return "", fmt.Errorf("could not encode call duration routes")
+	}
+	return string(encoded), nil
+}
+
+func supervisionDefaults(cfg sipSupervisionConfig) sipSupervisionConfig {
+	if strings.TrimSpace(cfg.ListenKey) == "" {
+		cfg.ListenKey = "*81"
+	}
+	if strings.TrimSpace(cfg.WhisperKey) == "" {
+		cfg.WhisperKey = "*82"
+	}
+	if strings.TrimSpace(cfg.BargeKey) == "" {
+		cfg.BargeKey = "*83"
+	}
+	return cfg
+}
+
+func decodeSupervisionConfig(raw string) sipSupervisionConfig {
+	cfg := sipSupervisionConfig{}
+	if strings.TrimSpace(raw) != "" {
+		_ = json.Unmarshal([]byte(raw), &cfg)
+	}
+	return supervisionDefaults(cfg)
+}
+
+func normalizeSupervisionKey(value string) (string, bool) {
+	key := strings.TrimSpace(value)
+	if len(key) < 2 || len(key) > 7 || key[0] != '*' {
+		return "", false
+	}
+	for _, ch := range key[1:] {
+		if ch < '0' || ch > '9' {
+			return "", false
+		}
+	}
+	return key, true
+}
+
+func (a *API) normalizeSupervisionConfig(accountID, supervisorExtension string, input sipSupervisionConfig) (string, error) {
+	cfg := supervisionDefaults(input)
+	if !cfg.Enabled {
+		cfg.Listen = false
+		cfg.Whisper = false
+		cfg.Barge = false
+		cfg.Targets = nil
+		encoded, _ := json.Marshal(cfg)
+		return string(encoded), nil
+	}
+	if !cfg.Listen && !cfg.Whisper && !cfg.Barge {
+		return "", fmt.Errorf("enable at least one supervision mode")
+	}
+
+	keys := map[string]string{}
+	for label, raw := range map[string]string{
+		"silent monitor": cfg.ListenKey,
+		"whisper":        cfg.WhisperKey,
+		"full barge":     cfg.BargeKey,
+	} {
+		key, ok := normalizeSupervisionKey(raw)
+		if !ok {
+			return "", fmt.Errorf("%s feature key must start with * and contain 1-6 digits", label)
+		}
+		if previous, exists := keys[key]; exists {
+			return "", fmt.Errorf("%s and %s cannot use the same feature key %s", previous, label, key)
+		}
+		keys[key] = label
+		switch label {
+		case "silent monitor":
+			cfg.ListenKey = key
+		case "whisper":
+			cfg.WhisperKey = key
+		case "full barge":
+			cfg.BargeKey = key
+		}
+	}
+
+	endpoints, err := a.store.ListSIPEndpoints(accountID)
+	if err != nil {
+		return "", fmt.Errorf("could not validate supervision targets")
+	}
+	allowed := make(map[string]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpoint.Enabled && isSafeSIPExtension(endpoint.Extension) && endpoint.Extension != supervisorExtension {
+			allowed[endpoint.Extension] = struct{}{}
+		}
+	}
+	seen := map[string]struct{}{}
+	targets := make([]string, 0, len(cfg.Targets))
+	for _, raw := range cfg.Targets {
+		target := strings.TrimSpace(raw)
+		if target == "" {
+			continue
+		}
+		if _, ok := allowed[target]; !ok {
+			return "", fmt.Errorf("supervision target %s is not another enabled SIP phone on this site", target)
+		}
+		if _, duplicate := seen[target]; duplicate {
+			continue
+		}
+		seen[target] = struct{}{}
+		targets = append(targets, target)
+	}
+	if len(targets) == 0 {
+		return "", fmt.Errorf("select at least one SIP phone this supervisor may access")
+	}
+	sort.Strings(targets)
+	cfg.Targets = targets
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("could not encode supervision settings")
 	}
 	return string(encoded), nil
 }
@@ -1518,6 +1674,7 @@ func (a *API) reconfigureAsterisk() {
 	for _, ep := range endpoints {
 		defs = append(defs, asterisk.SIPEndpointDef{
 			ID:                        ep.ID,
+			AccountID:                 ep.AccountID,
 			Extension:                 ep.Extension,
 			Username:                  ep.Username,
 			Password:                  ep.Password,
@@ -1536,6 +1693,7 @@ func (a *API) reconfigureAsterisk() {
 			AnswerAnnouncement:        ep.AnswerAnnouncement,
 			PreRingAnnouncement:       ep.PreRingAnnouncement,
 			CallDurationRules:         ep.CallDurationRules,
+			SupervisionConfig:         ep.SupervisionConfig,
 			Enabled:                   ep.Enabled,
 		})
 	}

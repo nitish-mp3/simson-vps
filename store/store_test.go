@@ -60,6 +60,9 @@ func TestOpenMigratesLegacySIPEndpointsWithVideoFlag(t *testing.T) {
 	if door.CallDurationRules != "{}" {
 		t.Fatalf("legacy SIP endpoint should default to unlimited calls, got %q", door.CallDurationRules)
 	}
+	if door.SupervisionConfig != "{}" {
+		t.Fatalf("legacy SIP endpoint should default to disabled supervision, got %q", door.SupervisionConfig)
+	}
 
 	if err := store.UpdateSIPEndpoint(door.ID, door.Description, door.Password, door.RouteTo, true, true, "1025", true, "1602", true, "1025", true, true, false, door.Enabled); err != nil {
 		t.Fatal(err)
@@ -122,6 +125,17 @@ func TestOpenMigratesLegacySIPEndpointsWithVideoFlag(t *testing.T) {
 	}
 	if door.CallDurationRules != `{"1025":15}` {
 		t.Fatalf("route duration rules were not persisted: %q", door.CallDurationRules)
+	}
+	policy := `{"enabled":true,"listen":true,"listen_key":"*81","targets":["1025"]}`
+	if err := store.UpdateSIPEndpointSupervision(door.ID, policy); err != nil {
+		t.Fatal(err)
+	}
+	door, err = store.GetSIPEndpoint("door")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if door.SupervisionConfig != policy {
+		t.Fatalf("supervision policy was not persisted: %q", door.SupervisionConfig)
 	}
 }
 

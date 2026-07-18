@@ -27,6 +27,9 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	}
 
 	pjsip := readTestFile(t, filepath.Join(root, "pjsip.d", "simson.conf"))
+	if !strings.Contains(pjsip, "keep_alive_interval=25") {
+		t.Fatal("PJSIP global config must keep TCP/TLS phone NAT bindings alive")
+	}
 	if strings.Contains(section(pjsip, "[simson-ep-tpl](!)", "[simson-auth-tpl](!)"), "transport=") {
 		t.Fatal("SIP phone template should allow the registered contact transport")
 	}
@@ -76,6 +79,44 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	}
 	if !strings.Contains(inboundSIP, "exten => *100,1,NoOp(Simson: explicit HAOS card bypass") {
 		t.Fatal("*100 must provide an explicit HAOS-card bypass for phones with a live advanced route")
+	}
+}
+
+func TestSupervisionDialplanIsExactAuthenticatedAndAccountScoped(t *testing.T) {
+	root := t.TempDir()
+	endpoints := []SIPEndpointDef{
+		{
+			Extension: "1026", AccountID: "site-a", Enabled: true,
+			SupervisionConfig: `{"enabled":true,"listen":true,"listen_key":"*81","whisper":true,"whisper_key":"*82","barge":true,"barge_key":"*83","targets":["1028","2020"]}`,
+		},
+		{Extension: "1028", AccountID: "site-a", Enabled: true},
+		{Extension: "2020", AccountID: "site-b", Enabled: true},
+	}
+	if err := writeDialplanConf(root, "from-simson-sip", "from-simson-node", "from-simson-out", "7009", nil, endpoints); err != nil {
+		t.Fatal(err)
+	}
+
+	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
+	for _, want := range []string{
+		"exten => *811028,1,NoOp(Simson authorized call supervision",
+		"exten => *821028,1,NoOp(Simson authorized call supervision",
+		"exten => *831028,1,NoOp(Simson authorized call supervision",
+		`Set(SIMSON_SUPERVISOR=${CHANNEL(pjsip,endpoint)})`,
+		`GotoIf($["${SIMSON_SUPERVISOR}" = "1026"]?supervise-0)`,
+		"ChanSpy(PJSIP/1028-,qbE)",
+		"ChanSpy(PJSIP/1028-,qbwE)",
+		"ChanSpy(PJSIP/1028-,qbBE)",
+		"exten => 1028,1,NoOp(Simson direct SIP endpoint",
+	} {
+		if !strings.Contains(dialplan, want) {
+			t.Fatalf("generated supervision dialplan missing %q:\n%s", want, dialplan)
+		}
+	}
+	if strings.Contains(dialplan, "*812020") || strings.Contains(dialplan, "ChanSpy(PJSIP/2020-") {
+		t.Fatalf("cross-account supervision target leaked into dialplan:\n%s", dialplan)
+	}
+	if !strings.Contains(section(dialplan, "exten => *811028", "exten => *821028"), "Hangup(21)") {
+		t.Fatal("unauthorized supervisor calls must be rejected")
 	}
 }
 

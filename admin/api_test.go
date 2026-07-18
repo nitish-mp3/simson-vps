@@ -70,6 +70,53 @@ func TestCallDurationRulesAreExactAndAccountScoped(t *testing.T) {
 	}
 }
 
+func TestSupervisionPolicyIsExplicitAndAccountScoped(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "supervision.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, account := range []string{"site-a", "site-b"} {
+		if err := st.CreateAccount(account, account, 10, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, endpoint := range []store.SIPEndpoint{
+		{ID: "supervisor", AccountID: "site-a", Extension: "1026", Username: "site-a-1026", Password: "secret", Enabled: true, CallDurationRules: "{}", SupervisionConfig: "{}"},
+		{ID: "target-a", AccountID: "site-a", Extension: "1028", Username: "site-a-1028", Password: "secret", Enabled: true, CallDurationRules: "{}", SupervisionConfig: "{}"},
+		{ID: "target-b", AccountID: "site-b", Extension: "2028", Username: "site-b-2028", Password: "secret", Enabled: true, CallDurationRules: "{}", SupervisionConfig: "{}"},
+	} {
+		if err := st.CreateSIPEndpoint(endpoint); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	api := &API{store: st}
+	encoded, err := api.normalizeSupervisionConfig("site-a", "1026", sipSupervisionConfig{
+		Enabled: true, Listen: true, Whisper: true, Barge: true, Targets: []string{"1028"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := decodeSupervisionConfig(encoded)
+	if policy.ListenKey != "*81" || policy.WhisperKey != "*82" || policy.BargeKey != "*83" || len(policy.Targets) != 1 || policy.Targets[0] != "1028" {
+		t.Fatalf("unexpected normalized supervision policy: %#v", policy)
+	}
+
+	invalid := []sipSupervisionConfig{
+		{Enabled: true, Listen: true, ListenKey: "81", Targets: []string{"1028"}},
+		{Enabled: true, Listen: true, ListenKey: "*81", Whisper: true, WhisperKey: "*81", Targets: []string{"1028"}},
+		{Enabled: true, Listen: true, Targets: []string{"2028"}},
+		{Enabled: true, Listen: true, Targets: []string{"1026"}},
+		{Enabled: true, Listen: true},
+	}
+	for _, input := range invalid {
+		if _, err := api.normalizeSupervisionConfig("site-a", "1026", input); err == nil {
+			t.Fatalf("unsafe supervision policy was accepted: %#v", input)
+		}
+	}
+}
+
 func TestAdvancedRouteValidationIsAccountScopedAndCapabilitySafe(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "advanced-route-validation.db"))
 	if err != nil {

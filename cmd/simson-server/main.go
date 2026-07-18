@@ -76,6 +76,7 @@ func main() {
 			for i, ep := range eps {
 				defs[i] = asterisk.SIPEndpointDef{
 					ID:                        ep.ID,
+					AccountID:                 ep.AccountID,
 					Extension:                 ep.Extension,
 					Username:                  ep.Username,
 					Password:                  ep.Password,
@@ -89,6 +90,12 @@ func main() {
 					CallbackBridgeCallers:     ep.CallbackBridgeCallers,
 					CallbackCallerAutoAnswer:  ep.CallbackCallerAutoAnswer,
 					CallbackCallerAutoSpeaker: ep.CallbackCallerAutoSpeaker,
+					GatewayIVREnabled:         ep.GatewayIVREnabled,
+					GatewayIVRSound:           ep.GatewayIVRSound,
+					AnswerAnnouncement:        ep.AnswerAnnouncement,
+					PreRingAnnouncement:       ep.PreRingAnnouncement,
+					CallDurationRules:         ep.CallDurationRules,
+					SupervisionConfig:         ep.SupervisionConfig,
 					Enabled:                   ep.Enabled,
 				}
 			}

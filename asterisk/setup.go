@@ -37,6 +37,7 @@ type SetupConfig struct {
 // It mirrors store.SIPEndpoint but avoids an import cycle.
 type SIPEndpointDef struct {
 	ID           string
+	AccountID    string
 	Extension    string
 	Username     string
 	Password     string
@@ -67,6 +68,9 @@ type SIPEndpointDef struct {
 	// CallDurationRules maps exact source SIP extensions to the maximum
 	// connected-call duration for this target, encoded as validated JSON.
 	CallDurationRules string
+	// SupervisionConfig contains validated account-scoped feature-code
+	// permissions for this authenticated endpoint.
+	SupervisionConfig string
 	Enabled           bool
 }
 
@@ -307,7 +311,7 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 	if enableAnonymousIngress {
 		endpointOrder += ",anonymous"
 	}
-	sb.WriteString("[global]\ntype=global\nmax_initial_qualify_time=60\nendpoint_identifier_order=" + endpointOrder + "\n\n")
+	sb.WriteString("[global]\ntype=global\nmax_initial_qualify_time=60\nkeep_alive_interval=25\nendpoint_identifier_order=" + endpointOrder + "\n\n")
 
 	// ── Endpoint template (shared settings for all Simson phones) ─────────────
 	sipContext := cfg.InContext
@@ -623,6 +627,7 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 		outCtx = "from-simson-out"
 	}
 
+	supervisionRoutes := buildSupervisionDialplan(endpoints)
 	directEndpointRoutes := buildDirectEndpointDialplan(endpoints)
 	autoAnswerExtensionRoutes := buildAutoAnswerExtensionDialplan(endpoints)
 	anonymousRoutes := buildAnonymousInboundDialplan(noAuthInboundExtensions, endpoints)
@@ -644,7 +649,7 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 ; If a SIP endpoint has no RouteTo node, it behaves like a normal PBX extension:
 ; a registered phone dialing it should ring that phone directly. Endpoints with
 ; RouteTo set are ingress/routing endpoints and continue through SimsonRoute.
-%s
+%s%s
 ; Explicit HAOS-card bypass. A live advanced route may use 100 as its
 ; source-phone trigger; *100 always skips that plan and rings the HAOS card.
 exten => *100,1,NoOp(Simson: explicit HAOS card bypass from ${CALLERID(num)})
@@ -861,7 +866,7 @@ exten => t,1,Hangup(16)
 [simson-blf]
 ; BLF/presence hints for desk phones that subscribe to extension state.
 %s
-`, inCtx, nodeCtx, outCtx, inCtx, directEndpointRoutes, nodeCtx, autoAnswerExtensionRoutes, outCtx, outCtx, anonymousRoutes, blfHints)
+`, inCtx, nodeCtx, outCtx, inCtx, supervisionRoutes, directEndpointRoutes, nodeCtx, autoAnswerExtensionRoutes, outCtx, outCtx, anonymousRoutes, blfHints)
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(content), 0640)
 }
@@ -1148,6 +1153,129 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		}
 	}
 	return sb.String()
+}
+
+type supervisionConfig struct {
+	Enabled    bool     `json:"enabled"`
+	Listen     bool     `json:"listen"`
+	ListenKey  string   `json:"listen_key"`
+	Whisper    bool     `json:"whisper"`
+	WhisperKey string   `json:"whisper_key"`
+	Barge      bool     `json:"barge"`
+	BargeKey   string   `json:"barge_key"`
+	Targets    []string `json:"targets"`
+}
+
+type supervisionRule struct {
+	Supervisor string
+	Target     string
+	Mode       string
+	Options    string
+}
+
+func buildSupervisionDialplan(endpoints []SIPEndpointDef) string {
+	known := map[string]map[string]struct{}{}
+	for _, ep := range endpoints {
+		if !ep.Enabled {
+			continue
+		}
+		account := strings.TrimSpace(ep.AccountID)
+		ext := sanitizeID(strings.TrimSpace(ep.Extension))
+		if account == "" || ext == "" || isReservedGatewayExtension(ext) {
+			continue
+		}
+		if known[account] == nil {
+			known[account] = map[string]struct{}{}
+		}
+		known[account][ext] = struct{}{}
+	}
+
+	rules := map[string][]supervisionRule{}
+	for _, ep := range endpoints {
+		if !ep.Enabled || strings.TrimSpace(ep.SupervisionConfig) == "" {
+			continue
+		}
+		var cfg supervisionConfig
+		if err := json.Unmarshal([]byte(ep.SupervisionConfig), &cfg); err != nil || !cfg.Enabled {
+			continue
+		}
+		supervisor := sanitizeID(strings.TrimSpace(ep.Extension))
+		account := strings.TrimSpace(ep.AccountID)
+		if supervisor == "" || account == "" {
+			continue
+		}
+		modes := []struct {
+			enabled bool
+			key     string
+			name    string
+			options string
+		}{
+			{cfg.Listen, cfg.ListenKey, "listen", "qbE"},
+			{cfg.Whisper, cfg.WhisperKey, "whisper", "qbwE"},
+			{cfg.Barge, cfg.BargeKey, "barge", "qbBE"},
+		}
+		for _, targetRaw := range cfg.Targets {
+			target := sanitizeID(strings.TrimSpace(targetRaw))
+			if target == "" || target == supervisor {
+				continue
+			}
+			if _, ok := known[account][target]; !ok {
+				continue
+			}
+			for _, mode := range modes {
+				key := normalizeSupervisionDialKey(mode.key)
+				if !mode.enabled || key == "" {
+					continue
+				}
+				dialed := key + target
+				rules[dialed] = append(rules[dialed], supervisionRule{
+					Supervisor: supervisor,
+					Target:     target,
+					Mode:       mode.name,
+					Options:    mode.options,
+				})
+			}
+		}
+	}
+	if len(rules) == 0 {
+		return "; Call supervision is disabled for all SIP endpoints.\n"
+	}
+
+	keys := make([]string, 0, len(rules))
+	for key := range rules {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	sb.WriteString("; Account-scoped call supervision. Authorization uses the authenticated\n")
+	sb.WriteString("; PJSIP endpoint and cannot be granted by spoofing caller ID.\n")
+	for _, dialed := range keys {
+		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson authorized call supervision ${CHANNEL(pjsip,endpoint)} dialed %s)\n", dialed, dialed)
+		sb.WriteString(" same  => n,Set(SIMSON_SUPERVISOR=${CHANNEL(pjsip,endpoint)})\n")
+		for i, rule := range rules[dialed] {
+			fmt.Fprintf(&sb, " same  => n,GotoIf($[\"${SIMSON_SUPERVISOR}\" = \"%s\"]?supervise-%d)\n", rule.Supervisor, i)
+		}
+		sb.WriteString(" same  => n,Hangup(21)\n")
+		for i, rule := range rules[dialed] {
+			fmt.Fprintf(&sb, " same  => n(supervise-%d),NoOp(Simson %s %s -> %s)\n", i, rule.Mode, rule.Supervisor, rule.Target)
+			fmt.Fprintf(&sb, " same  => n,ChanSpy(PJSIP/%s-,%s)\n", rule.Target, rule.Options)
+			sb.WriteString(" same  => n,Hangup()\n")
+		}
+	}
+	return sb.String()
+}
+
+func normalizeSupervisionDialKey(value string) string {
+	key := strings.TrimSpace(value)
+	if len(key) < 2 || len(key) > 7 || key[0] != '*' {
+		return ""
+	}
+	for _, ch := range key[1:] {
+		if ch < '0' || ch > '9' {
+			return ""
+		}
+	}
+	return key
 }
 
 func callbackSourceMode(ep SIPEndpointDef) string {
