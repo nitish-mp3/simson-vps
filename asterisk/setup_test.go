@@ -653,6 +653,8 @@ func TestAccountFeatureCodesAreGeneratedAndAccountScoped(t *testing.T) {
 	for _, want := range []string{
 		"Set(__SIMSON_BLINDXFER_CODE=*84)",
 		"Set(FEATUREMAP(blindxfer)=*84)",
+		"Set(__TRANSFER_CONTEXT=simson-transfer-site-a)",
+		"Set(TRANSFER_CONTEXT=simson-transfer-site-a)",
 		"Set(SIMSON_DIAL_OPTIONS=Ttb(simson-extension-predial",
 		"exten => *851028,1,NoOp(Simson site conference launch",
 		`"${CHANNEL(pjsip,endpoint)}" = "site-a-1027"`,
@@ -661,6 +663,10 @@ func TestAccountFeatureCodesAreGeneratedAndAccountScoped(t *testing.T) {
 		"Dial(PJSIP/${SIMSON_CONF_NUMBER}@7009,60,G(simson-account-conference",
 		"Dial(PJSIP/${SIMSON_CONF_NUMBER}@7013,60,G(simson-account-conference",
 		"[simson-account-conference]",
+		"[simson-transfer-site-a]",
+		"exten => 1028,1,NoOp(Simson same-site blind transfer to 1028)",
+		"Set(SIMSON_TRUNK=7009)",
+		"Goto(from-simson-out,${SIMSON_XFER_NUMBER},1)",
 	} {
 		if !strings.Contains(dialplan, want) {
 			t.Fatalf("account feature dialplan missing %q:\n%s", want, dialplan)
@@ -672,6 +678,13 @@ func TestAccountFeatureCodesAreGeneratedAndAccountScoped(t *testing.T) {
 	siteAConference := section(dialplan, "exten => *851028", "exten => *852020")
 	if strings.Contains(siteAConference, "site-b-2020") || strings.Contains(siteAConference, "PJSIP/2020") {
 		t.Fatalf("site-b endpoint leaked into site-a conference authorization:\n%s", siteAConference)
+	}
+	siteATransfer := section(dialplan, "[simson-transfer-site-a]", "[simson-transfer-site-b]")
+	if !strings.Contains(siteATransfer, "Set(SIMSON_TRUNK=7009)") {
+		t.Fatalf("site-a outside transfer did not use its default gateway:\n%s", siteATransfer)
+	}
+	if strings.Contains(siteATransfer, "2020") || strings.Contains(siteATransfer, "SIMSON_TRUNK=7013") {
+		t.Fatalf("site-b endpoint or gateway leaked into site-a transfer context:\n%s", siteATransfer)
 	}
 }
 

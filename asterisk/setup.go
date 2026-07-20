@@ -638,6 +638,7 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 	supervisionRoutes := buildSupervisionDialplan(endpoints)
 	directEndpointRoutes := buildDirectEndpointDialplan(endpoints)
 	autoAnswerExtensionRoutes := buildAutoAnswerExtensionDialplan(endpoints)
+	accountTransferRoutes := buildAccountTransferDialplan(endpoints)
 	anonymousRoutes := buildAnonymousInboundDialplan(noAuthInboundExtensions, endpoints)
 	blfHints := buildBLFHintDialplan(endpoints)
 
@@ -882,7 +883,8 @@ exten => t,1,Hangup(16)
 [simson-blf]
 ; BLF/presence hints for desk phones that subscribe to extension state.
 %s
-`, inCtx, nodeCtx, outCtx, inCtx, supervisionRoutes, directEndpointRoutes, nodeCtx, autoAnswerExtensionRoutes, outCtx, outCtx, anonymousRoutes, blfHints)
+%s
+`, inCtx, nodeCtx, outCtx, inCtx, supervisionRoutes, directEndpointRoutes, nodeCtx, autoAnswerExtensionRoutes, outCtx, outCtx, anonymousRoutes, blfHints, accountTransferRoutes)
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(content), 0640)
 }
@@ -1133,13 +1135,7 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
 		sb.WriteString(" same  => n,Set(JITTERBUFFER(adaptive)=default)\n")
-		if ep.AccountFeaturesEnabled && normalizeAccountDialCode(ep.AccountTransferCode) != "" {
-			code := normalizeAccountDialCode(ep.AccountTransferCode)
-			fmt.Fprintf(&sb, " same  => n,Set(__SIMSON_BLINDXFER_CODE=%s)\n", code)
-			fmt.Fprintf(&sb, " same  => n,Set(FEATUREMAP(blindxfer)=%s)\n", code)
-		} else {
-			sb.WriteString(" same  => n,Set(__SIMSON_BLINDXFER_CODE=)\n")
-		}
+		appendAccountTransferChannelVars(&sb, ep)
 		appendCallerPreRingAnnouncement(&sb, ep.PreRingAnnouncement)
 		targetAutoModePrepared := false
 		if ep.CallbackBridge {
@@ -1193,6 +1189,104 @@ func normalizeAccountDialCode(value string) string {
 		}
 	}
 	return value
+}
+
+func accountTransferContextName(accountID string) string {
+	accountID = sanitizeID(strings.TrimSpace(accountID))
+	if accountID == "" {
+		return ""
+	}
+	return "simson-transfer-" + accountID
+}
+
+func appendAccountTransferChannelVars(sb *strings.Builder, ep SIPEndpointDef) {
+	code := normalizeAccountDialCode(ep.AccountTransferCode)
+	context := accountTransferContextName(ep.AccountID)
+	if !ep.AccountFeaturesEnabled || code == "" || context == "" {
+		sb.WriteString(" same  => n,Set(__SIMSON_BLINDXFER_CODE=)\n")
+		sb.WriteString(" same  => n,Set(__TRANSFER_CONTEXT=)\n")
+		return
+	}
+	fmt.Fprintf(sb, " same  => n,Set(__SIMSON_BLINDXFER_CODE=%s)\n", code)
+	fmt.Fprintf(sb, " same  => n,Set(FEATUREMAP(blindxfer)=%s)\n", code)
+	fmt.Fprintf(sb, " same  => n,Set(__TRANSFER_CONTEXT=%s)\n", context)
+	fmt.Fprintf(sb, " same  => n,Set(TRANSFER_CONTEXT=%s)\n", context)
+}
+
+// buildAccountTransferDialplan confines blind-transfer destinations to the
+// authenticated endpoint's account. Exact same-site SIP extensions are routed
+// through the normal endpoint policy, while outside numbers can leave only via
+// that account's explicitly selected default outbound gateway.
+func buildAccountTransferDialplan(endpoints []SIPEndpointDef) string {
+	type transferAccount struct {
+		members map[string]struct{}
+		trunk   string
+		enabled bool
+	}
+	accounts := map[string]*transferAccount{}
+	for _, ep := range endpoints {
+		if !ep.Enabled || strings.TrimSpace(ep.AccountID) == "" {
+			continue
+		}
+		accountID := strings.TrimSpace(ep.AccountID)
+		account := accounts[accountID]
+		if account == nil {
+			account = &transferAccount{members: map[string]struct{}{}}
+			accounts[accountID] = account
+		}
+		if ep.AccountFeaturesEnabled && normalizeAccountDialCode(ep.AccountTransferCode) != "" {
+			account.enabled = true
+		}
+		ext := sanitizeID(strings.TrimSpace(ep.Extension))
+		if ext == "" {
+			continue
+		}
+		if ep.DefaultOutbound && isReservedGatewayExtension(ext) {
+			account.trunk = ext
+		}
+		if !isReservedGatewayExtension(ext) {
+			account.members[ext] = struct{}{}
+		}
+	}
+
+	accountIDs := make([]string, 0, len(accounts))
+	for accountID, account := range accounts {
+		if account.enabled && accountTransferContextName(accountID) != "" {
+			accountIDs = append(accountIDs, accountID)
+		}
+	}
+	sort.Strings(accountIDs)
+
+	var sb strings.Builder
+	for _, accountID := range accountIDs {
+		account := accounts[accountID]
+		context := accountTransferContextName(accountID)
+		fmt.Fprintf(&sb, "\n[%s]\n", context)
+		fmt.Fprintf(&sb, "; Account-scoped blind-transfer destinations for %s.\n", sanitizeID(accountID))
+		members := make([]string, 0, len(account.members))
+		for ext := range account.members {
+			members = append(members, ext)
+		}
+		sort.Strings(members)
+		for _, ext := range members {
+			fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson same-site blind transfer to %s)\n", ext, ext)
+			fmt.Fprintf(&sb, " same  => n,Goto(from-simson-sip,%s,1)\n", ext)
+		}
+		if account.trunk != "" {
+			for _, pattern := range []string{"_+X.", "_X."} {
+				fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson account outside blind transfer ${EXTEN} via %s)\n", pattern, account.trunk)
+				sb.WriteString(" same  => n,Set(SIMSON_XFER_NUMBER=${FILTER(0-9,${EXTEN})})\n")
+				sb.WriteString(" same  => n,GotoIf($[${LEN(${SIMSON_XFER_NUMBER})} < 7]?invalid)\n")
+				fmt.Fprintf(&sb, " same  => n,Set(SIMSON_TRUNK=%s)\n", account.trunk)
+				sb.WriteString(" same  => n,Set(SIMSON_CALL_ID=transfer-${UNIQUEID})\n")
+				sb.WriteString(" same  => n,Goto(from-simson-out,${SIMSON_XFER_NUMBER},1)\n")
+				sb.WriteString(" same  => n(invalid),Hangup(28)\n")
+			}
+		}
+		sb.WriteString("exten => i,1,Hangup(21)\n")
+		sb.WriteString("exten => t,1,Hangup(16)\n")
+	}
+	return sb.String()
 }
 
 func appendAccountConferenceRoutes(sb *strings.Builder, endpoints []SIPEndpointDef) {
@@ -1569,7 +1663,8 @@ func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
 	seen := map[string]struct{}{}
 	var sb strings.Builder
 	for _, ep := range endpoints {
-		if !ep.Enabled || (!ep.AutoAnswer && strings.TrimSpace(ep.AnswerAnnouncement) == "" && strings.TrimSpace(ep.PreRingAnnouncement) == "" && len(parseCallDurationRules(ep.CallDurationRules)) == 0) {
+		hasTransferPolicy := ep.AccountFeaturesEnabled && normalizeAccountDialCode(ep.AccountTransferCode) != "" && accountTransferContextName(ep.AccountID) != ""
+		if !ep.Enabled || (!ep.AutoAnswer && strings.TrimSpace(ep.AnswerAnnouncement) == "" && strings.TrimSpace(ep.PreRingAnnouncement) == "" && len(parseCallDurationRules(ep.CallDurationRules)) == 0 && !hasTransferPolicy) {
 			continue
 		}
 		ext := sanitizeID(strings.TrimSpace(ep.Extension))
@@ -1587,6 +1682,7 @@ func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
 			fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson call policy SIP endpoint ${EXTEN})\n", ext)
 			sb.WriteString(" same  => n,Set(SIMSON_AUTO_ANSWER_MODE=)\n")
 		}
+		appendAccountTransferChannelVars(&sb, ep)
 		appendCallerPreRingAnnouncement(&sb, ep.PreRingAnnouncement)
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))\n")
 		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
