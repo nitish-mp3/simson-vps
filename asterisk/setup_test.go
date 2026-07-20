@@ -99,9 +99,14 @@ func TestSupervisionDialplanIsExactAuthenticatedAndAccountScoped(t *testing.T) {
 	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
 	for _, want := range []string{
 		"exten => *811028,1,NoOp(Simson authorized call supervision",
+		"exten => 811028,1,NoOp(Simson authorized call supervision",
 		"exten => *821028,1,NoOp(Simson authorized call supervision",
+		"exten => 821028,1,NoOp(Simson authorized call supervision",
 		"exten => *831028,1,NoOp(Simson authorized call supervision",
+		"exten => 831028,1,NoOp(Simson authorized call supervision",
+		`Set(SIMSON_SUPERVISOR=${SIMSON_ENDPOINT_ID})`,
 		`Set(SIMSON_SUPERVISOR=${CHANNEL(pjsip,endpoint)})`,
+		`Set(SIMSON_CHANNEL_ENDPOINT=${CUT(SIMSON_CHANNEL_RESOURCE,-,1)})`,
 		`GotoIf($["${SIMSON_SUPERVISOR}" = "1026"]?supervise-0)`,
 		"ChanSpy(PJSIP/1028-,qbE)",
 		"ChanSpy(PJSIP/1028-,qbwE)",
@@ -115,8 +120,29 @@ func TestSupervisionDialplanIsExactAuthenticatedAndAccountScoped(t *testing.T) {
 	if strings.Contains(dialplan, "*812020") || strings.Contains(dialplan, "ChanSpy(PJSIP/2020-") {
 		t.Fatalf("cross-account supervision target leaked into dialplan:\n%s", dialplan)
 	}
+	if strings.Contains(dialplan, "812020") {
+		t.Fatalf("cross-account supervision target leaked into compatibility aliases:\n%s", dialplan)
+	}
 	if !strings.Contains(section(dialplan, "exten => *811028", "exten => *821028"), "Hangup(21)") {
 		t.Fatal("unauthorized supervisor calls must be rejected")
+	}
+	if !strings.Contains(section(dialplan, "exten => 811028", "exten => 821028"), "Hangup(21)") {
+		t.Fatal("digits-only compatibility aliases must retain endpoint authorization")
+	}
+}
+
+func TestPJSIPEndpointCarriesServerAssignedAuthorizationIdentity(t *testing.T) {
+	root := t.TempDir()
+	endpoints := []SIPEndpointDef{{
+		Extension: "1027", Username: "supervisor-auth", Password: "test-secret", AccountID: "site-a", Enabled: true,
+	}}
+	if err := writePJSIPConf(root, SetupConfig{SIPDomain: "simson-vps.vipsy.in"}, endpoints); err != nil {
+		t.Fatal(err)
+	}
+	pjsip := readTestFile(t, filepath.Join(root, "pjsip.d", "simson.conf"))
+	endpoint := section(pjsip, "[1027](simson-ep-tpl)", "[1027-auth]")
+	if !strings.Contains(endpoint, "set_var=SIMSON_ENDPOINT_ID=1027") {
+		t.Fatalf("endpoint must carry its server-assigned supervision identity:\n%s", endpoint)
 	}
 }
 

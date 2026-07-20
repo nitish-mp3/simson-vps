@@ -443,7 +443,7 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 			aorName = endpointID
 		}
 
-		fmt.Fprintf(&sb, "[%s](simson-ep-tpl)\nauth=%s-auth\noutbound_auth=%s-auth\naors=%s\n", endpointID, endpointID, endpointID, aorName)
+		fmt.Fprintf(&sb, "[%s](simson-ep-tpl)\nauth=%s-auth\noutbound_auth=%s-auth\naors=%s\nset_var=SIMSON_ENDPOINT_ID=%s\n", endpointID, endpointID, endpointID, aorName, endpointID)
 		if ep.VideoEnabled {
 			sb.WriteString("allow=h264\n")
 		}
@@ -1241,17 +1241,42 @@ func buildSupervisionDialplan(endpoints []SIPEndpointDef) string {
 		return "; Call supervision is disabled for all SIP endpoints.\n"
 	}
 
+	// Some handsets reserve star-prefixed strings for local feature handling and
+	// never send them to Asterisk. Publish a digits-only compatibility alias for
+	// every exact supervision code; it retains the same endpoint authentication
+	// and per-account target allowlist as the configured star code.
+	aliases := make(map[string][]supervisionRule, len(rules))
+	for dialed, dialRules := range rules {
+		alias := strings.TrimPrefix(dialed, "*")
+		if alias == dialed || alias == "" {
+			continue
+		}
+		if _, exists := rules[alias]; exists {
+			continue
+		}
+		aliases[alias] = append([]supervisionRule(nil), dialRules...)
+	}
+	for dialed, dialRules := range aliases {
+		rules[dialed] = dialRules
+	}
+
 	keys := make([]string, 0, len(rules))
 	for key := range rules {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	var sb strings.Builder
-	sb.WriteString("; Account-scoped call supervision. Authorization uses the authenticated\n")
-	sb.WriteString("; PJSIP endpoint and cannot be granted by spoofing caller ID.\n")
+	sb.WriteString("; Account-scoped call supervision. Authorization uses an endpoint variable\n")
+	sb.WriteString("; assigned by Asterisk, never caller ID supplied by the SIP device.\n")
 	for _, dialed := range keys {
-		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson authorized call supervision ${CHANNEL(pjsip,endpoint)} dialed %s)\n", dialed, dialed)
-		sb.WriteString(" same  => n,Set(SIMSON_SUPERVISOR=${CHANNEL(pjsip,endpoint)})\n")
+		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson authorized call supervision dialed %s)\n", dialed, dialed)
+		sb.WriteString(" same  => n,Set(SIMSON_SUPERVISOR=${SIMSON_ENDPOINT_ID})\n")
+		sb.WriteString(" same  => n,ExecIf($[\"${SIMSON_SUPERVISOR}\" = \"\"]?Set(SIMSON_SUPERVISOR=${CHANNEL(pjsip,endpoint)}))\n")
+		sb.WriteString(" same  => n,Set(SIMSON_CHANNEL_NAME=${CHANNEL(name)})\n")
+		sb.WriteString(" same  => n,Set(SIMSON_CHANNEL_RESOURCE=${CUT(SIMSON_CHANNEL_NAME,/,2)})\n")
+		sb.WriteString(" same  => n,Set(SIMSON_CHANNEL_ENDPOINT=${CUT(SIMSON_CHANNEL_RESOURCE,-,1)})\n")
+		sb.WriteString(" same  => n,ExecIf($[\"${SIMSON_SUPERVISOR}\" = \"\"]?Set(SIMSON_SUPERVISOR=${SIMSON_CHANNEL_ENDPOINT}))\n")
+		sb.WriteString(" same  => n,NoOp(Simson supervision authenticated endpoint ${SIMSON_SUPERVISOR})\n")
 		for i, rule := range rules[dialed] {
 			fmt.Fprintf(&sb, " same  => n,GotoIf($[\"${SIMSON_SUPERVISOR}\" = \"%s\"]?supervise-%d)\n", rule.Supervisor, i)
 		}

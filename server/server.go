@@ -3820,6 +3820,7 @@ func (s *Server) configureAsteriskFromStore() {
 	for _, ep := range endpoints {
 		defs = append(defs, asterisk.SIPEndpointDef{
 			ID:                        ep.ID,
+			AccountID:                 ep.AccountID,
 			Extension:                 ep.Extension,
 			Username:                  ep.Username,
 			Password:                  ep.Password,
@@ -3838,6 +3839,7 @@ func (s *Server) configureAsteriskFromStore() {
 			AnswerAnnouncement:        ep.AnswerAnnouncement,
 			PreRingAnnouncement:       ep.PreRingAnnouncement,
 			CallDurationRules:         ep.CallDurationRules,
+			SupervisionConfig:         ep.SupervisionConfig,
 			Enabled:                   ep.Enabled,
 		})
 	}
