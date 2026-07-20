@@ -26,6 +26,16 @@ type Account struct {
 	UpdatedAt     time.Time
 }
 
+// AccountCallFeatures contains site-wide PBX feature codes. Codes are scoped
+// to one account and are applied only to that account's authenticated phones.
+type AccountCallFeatures struct {
+	AccountID      string    `json:"account_id"`
+	TransferCode   string    `json:"transfer_code"`
+	ConferenceCode string    `json:"conference_code"`
+	Enabled        bool      `json:"enabled"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
 // Node represents a registered node (addon install).
 type Node struct {
 	ID           string
@@ -222,6 +232,13 @@ func (s *Store) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_advanced_routes_account ON advanced_routes(account_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_advanced_routes_ingress ON advanced_routes(account_id, ingress_kind, ingress_value)`,
+		`CREATE TABLE IF NOT EXISTS account_call_features (
+			account_id      TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+			transfer_code   TEXT NOT NULL DEFAULT '*84',
+			conference_code TEXT NOT NULL DEFAULT '*85',
+			enabled         INTEGER NOT NULL DEFAULT 1,
+			updated_at      DATETIME NOT NULL DEFAULT (datetime('now'))
+		)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -358,6 +375,52 @@ func (s *Store) ListAccounts() ([]Account, error) {
 
 func (s *Store) UpdateAccountLicense(id, status string) error {
 	_, err := s.db.Exec(`UPDATE accounts SET license_status = ?, updated_at = datetime('now') WHERE id = ?`, status, id)
+	return err
+}
+
+func (s *Store) GetAccountCallFeatures(accountID string) (*AccountCallFeatures, error) {
+	row := s.db.QueryRow(`SELECT account_id, transfer_code, conference_code, enabled, updated_at
+		FROM account_call_features WHERE account_id = ?`, accountID)
+	features := &AccountCallFeatures{AccountID: accountID, TransferCode: "*84", ConferenceCode: "*85", Enabled: true}
+	if err := row.Scan(&features.AccountID, &features.TransferCode, &features.ConferenceCode, &features.Enabled, &features.UpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return features, nil
+		}
+		return nil, err
+	}
+	return features, nil
+}
+
+func (s *Store) ListAccountCallFeatures() ([]AccountCallFeatures, error) {
+	rows, err := s.db.Query(`SELECT a.id,
+		COALESCE(f.transfer_code, '*84'), COALESCE(f.conference_code, '*85'),
+		COALESCE(f.enabled, 1), CAST(strftime('%s', COALESCE(f.updated_at, a.updated_at)) AS INTEGER)
+		FROM accounts a LEFT JOIN account_call_features f ON f.account_id = a.id ORDER BY a.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AccountCallFeatures
+	for rows.Next() {
+		var features AccountCallFeatures
+		var updatedUnix int64
+		if err := rows.Scan(&features.AccountID, &features.TransferCode, &features.ConferenceCode, &features.Enabled, &updatedUnix); err != nil {
+			return nil, err
+		}
+		features.UpdatedAt = time.Unix(updatedUnix, 0).UTC()
+		out = append(out, features)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpsertAccountCallFeatures(features AccountCallFeatures) error {
+	_, err := s.db.Exec(`INSERT INTO account_call_features
+		(account_id, transfer_code, conference_code, enabled, updated_at)
+		VALUES (?, ?, ?, ?, datetime('now'))
+		ON CONFLICT(account_id) DO UPDATE SET transfer_code=excluded.transfer_code,
+		conference_code=excluded.conference_code, enabled=excluded.enabled,
+		updated_at=datetime('now')`, features.AccountID, features.TransferCode,
+		features.ConferenceCode, features.Enabled)
 	return err
 }
 

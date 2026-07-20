@@ -139,6 +139,44 @@ func TestOpenMigratesLegacySIPEndpointsWithVideoFlag(t *testing.T) {
 	}
 }
 
+func TestAccountCallFeaturesDefaultAndUpdate(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "features.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.CreateAccount("site-a", "Site A", 10, 10); err != nil {
+		t.Fatal(err)
+	}
+
+	features, err := st.GetAccountCallFeatures("site-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if features.TransferCode != "*84" || features.ConferenceCode != "*85" || !features.Enabled {
+		t.Fatalf("unexpected defaults: %#v", features)
+	}
+	listed, err := st.ListAccountCallFeatures()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].AccountID != "site-a" || listed[0].TransferCode != "*84" || listed[0].ConferenceCode != "*85" || !listed[0].Enabled || listed[0].UpdatedAt.IsZero() {
+		t.Fatalf("existing account defaults were not listed: %#v", listed)
+	}
+
+	want := AccountCallFeatures{AccountID: "site-a", TransferCode: "*64", ConferenceCode: "*65", Enabled: true}
+	if err := st.UpsertAccountCallFeatures(want); err != nil {
+		t.Fatal(err)
+	}
+	features, err = st.GetAccountCallFeatures("site-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if features.TransferCode != want.TransferCode || features.ConferenceCode != want.ConferenceCode || !features.Enabled {
+		t.Fatalf("account feature update was not persisted: %#v", features)
+	}
+}
+
 func TestAdvancedRouteCRUDAndIngressLookup(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "advanced-routes.db"))
 	if err != nil {

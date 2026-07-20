@@ -67,7 +67,7 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	if strings.Count(directDesk, "Set(JITTERBUFFER(adaptive)=default)") != 1 {
 		t.Fatalf("direct SIP caller leg should receive exactly one adaptive jitter buffer:\n%s", directDesk)
 	}
-	if !strings.Contains(directDesk, "Tb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^))") {
+	if !strings.Contains(directDesk, "Ttb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^))") {
 		t.Fatalf("direct SIP called leg should receive the media pre-dial handler:\n%s", directDesk)
 	}
 	inboundSIP := section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n")
@@ -633,6 +633,45 @@ func TestNoAuthGatewayDoesNotSwallowRegisteredPhonesBehindSameNAT(t *testing.T) 
 	}
 	if strings.Contains(section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n"), "exten => 7010,1,NoOp(Simson direct SIP endpoint") {
 		t.Fatal("reserved 70xx gateway-style endpoint must not be generated as a direct phone extension")
+	}
+}
+
+func TestAccountFeatureCodesAreGeneratedAndAccountScoped(t *testing.T) {
+	root := t.TempDir()
+	endpoints := []SIPEndpointDef{
+		{Extension: "1027", Username: "site-a-1027", AccountID: "site-a", Enabled: true, AccountFeaturesEnabled: true, AccountTransferCode: "*84", AccountConferenceCode: "*85"},
+		{Extension: "1028", Username: "site-a-1028", AccountID: "site-a", Enabled: true, AccountFeaturesEnabled: true, AccountTransferCode: "*84", AccountConferenceCode: "*85"},
+		{Extension: "7009", Username: "site-a-7009", AccountID: "site-a", Enabled: true, DefaultOutbound: true, AccountFeaturesEnabled: true, AccountTransferCode: "*84", AccountConferenceCode: "*85"},
+		{Extension: "2020", Username: "site-b-2020", AccountID: "site-b", Enabled: true, AccountFeaturesEnabled: true, AccountTransferCode: "*74", AccountConferenceCode: "*85"},
+		{Extension: "7013", Username: "site-b-7013", AccountID: "site-b", Enabled: true, DefaultOutbound: true, AccountFeaturesEnabled: true, AccountTransferCode: "*74", AccountConferenceCode: "*85"},
+	}
+	if err := writeDialplanConf(root, "from-simson-sip", "from-simson-node", "from-simson-out", "7009", nil, endpoints); err != nil {
+		t.Fatal(err)
+	}
+
+	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
+	for _, want := range []string{
+		"Set(__SIMSON_BLINDXFER_CODE=*84)",
+		"Set(FEATUREMAP(blindxfer)=*84)",
+		"Set(SIMSON_DIAL_OPTIONS=Ttb(simson-extension-predial",
+		"exten => *851028,1,NoOp(Simson site conference launch",
+		`"${CHANNEL(pjsip,endpoint)}" = "site-a-1027"`,
+		"exten => *852020,1,NoOp(Simson site conference launch",
+		"exten => _*85X.,1,NoOp(Simson account-authorized outside conference",
+		"Dial(PJSIP/${SIMSON_CONF_NUMBER}@7009,60,G(simson-account-conference",
+		"Dial(PJSIP/${SIMSON_CONF_NUMBER}@7013,60,G(simson-account-conference",
+		"[simson-account-conference]",
+	} {
+		if !strings.Contains(dialplan, want) {
+			t.Fatalf("account feature dialplan missing %q:\n%s", want, dialplan)
+		}
+	}
+	if strings.Count(dialplan, "exten => _*85X.,1,") != 1 {
+		t.Fatalf("shared conference prefix must emit one account-authorized outside pattern:\n%s", dialplan)
+	}
+	siteAConference := section(dialplan, "exten => *851028", "exten => *852020")
+	if strings.Contains(siteAConference, "site-b-2020") || strings.Contains(siteAConference, "PJSIP/2020") {
+		t.Fatalf("site-b endpoint leaked into site-a conference authorization:\n%s", siteAConference)
 	}
 }
 

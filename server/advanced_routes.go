@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,6 +109,14 @@ func (s *Server) executeAdvancedRoute(run *advancedRouteRun, in asterisk.Incomin
 			s.endAdvancedRoute(run, "private_hub_unavailable", true)
 			return
 		}
+		if reason := unsafeExternalAdvancedStage(run.plan, stage); reason != "" {
+			s.log.Error("unsafe outside-number route blocked at runtime", map[string]any{
+				"call_id": run.parentID, "route_id": run.plan.ID,
+				"stage": stageIndex + 1, "reason": reason,
+			})
+			s.endAdvancedRoute(run, "unsafe_external_route", true)
+			return
+		}
 		activeTargets := 0
 		run.mu.Lock()
 		run.conference = stage.AnswerMode == "conference"
@@ -193,6 +202,38 @@ func (s *Server) executeAdvancedRoute(run *advancedRouteRun, in asterisk.Incomin
 		s.cancelAdvancedRoutePending(run, "stage_timeout")
 	}
 	s.endAdvancedRoute(run, "route_exhausted", true)
+}
+
+// unsafeExternalAdvancedStage is a runtime safety net for plans that predate
+// API validation or were edited directly in SQLite. Analog gateways commonly
+// answer SIP as soon as they seize a line, before the PSTN destination answers.
+// They therefore cannot safely compete with parallel legs or their own inbound
+// port without prematurely winning and stranding the source call.
+func unsafeExternalAdvancedStage(plan store.AdvancedRoute, stage store.RouteStage) string {
+	enabled := 0
+	external := 0
+	for _, target := range stage.Targets {
+		if !target.Enabled || strings.TrimSpace(target.Value) == "" {
+			continue
+		}
+		enabled++
+		if target.Kind == "external" {
+			external++
+			if plan.IngressKind == "gateway" && strings.TrimSpace(target.Trunk) == strings.TrimSpace(plan.IngressValue) {
+				return "outbound gateway matches inbound gateway"
+			}
+		}
+	}
+	if external == 0 {
+		return ""
+	}
+	if external != 1 || enabled != 1 {
+		return "outside-number forwarding must be the only active target"
+	}
+	if mode := strings.TrimSpace(stage.AnswerMode); mode != "" && mode != "first_answer" {
+		return "outside-number forwarding requires first_answer mode"
+	}
+	return ""
 }
 
 func advancedRouteTargetKey(target store.RouteTarget) string {

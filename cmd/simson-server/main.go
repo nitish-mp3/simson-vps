@@ -72,8 +72,17 @@ func main() {
 		if err != nil {
 			log.Warn("asterisk auto-configure: failed to load SIP endpoints", map[string]any{"err": err.Error()})
 		} else {
+			accountFeatures, featureErr := st.ListAccountCallFeatures()
+			if featureErr != nil {
+				log.Warn("asterisk auto-configure: failed to load account call features", map[string]any{"err": featureErr.Error()})
+			}
+			featuresByAccount := make(map[string]store.AccountCallFeatures, len(accountFeatures))
+			for _, features := range accountFeatures {
+				featuresByAccount[features.AccountID] = features
+			}
 			defs := make([]asterisk.SIPEndpointDef, len(eps))
 			for i, ep := range eps {
+				features := featuresByAccount[ep.AccountID]
 				defs[i] = asterisk.SIPEndpointDef{
 					ID:                        ep.ID,
 					AccountID:                 ep.AccountID,
@@ -96,6 +105,9 @@ func main() {
 					PreRingAnnouncement:       ep.PreRingAnnouncement,
 					CallDurationRules:         ep.CallDurationRules,
 					SupervisionConfig:         ep.SupervisionConfig,
+					AccountTransferCode:       features.TransferCode,
+					AccountConferenceCode:     features.ConferenceCode,
+					AccountFeaturesEnabled:    features.Enabled,
 					Enabled:                   ep.Enabled,
 				}
 			}

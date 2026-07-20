@@ -106,6 +106,8 @@ func (a *API) Router() http.Handler {
 	mux.HandleFunc("GET /admin/accounts/{accountId}/advanced-routes/{id}", a.auth(a.handleGetAdvancedRoute))
 	mux.HandleFunc("PUT /admin/accounts/{accountId}/advanced-routes/{id}", a.auth(a.handleUpdateAdvancedRoute))
 	mux.HandleFunc("DELETE /admin/accounts/{accountId}/advanced-routes/{id}", a.auth(a.handleDeleteAdvancedRoute))
+	mux.HandleFunc("GET /admin/accounts/{accountId}/call-features", a.auth(a.handleGetAccountCallFeatures))
+	mux.HandleFunc("PUT /admin/accounts/{accountId}/call-features", a.auth(a.handlePutAccountCallFeatures))
 
 	// Asterisk management
 	mux.HandleFunc("POST /admin/asterisk/reload-sip", a.auth(a.handleAsteriskReloadSIP))
@@ -1669,9 +1671,19 @@ func (a *API) reconfigureAsterisk() {
 		a.log.Error("could not load SIP endpoints for Asterisk config", map[string]any{"err": err.Error()})
 		return
 	}
+	accountFeatures, err := a.store.ListAccountCallFeatures()
+	if err != nil {
+		a.log.Error("could not load account call features for Asterisk config", map[string]any{"err": err.Error()})
+		return
+	}
+	featuresByAccount := make(map[string]store.AccountCallFeatures, len(accountFeatures))
+	for _, features := range accountFeatures {
+		featuresByAccount[features.AccountID] = features
+	}
 
 	defs := make([]asterisk.SIPEndpointDef, 0, len(endpoints))
 	for _, ep := range endpoints {
+		features := featuresByAccount[ep.AccountID]
 		defs = append(defs, asterisk.SIPEndpointDef{
 			ID:                        ep.ID,
 			AccountID:                 ep.AccountID,
@@ -1694,6 +1706,10 @@ func (a *API) reconfigureAsterisk() {
 			PreRingAnnouncement:       ep.PreRingAnnouncement,
 			CallDurationRules:         ep.CallDurationRules,
 			SupervisionConfig:         ep.SupervisionConfig,
+			AccountTransferCode:       features.TransferCode,
+			AccountConferenceCode:     features.ConferenceCode,
+			AccountFeaturesEnabled:    features.Enabled,
+			DefaultOutbound:           ep.DefaultOutbound,
 			Enabled:                   ep.Enabled,
 		})
 	}

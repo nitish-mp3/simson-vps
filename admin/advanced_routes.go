@@ -149,6 +149,9 @@ func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {
 		if ep == nil || ep.AccountID != route.AccountID {
 			return fmt.Errorf("ingress endpoint does not belong to this account")
 		}
+		if !ep.Enabled {
+			return fmt.Errorf("ingress endpoint is disabled")
+		}
 	}
 	if len(route.Stages) == 0 || len(route.Stages) > 10 {
 		return fmt.Errorf("a route must contain between 1 and 10 stages")
@@ -192,6 +195,7 @@ func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {
 		}
 		seen := map[string]bool{}
 		enabledTargets := 0
+		externalTargets := 0
 		hubTargets := 0
 		for targetIndex := range stage.Targets {
 			target := &stage.Targets[targetIndex]
@@ -207,6 +211,9 @@ func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {
 				continue
 			}
 			enabledTargets++
+			if target.Kind == "external" {
+				externalTargets++
+			}
 			target.Role = strings.ToLower(strings.TrimSpace(target.Role))
 			if stage.AnswerMode == "private_hub" {
 				if target.Role != "hub" && target.Role != "spoke" {
@@ -244,6 +251,14 @@ func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {
 		if enabledTargets == 0 {
 			return fmt.Errorf("stage %d must have at least one active target", stageIndex+1)
 		}
+		if externalTargets > 0 {
+			if enabledTargets != 1 || externalTargets != 1 {
+				return fmt.Errorf("stage %d outside-number forwarding must be the only active target; gateway legs may answer before the remote number rings", stageIndex+1)
+			}
+			if stage.AnswerMode != "first_answer" {
+				return fmt.Errorf("stage %d outside-number forwarding must use first_answer mode", stageIndex+1)
+			}
+		}
 		if stage.AnswerMode == "private_hub" && (enabledTargets < 3 || hubTargets != 1) {
 			return fmt.Errorf("stage %d private hub requires exactly one hub and at least two spokes", stageIndex+1)
 		}
@@ -261,8 +276,8 @@ func (a *API) validateAdvancedRouteTarget(route *store.AdvancedRoute, stage *sto
 	switch target.Kind {
 	case "sip", "gateway":
 		ep, err := a.store.GetSIPEndpointByExtension(target.Value)
-		if err != nil || ep == nil || ep.AccountID != route.AccountID {
-			return fmt.Errorf("SIP/gateway endpoint does not belong to this account")
+		if err != nil || ep == nil || ep.AccountID != route.AccountID || !ep.Enabled {
+			return fmt.Errorf("SIP/gateway endpoint does not belong to this account or is disabled")
 		}
 		if route.IngressKind != "manual" && target.Value == route.IngressValue {
 			return fmt.Errorf("target loops back to the ingress endpoint")
@@ -280,8 +295,11 @@ func (a *API) validateAdvancedRouteTarget(route *store.AdvancedRoute, stage *sto
 			return fmt.Errorf("external target requires a gateway trunk")
 		}
 		trunk, err := a.store.GetSIPEndpointByExtension(target.Trunk)
-		if err != nil || trunk == nil || trunk.AccountID != route.AccountID {
-			return fmt.Errorf("external target gateway does not belong to this account")
+		if err != nil || trunk == nil || trunk.AccountID != route.AccountID || !trunk.Enabled {
+			return fmt.Errorf("external target gateway does not belong to this account or is disabled")
+		}
+		if route.IngressKind == "gateway" && target.Trunk == route.IngressValue {
+			return fmt.Errorf("outside-number forwarding cannot seize the same physical gateway that received the call")
 		}
 	default:
 		return fmt.Errorf("kind must be sip, haos, gateway, or external")

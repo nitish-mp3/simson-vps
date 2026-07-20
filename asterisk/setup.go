@@ -71,7 +71,15 @@ type SIPEndpointDef struct {
 	// SupervisionConfig contains validated account-scoped feature-code
 	// permissions for this authenticated endpoint.
 	SupervisionConfig string
-	Enabled           bool
+	// Account-scoped feature codes copied onto every endpoint definition during
+	// config generation. They are never shared across customer accounts.
+	AccountTransferCode    string
+	AccountConferenceCode  string
+	AccountFeaturesEnabled bool
+	// DefaultOutbound marks this endpoint as its account's selected gateway.
+	// It is used only for account-authorized outside-number feature calls.
+	DefaultOutbound bool
+	Enabled         bool
 }
 
 // Setup writes all Asterisk config files needed by the Simson VPS and reloads
@@ -845,9 +853,17 @@ exten => s,1,NoOp(Add Simson SIP auto-answer headers mode=${ARG1})
 [simson-extension-predial]
 exten => s,1,NoOp(Mark Simson extension leg and optionally add auto-answer headers)
  same  => n,Gosub(simson-outbound-mark^s^1(${ARG1}))
+ same  => n,ExecIf($["${SIMSON_BLINDXFER_CODE}" != ""]?Set(FEATUREMAP(blindxfer)=${SIMSON_BLINDXFER_CODE}))
  same  => n,GotoIf($["${ARG2}" = ""]?done)
  same  => n,Gosub(simson-auto-answer^s^1(${ARG2}))
  same  => n(done),Return()
+
+[simson-account-conference]
+; G() sends the dialing channel to priority 1 and the answered channel to
+; priority 2. Both then enter the same room at priority 2.
+exten => _feature-.,1,NoOp(Simson account conference ${EXTEN})
+ same  => n,ConfBridge(${EXTEN},simson_bridge,simson_user)
+ same  => n,Hangup()
 
 [simson-outbound-mark]
 exten => s,1,NoOp(Mark Simson outbound child channel ${ARG1})
@@ -1117,6 +1133,13 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
 		sb.WriteString(" same  => n,Set(JITTERBUFFER(adaptive)=default)\n")
+		if ep.AccountFeaturesEnabled && normalizeAccountDialCode(ep.AccountTransferCode) != "" {
+			code := normalizeAccountDialCode(ep.AccountTransferCode)
+			fmt.Fprintf(&sb, " same  => n,Set(__SIMSON_BLINDXFER_CODE=%s)\n", code)
+			fmt.Fprintf(&sb, " same  => n,Set(FEATUREMAP(blindxfer)=%s)\n", code)
+		} else {
+			sb.WriteString(" same  => n,Set(__SIMSON_BLINDXFER_CODE=)\n")
+		}
 		appendCallerPreRingAnnouncement(&sb, ep.PreRingAnnouncement)
 		targetAutoModePrepared := false
 		if ep.CallbackBridge {
@@ -1134,9 +1157,9 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		// Apply one adaptive buffer to the called RTP leg too. The inbound
 		// caller received its buffer above, so each direction is protected
 		// without stacking a second ConfBridge jitter buffer.
-		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^)))\n")
+		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Ttb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^)))\n")
 		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
-		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Tb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE})))\n")
+		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Ttb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE})))\n")
 		appendCalledPartyAnnouncement(&sb, ep.AnswerAnnouncement)
 		appendCallDurationRules(&sb, ep.CallDurationRules)
 		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},${SIMSON_DIAL_OPTIONS})\n")
@@ -1152,7 +1175,126 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 			sb.WriteString(" same  => n,Hangup(21)\n")
 		}
 	}
+	appendAccountConferenceRoutes(&sb, endpoints)
 	return sb.String()
+}
+
+func normalizeAccountDialCode(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if !strings.HasPrefix(value, "*") {
+		value = "*" + value
+	}
+	for _, r := range strings.TrimPrefix(value, "*") {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return value
+}
+
+func appendAccountConferenceRoutes(sb *strings.Builder, endpoints []SIPEndpointDef) {
+	type outsideConferenceRoute struct {
+		accountID string
+		code      string
+		trunk     string
+		authExpr  string
+	}
+	members := map[string][]SIPEndpointDef{}
+	conferenceCode := map[string]string{}
+	defaultGateway := map[string]string{}
+	for _, ep := range endpoints {
+		if !ep.Enabled || ep.AccountID == "" {
+			continue
+		}
+		ext := sanitizeID(strings.TrimSpace(ep.Extension))
+		if isReservedGatewayExtension(ext) {
+			if ep.DefaultOutbound {
+				defaultGateway[ep.AccountID] = ext
+			}
+			continue
+		}
+		members[ep.AccountID] = append(members[ep.AccountID], ep)
+		if ep.AccountFeaturesEnabled {
+			conferenceCode[ep.AccountID] = normalizeAccountDialCode(ep.AccountConferenceCode)
+		}
+	}
+	outsideRoutes := make([]outsideConferenceRoute, 0, len(members))
+	accountIDs := make([]string, 0, len(members))
+	for accountID := range members {
+		accountIDs = append(accountIDs, accountID)
+	}
+	sort.Strings(accountIDs)
+	for _, accountID := range accountIDs {
+		accountMembers := members[accountID]
+		code := conferenceCode[accountID]
+		if code == "" {
+			continue
+		}
+		allowed := make([]string, 0, len(accountMembers))
+		for _, source := range accountMembers {
+			endpointName := sanitizeID(strings.TrimSpace(source.Username))
+			if endpointName != "" {
+				allowed = append(allowed, fmt.Sprintf("\"${CHANNEL(pjsip,endpoint)}\" = \"%s\"", endpointName))
+			}
+		}
+		if len(allowed) == 0 {
+			continue
+		}
+		authExpr := strings.Join(allowed, " | ")
+		for _, target := range accountMembers {
+			targetExt := sanitizeID(strings.TrimSpace(target.Extension))
+			if targetExt == "" {
+				continue
+			}
+			fmt.Fprintf(sb, "exten => %s%s,1,NoOp(Simson site conference launch ${CALLERID(num)} -> %s)\n", code, targetExt, targetExt)
+			fmt.Fprintf(sb, " same  => n,GotoIf($[%s]?authorized)\n", authExpr)
+			sb.WriteString(" same  => n,Hangup(21)\n")
+			sb.WriteString(" same  => n(authorized),Set(SIMSON_CONF_ROOM=feature-${UNIQUEID})\n")
+			fmt.Fprintf(sb, " same  => n,Dial(PJSIP/%s,30,G(simson-account-conference^${SIMSON_CONF_ROOM}^1))\n", targetExt)
+			sb.WriteString(" same  => n,Hangup()\n")
+		}
+
+		// Exact SIP-extension routes above win over this pattern. Longer values
+		// are treated as outside numbers and may leave only through this
+		// account's explicitly selected default gateway.
+		trunk := defaultGateway[accountID]
+		if trunk != "" {
+			outsideRoutes = append(outsideRoutes, outsideConferenceRoute{
+				accountID: accountID, code: code, trunk: trunk, authExpr: authExpr,
+			})
+		}
+	}
+
+	// Accounts normally share the same feature prefix. Emit one wildcard per
+	// prefix and branch by the authenticated source endpoint; duplicate Asterisk
+	// pattern priorities would otherwise overwrite one another.
+	routesByCode := map[string][]outsideConferenceRoute{}
+	for _, route := range outsideRoutes {
+		routesByCode[route.code] = append(routesByCode[route.code], route)
+	}
+	codes := make([]string, 0, len(routesByCode))
+	for code := range routesByCode {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	for _, code := range codes {
+		routes := routesByCode[code]
+		fmt.Fprintf(sb, "exten => _%sX.,1,NoOp(Simson account-authorized outside conference ${CALLERID(num)} -> ${EXTEN})\n", code)
+		for i, route := range routes {
+			fmt.Fprintf(sb, " same  => n,GotoIf($[%s]?outside-account-%d)\n", route.authExpr, i)
+		}
+		sb.WriteString(" same  => n,Hangup(21)\n")
+		for i, route := range routes {
+			fmt.Fprintf(sb, " same  => n(outside-account-%d),Set(SIMSON_CONF_NUMBER=${EXTEN:%d})\n", i, len(code))
+			sb.WriteString(" same  => n,ExecIf($[${LEN(${SIMSON_CONF_NUMBER})} < 7]?Hangup(28))\n")
+			sb.WriteString(" same  => n,Set(SIMSON_CONF_ROOM=feature-${UNIQUEID})\n")
+			fmt.Fprintf(sb, " same  => n,Dial(PJSIP/${SIMSON_CONF_NUMBER}@%s,60,G(simson-account-conference^${SIMSON_CONF_ROOM}^1))\n", route.trunk)
+			sb.WriteString(" same  => n,Hangup()\n")
+		}
+	}
 }
 
 type supervisionConfig struct {
