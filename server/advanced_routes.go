@@ -45,16 +45,29 @@ type advancedRouteRun struct {
 }
 
 func (s *Server) tryStartAdvancedRoute(accountID, sourceExt string, in asterisk.IncomingSIPCall) bool {
+	return s.tryStartAdvancedRouteForIngress(accountID, sourceExt, sourceExt, in)
+}
+
+// tryStartAdvancedRouteForIngress starts the plan identified by ingressExt,
+// while retaining sourceExt as the real caller for loop protection, caller ID,
+// and audit data. This distinction is important for landing routes: a call
+// from 1027 to 1028 must be able to match a plan for 1028 without pretending
+// that 1028 placed the call.
+func (s *Server) tryStartAdvancedRouteForIngress(accountID, ingressExt, sourceExt string, in asterisk.IncomingSIPCall) bool {
 	if s.asterisk == nil || accountID == "" || sourceExt == "" {
+		return false
+	}
+	ingressExt = strings.TrimSpace(ingressExt)
+	if ingressExt == "" {
 		return false
 	}
 	var plan *store.AdvancedRoute
 	var err error
 	for _, kind := range []string{"gateway", "sip"} {
-		plan, err = s.store.GetAdvancedRouteByIngress(accountID, kind, sourceExt)
+		plan, err = s.store.GetAdvancedRouteByIngress(accountID, kind, ingressExt)
 		if err != nil {
 			s.log.Error("advanced route lookup failed", map[string]any{
-				"account_id": accountID, "source": sourceExt, "kind": kind, "err": err.Error(),
+				"account_id": accountID, "ingress": ingressExt, "kind": kind, "err": err.Error(),
 			})
 			return false
 		}
@@ -86,9 +99,10 @@ func (s *Server) tryStartAdvancedRoute(accountID, sourceExt string, in asterisk.
 	s.advancedRoutesMu.Unlock()
 
 	s.store.WriteAudit(accountID, "sip:"+sourceExt, "advanced_route_started",
-		fmt.Sprintf("call=%s route=%s bridge=%s", callID, plan.ID, in.BridgeID), "")
+		fmt.Sprintf("call=%s route=%s ingress=%s bridge=%s", callID, plan.ID, ingressExt, in.BridgeID), "")
 	s.log.Info("advanced SIP route started", map[string]any{
-		"call_id": callID, "route_id": plan.ID, "route": plan.Name, "source": sourceExt,
+		"call_id": callID, "route_id": plan.ID, "route": plan.Name,
+		"ingress": ingressExt, "source": sourceExt,
 	})
 	go s.executeAdvancedRoute(run, in, sourceExt)
 	return true

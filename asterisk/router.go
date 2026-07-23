@@ -54,6 +54,36 @@ type ChannelHangup struct {
 	LinkedID  string
 }
 
+// ChannelDTMF is one completed DTMF digit received from a live Asterisk
+// channel. The server uses this for feature codes on ConfBridge calls, where
+// Dial()'s built-in transfer feature hooks are not present.
+type ChannelDTMF struct {
+	Channel   string
+	Digit     string
+	Direction string
+}
+
+// BridgeTransferResult is the asynchronous outcome of adding a replacement
+// SIP handset to an existing Simson ConfBridge call.
+type BridgeTransferResult struct {
+	CallID        string
+	SourceChannel string
+	SourceExt     string
+	TargetExt     string
+	ReplaceSource bool
+	OK            bool
+	Reason        string
+	Channel       string
+}
+
+type pendingBridgeTransfer struct {
+	callID        string
+	sourceChannel string
+	sourceExt     string
+	targetExt     string
+	replaceSource bool
+}
+
 // Router orchestrates call routing between VPS Asterisk (via AMI) and the
 // Simson WebSocket nodes.
 //
@@ -70,6 +100,8 @@ type Router struct {
 	OnIntercomCallback func(req IntercomCallbackRequest)           // SIP direct route requested callback bridge
 	OnChannelHangup    func(info ChannelHangup)                    // SIP channel hung up
 	OnOriginateResult  func(callID string, ok bool, reason string) // async Originate outcome
+	OnChannelDTMF      func(info ChannelDTMF)                      // completed received DTMF digit
+	OnBridgeTransfer   func(result BridgeTransferResult)           // ConfBridge transfer outcome
 
 	// call tracking
 	mu                    sync.RWMutex
@@ -80,6 +112,7 @@ type Router struct {
 	// async originate tracking
 	originateMu      sync.Mutex
 	actionIDToCallID map[string]string // originate actionID → simson call ID
+	bridgeTransfers  map[string]pendingBridgeTransfer
 }
 
 // NewRouter creates a Router wrapping the given AMI client and registers the
@@ -92,9 +125,93 @@ func NewRouter(ami *AMIClient, log *logging.Logger) *Router {
 		callIDToChan:          make(map[string]string),
 		callIDToChannelPrefix: make(map[string][]string),
 		actionIDToCallID:      make(map[string]string),
+		bridgeTransfers:       make(map[string]pendingBridgeTransfer),
 	}
 	ami.OnEvent(r.onEvent)
 	return r
+}
+
+// OriginateBridgeTransfer rings targetExtension and sends the answered Local
+// leg into bridgeExt. It has separate result tracking from ordinary call
+// originates so a failed transfer never changes the parent call's state.
+func (r *Router) OriginateBridgeTransfer(targetExtension, context, bridgeExt, callerID, callID, fromNode, sourceChannel, sourceExt string, timeoutSec int) (string, error) {
+	return r.originateBridgeParticipant(targetExtension, context, bridgeExt, callerID, callID, fromNode, sourceChannel, sourceExt, timeoutSec, true)
+}
+
+// OriginateBridgeConference rings another handset into an existing Simson
+// bridge while retaining the source handset. This is the in-call *85 path;
+// unlike a transfer, answering the new leg must not release the caller.
+func (r *Router) OriginateBridgeConference(targetExtension, context, bridgeExt, callerID, callID, fromNode, sourceChannel, sourceExt string, timeoutSec int) (string, error) {
+	return r.originateBridgeParticipant(targetExtension, context, bridgeExt, callerID, callID, fromNode, sourceChannel, sourceExt, timeoutSec, false)
+}
+
+// OriginateDirectConference rings targetExtension and, once answered, barges
+// that handset into the existing direct SIP channel. This is intentionally
+// separate from Simson ConfBridge calls: ordinary SIP-to-SIP calls live in an
+// Asterisk basic bridge and therefore have no Simson bridge extension to join.
+func (r *Router) OriginateDirectConference(targetExtension, sourceChannel, callerID string, timeoutSec int) (string, error) {
+	targetExtension = strings.TrimSpace(targetExtension)
+	sourceChannel = normalizeChannel(sourceChannel)
+	if targetExtension == "" || sourceChannel == "" {
+		return "", fmt.Errorf("direct conference requires target and source channel")
+	}
+	if timeoutSec <= 0 {
+		timeoutSec = 30
+	}
+	actionID := uuid.NewString()
+	_, err := r.ami.OriginateWithVars(
+		fmt.Sprintf("PJSIP/%s", targetExtension),
+		"simson-direct-conference",
+		"s",
+		callerID,
+		timeoutSec*1000,
+		actionID,
+		map[string]string{
+			"SIMSON_SPY_CHANNEL": sourceChannel,
+		},
+	)
+	if err != nil {
+		return "", err
+	}
+	return actionID, nil
+}
+
+func (r *Router) originateBridgeParticipant(targetExtension, context, bridgeExt, callerID, callID, fromNode, sourceChannel, sourceExt string, timeoutSec int, replaceSource bool) (string, error) {
+	targetExtension = strings.TrimSpace(targetExtension)
+	sourceChannel = normalizeChannel(sourceChannel)
+	if targetExtension == "" || bridgeExt == "" || callID == "" || sourceChannel == "" {
+		return "", fmt.Errorf("bridge transfer requires target, bridge, call, and source channel")
+	}
+	channel := fmt.Sprintf("Local/%s@from-simson-extension/n", targetExtension)
+	actionID := uuid.NewString()
+	r.TrackPendingPrefix(callID, fmt.Sprintf("Local/%s@from-simson-extension-", targetExtension))
+	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", targetExtension))
+
+	r.originateMu.Lock()
+	if r.bridgeTransfers == nil {
+		r.bridgeTransfers = make(map[string]pendingBridgeTransfer)
+	}
+	r.bridgeTransfers[actionID] = pendingBridgeTransfer{
+		callID: callID, sourceChannel: sourceChannel, sourceExt: sourceExt,
+		targetExt: targetExtension, replaceSource: replaceSource,
+	}
+	r.originateMu.Unlock()
+
+	vars := map[string]string{
+		"SIMSON_CALL_ID":      callID,
+		"__SIMSON_CALL_ID":    callID,
+		"SIMSON_FROM_NODE":    fromNode,
+		"__SIMSON_FROM_NODE":  fromNode,
+		"SIMSON_WAIT_TIMEOUT": fmt.Sprintf("%d", timeoutSec),
+	}
+	_, err := r.ami.OriginateWithVars(channel, context, bridgeExt, callerID, timeoutSec*1000, actionID, vars)
+	if err != nil {
+		r.originateMu.Lock()
+		delete(r.bridgeTransfers, actionID)
+		r.originateMu.Unlock()
+		return "", err
+	}
+	return actionID, nil
 }
 
 // Connect connects to Asterisk AMI.
@@ -752,6 +869,49 @@ func (r *Router) HangupChannelNoWait(channel string) error {
 	return r.ami.HangupChannelNoWait(channel)
 }
 
+// ClearEndpointChannels releases live PJSIP channels for one endpoint. It is
+// intentionally endpoint-scoped so an operator can recover an orphaned FXO,
+// GSM, or SIP-phone channel without disturbing unrelated calls.
+func (r *Router) ClearEndpointChannels(extension string) (int, error) {
+	extension = strings.TrimSpace(extension)
+	if extension == "" || strings.ContainsAny(extension, "! \t\r\n") {
+		return 0, fmt.Errorf("invalid endpoint extension")
+	}
+	out, err := r.ami.RunCommand("core show channels concise")
+	if err != nil {
+		return 0, err
+	}
+	prefix := "PJSIP/" + extension + "-"
+	seen := make(map[string]struct{})
+	cleared := 0
+	var firstErr error
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.Split(strings.TrimSpace(line), "!")
+		if len(parts) == 0 {
+			continue
+		}
+		channel := normalizeChannel(parts[0])
+		if channel == "" || !strings.HasPrefix(channel, prefix) {
+			continue
+		}
+		if _, ok := seen[channel]; ok {
+			continue
+		}
+		seen[channel] = struct{}{}
+		if err := r.ami.HangupChannel(channel); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "no such channel") {
+				continue
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		cleared++
+	}
+	return cleared, firstErr
+}
+
 // BridgeCall bridges the SIP channel of callID with a second Asterisk channel
 // (typically the local channel of the node-callback leg).
 func (r *Router) BridgeCall(callID, nodeChannel string) error {
@@ -874,6 +1034,16 @@ func (r *Router) onEvent(ev Event) {
 	case "OriginateResponse":
 		r.handleOriginateResponse(ev)
 
+	case "DTMFEnd":
+		r.handleDTMF(ev)
+
+	case "DTMF":
+		// Older Asterisk releases emit a single DTMF event. Ignore an explicit
+		// begin event so one key is never collected twice.
+		if !strings.EqualFold(strings.TrimSpace(ev.Fields["Begin"]), "Yes") {
+			r.handleDTMF(ev)
+		}
+
 	case "VarSet":
 		// When Asterisk sets SIMSON_CALL_ID on a channel we can start tracking it.
 		if ev.Fields["Variable"] == "SIMSON_CALL_ID" {
@@ -883,6 +1053,40 @@ func (r *Router) onEvent(ev Event) {
 				r.TrackCall(callID, channel)
 			}
 		}
+	}
+}
+
+func (r *Router) handleDTMF(ev Event) {
+	// Asterisk 16 commonly sends DigitReceived on DTMFEnd, while other
+	// versions and AMI proxies use Digit (or DTMF). Accept all completed-event
+	// spellings; otherwise native blind transfer may work while Simson's
+	// account-scoped conference/custom feature codes appear completely dead.
+	digit := strings.TrimSpace(ev.Fields["Digit"])
+	if digit == "" {
+		digit = strings.TrimSpace(ev.Fields["DigitReceived"])
+	}
+	if digit == "" {
+		digit = strings.TrimSpace(ev.Fields["DTMF"])
+	}
+	if digit == "" {
+		digit = strings.TrimSpace(ev.Fields["Key"])
+	}
+	info := ChannelDTMF{
+		Channel:   normalizeChannel(ev.Fields["Channel"]),
+		Digit:     digit,
+		Direction: strings.TrimSpace(ev.Fields["Direction"]),
+	}
+	if info.Channel == "" || len(info.Digit) != 1 {
+		return
+	}
+	if info.Direction != "" && !strings.EqualFold(info.Direction, "Received") && !strings.EqualFold(info.Direction, "In") {
+		return
+	}
+	if r.OnChannelDTMF != nil {
+		// Preserve keypad order. The server callback is intentionally a
+		// non-blocking queue write; dispatching one goroutine per digit can turn
+		// *841026 into a different sequence on fast phones.
+		r.OnChannelDTMF(info)
 	}
 }
 
@@ -1000,11 +1204,38 @@ func (r *Router) handleOriginateResponse(ev Event) {
 	}
 
 	r.originateMu.Lock()
+	transfer, isBridgeTransfer := r.bridgeTransfers[actionID]
+	if isBridgeTransfer {
+		delete(r.bridgeTransfers, actionID)
+	}
 	callID, exists := r.actionIDToCallID[actionID]
 	if exists {
 		delete(r.actionIDToCallID, actionID)
 	}
 	r.originateMu.Unlock()
+
+	if isBridgeTransfer {
+		ok := ev.Fields["Response"] == "Success"
+		channel := normalizeChannel(ev.Fields["Channel"])
+		if ok && channel != "" {
+			r.TrackCall(transfer.callID, channel)
+		}
+		result := BridgeTransferResult{
+			CallID: transfer.callID, SourceChannel: transfer.sourceChannel,
+			SourceExt: transfer.sourceExt, TargetExt: transfer.targetExt,
+			ReplaceSource: transfer.replaceSource,
+			OK:            ok, Reason: ev.Fields["Reason"], Channel: channel,
+		}
+		r.log.Info("bridge transfer originate result", map[string]any{
+			"call_id": transfer.callID, "source": transfer.sourceExt, "target": transfer.targetExt,
+			"replace_source": transfer.replaceSource,
+			"ok":             ok, "reason": result.Reason, "channel": channel,
+		})
+		if r.OnBridgeTransfer != nil {
+			go r.OnBridgeTransfer(result)
+		}
+		return
+	}
 
 	if !exists {
 		return

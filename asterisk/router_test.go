@@ -97,11 +97,76 @@ func TestHandleHangupPreservesCauseDetails(t *testing.T) {
 	}
 }
 
+func TestHandleDTMFPreservesCompletedReceivedDigits(t *testing.T) {
+	r := newTrackingOnlyRouter()
+	var got []string
+	r.OnChannelDTMF = func(info ChannelDTMF) { got = append(got, info.Digit) }
+
+	for _, digit := range []string{"*", "8", "4", "1", "0", "2", "6"} {
+		r.handleDTMF(Event{Fields: map[string]string{
+			"Channel": "PJSIP/1027-0001;1", "Digit": digit, "Direction": "Received",
+		}})
+	}
+	// Outbound DTMF is not a feature-code input and must be ignored.
+	r.handleDTMF(Event{Fields: map[string]string{
+		"Channel": "PJSIP/1027-0001", "Digit": "9", "Direction": "Sent",
+	}})
+
+	if joined := strings.Join(got, ""); joined != "*841026" {
+		t.Fatalf("received DTMF = %q, want *841026", joined)
+	}
+}
+
+func TestHandleDTMFAcceptsDigitReceivedOnDTMFEnd(t *testing.T) {
+	r := newTrackingOnlyRouter()
+	var got string
+	r.OnChannelDTMF = func(info ChannelDTMF) { got = info.Digit }
+	r.handleDTMF(Event{Fields: map[string]string{
+		"Channel":       "PJSIP/1027-00000001",
+		"DigitReceived": "*",
+		"Direction":     "Received",
+	}})
+	if got != "*" {
+		t.Fatalf("received DTMF = %q, want %q", got, "*")
+	}
+}
+
+func TestBridgeTransferOriginateFailureDoesNotReachParentCallCallback(t *testing.T) {
+	r := newTrackingOnlyRouter()
+	r.bridgeTransfers["transfer-action"] = pendingBridgeTransfer{
+		callID: "call-1", sourceChannel: "PJSIP/1027-0001", sourceExt: "1027", targetExt: "1026", replaceSource: true,
+	}
+	resultCh := make(chan BridgeTransferResult, 1)
+	parentResult := make(chan struct{}, 1)
+	r.OnBridgeTransfer = func(result BridgeTransferResult) { resultCh <- result }
+	r.OnOriginateResult = func(string, bool, string) { parentResult <- struct{}{} }
+
+	r.handleOriginateResponse(Event{Fields: map[string]string{
+		"ActionID": "transfer-action", "Response": "Failure", "Reason": "4",
+	}})
+
+	select {
+	case result := <-resultCh:
+		if result.OK || result.CallID != "call-1" || result.SourceExt != "1027" || result.TargetExt != "1026" || !result.ReplaceSource {
+			t.Fatalf("unexpected bridge transfer result: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for bridge transfer result")
+	}
+	select {
+	case <-parentResult:
+		t.Fatal("failed transfer was incorrectly reported as a parent call originate failure")
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
 func newTrackingOnlyRouter() *Router {
 	return &Router{
 		log:                   logging.New("error"),
 		chanToCallID:          make(map[string]string),
 		callIDToChan:          make(map[string]string),
 		callIDToChannelPrefix: make(map[string][]string),
+		actionIDToCallID:      make(map[string]string),
+		bridgeTransfers:       make(map[string]pendingBridgeTransfer),
 	}
 }

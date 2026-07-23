@@ -97,6 +97,7 @@ func (a *API) Router() http.Handler {
 	mux.HandleFunc("GET /admin/sip-endpoints/{id}", a.auth(a.handleGetSIPEndpoint))
 	mux.HandleFunc("PUT /admin/sip-endpoints/{id}", a.auth(a.handleUpdateSIPEndpoint))
 	mux.HandleFunc("DELETE /admin/sip-endpoints/{id}", a.auth(a.handleDeleteSIPEndpoint))
+	mux.HandleFunc("POST /admin/sip-endpoints/{id}/clear-stuck", a.auth(a.handleClearStuckSIPEndpoint))
 	mux.HandleFunc("POST /admin/accounts/{accountId}/door-events", a.auth(a.handleDoorEvent))
 
 	// Advanced account-scoped call routes. These are deliberately separate
@@ -1137,6 +1138,32 @@ func (a *API) handleDeleteSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	a.reconfigureAsterisk()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleClearStuckSIPEndpoint is a guarded recovery action for a gateway or
+// SIP endpoint that remains marked in use after its call has ended.
+func (a *API) handleClearStuckSIPEndpoint(w http.ResponseWriter, r *http.Request) {
+	if a.asterisk == nil || !a.asterisk.Connected() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Asterisk integration unavailable"})
+		return
+	}
+	ep, err := a.store.GetSIPEndpoint(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	if ep == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "SIP endpoint not found"})
+		return
+	}
+	cleared, err := a.asterisk.ClearEndpointChannels(ep.Extension)
+	if err != nil {
+		a.log.Error("clear stuck SIP endpoint", map[string]any{"endpoint": ep.Extension, "err": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "cleared": cleared})
+		return
+	}
+	a.log.Info("cleared stuck SIP endpoint channels", map[string]any{"endpoint": ep.Extension, "cleared": cleared})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "extension": ep.Extension, "cleared": cleared})
 }
 
 // handleDoorEvent starts a native SIP-to-SIP door camera bridge. The source

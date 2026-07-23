@@ -866,6 +866,15 @@ exten => _feature-.,1,NoOp(Simson account conference ${EXTEN})
  same  => n,ConfBridge(${EXTEN},simson_bridge,simson_user)
  same  => n,Hangup()
 
+[simson-direct-conference]
+; The invited handset joins an already active basic SIP bridge through
+; ChanSpy barge mode. q suppresses announcements and E exits with the source.
+exten => s,1,NoOp(Simson direct SIP conference into ${SIMSON_SPY_CHANNEL})
+ same  => n,GotoIf($["${SIMSON_SPY_CHANNEL}" = ""]?invalid)
+ same  => n,ChanSpy(${SIMSON_SPY_CHANNEL},qBE)
+ same  => n,Hangup()
+ same  => n(invalid),Hangup(21)
+
 [simson-outbound-mark]
 exten => s,1,NoOp(Mark Simson outbound child channel ${ARG1})
  same  => n,Set(SIMSON_CALL_ID=${ARG1})

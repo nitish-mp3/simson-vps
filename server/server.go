@@ -43,6 +43,23 @@ type Server struct {
 	sipOutboundMu      sync.Mutex
 	sipOutboundRetries map[string]*sipOutboundRetry
 
+	// Some gateway channel hangups arrive without a matching OriginateResponse.
+	// Keep a bounded per-channel fallback so a physical FXO/GSM port cannot stay
+	// seized indefinitely while still allowing normal retry handling to win.
+	gatewayHangupFallbackMu sync.Mutex
+	gatewayHangupFallback   map[string]time.Time
+
+	// gatewayTransfer* handles account feature codes on SIP-to-gateway calls.
+	// Those calls use ConfBridge, so Asterisk's Dial()-only blind transfer hook
+	// cannot see the digits. State is scoped by live channel and call ID.
+	gatewayTransferMu            sync.Mutex
+	gatewayTransferCaptures      map[string]*gatewayTransferCapture
+	gatewayTransferPending       map[string]*gatewayTransferPending
+	gatewayTransferReleased      map[string]time.Time
+	gatewayTransferFailedTargets map[string]time.Time
+	gatewayTransferLastDTMF      map[string]gatewayTransferDTMFStamp
+	gatewayTransferDTMFQueue     chan asterisk.ChannelDTMF
+
 	// sipBridgeTransfers makes SIP bridge handoffs idempotent. A reconnect,
 	// duplicated addon timer, or replayed authenticated WSS message must never
 	// originate a second desk-phone leg for the same live bridge.
@@ -91,6 +108,13 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 		log:                          log,
 		recentSIPInvites:             make(map[string]time.Time),
 		sipOutboundRetries:           make(map[string]*sipOutboundRetry),
+		gatewayHangupFallback:        make(map[string]time.Time),
+		gatewayTransferCaptures:      make(map[string]*gatewayTransferCapture),
+		gatewayTransferPending:       make(map[string]*gatewayTransferPending),
+		gatewayTransferReleased:      make(map[string]time.Time),
+		gatewayTransferFailedTargets: make(map[string]time.Time),
+		gatewayTransferLastDTMF:      make(map[string]gatewayTransferDTMFStamp),
+		gatewayTransferDTMFQueue:     make(chan asterisk.ChannelDTMF, 256),
 		sipBridgeTransfers:           make(map[string]time.Time),
 		sipIntercomCallbacks:         make(map[string]time.Time),
 		sipIntercomCallbackCallToKey: make(map[string]string),
@@ -119,7 +143,10 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 		router.OnIntercomCallback = s.handleSIPIntercomCallback
 		router.OnChannelHangup = s.handleSIPChannelHangup
 		router.OnOriginateResult = s.handleSIPOriginateResult
+		router.OnChannelDTMF = s.enqueueGatewayBridgeDTMF
+		router.OnBridgeTransfer = s.handleGatewayBridgeTransferResult
 		s.asterisk = router
+		go s.runGatewayBridgeDTMFQueue()
 	}
 
 	return s
@@ -2031,9 +2058,8 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 
 		if isHAOSRingCode(in.Extension) {
 			accountID = callerEP.AccountID
-			routeTo = ""
 			sourceExt = callerEP.Extension
-			haosRingCode = true
+			routeTo, haosRingCode = routeForHAOSRingCode(callerEP)
 		} else {
 			if isExternalDialString(in.Extension) || s.hasExplicitGatewayTrunkPrefix(callerEP.AccountID, in.Extension) {
 				// This path runs from an AMI UserEvent. Originate must not block
@@ -2099,15 +2125,38 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		return
 	}
 
-	// Advanced plans are keyed by the endpoint that placed the call, not by the
-	// number it dialled. When 1027 calls 1028, the plan for source 1027 must run;
-	// using the destination endpoint here silently bypasses parallel/conference
-	// routing and only rings 1028.
+	// Advanced plans can be keyed by either the landing endpoint or the calling
+	// endpoint. Landing plans take precedence for an exact destination; source
+	// plans remain the fallback for ordinary internal/outbound calls.
 	advancedSourceExt := s.resolveAdvancedRouteSource(accountID, sourceExt, in)
-	// Advanced routes are additive. If no enabled plan exactly matches this
-	// account and source endpoint, the established routing path remains intact.
-	if !isHAOSBypassCode(in.Extension) && s.tryStartAdvancedRoute(accountID, advancedSourceExt, in) {
-		return
+	if !isHAOSBypassCode(in.Extension) {
+		// A gateway may first resolve to a SIP landing endpoint (for example
+		// 7016 -> 1027). Check both the dialled endpoint and that resolved
+		// landing target so a plan for 1027 is not bypassed by the gateway's
+		// direct-target setting.
+		landingCandidates := []string{strings.TrimSpace(in.Extension)}
+		if ep != nil {
+			landingCandidates = append(landingCandidates, strings.TrimSpace(ep.Extension))
+		}
+		if routeTo != "" && routeTo != sourceExt {
+			landingCandidates = append(landingCandidates, strings.TrimSpace(routeTo))
+		}
+		seenLanding := make(map[string]struct{}, len(landingCandidates))
+		for _, landingExt := range landingCandidates {
+			if landingExt == "" || landingExt == advancedSourceExt {
+				continue
+			}
+			if _, seen := seenLanding[landingExt]; seen {
+				continue
+			}
+			seenLanding[landingExt] = struct{}{}
+			if s.tryStartAdvancedRouteForIngress(accountID, landingExt, advancedSourceExt, in) {
+				return
+			}
+		}
+		if s.tryStartAdvancedRoute(accountID, advancedSourceExt, in) {
+			return
+		}
 	}
 
 	// Collect target nodes, prioritizing those without active calls.
@@ -2278,6 +2327,18 @@ func gatewayInboundPolicy(ep *store.SIPEndpoint) (string, string) {
 	default:
 		return "", strings.TrimSpace(ep.GatewayDirectTarget)
 	}
+}
+
+// routeForHAOSRingCode preserves the common extension 100 behavior for desk
+// phones while allowing a gateway configured for immediate/direct delivery to
+// use 100 as its SIP destination. Many FXO gateways can only send one fixed
+// Request-URI for inbound PSTN calls, so ignoring the per-gateway policy here
+// would incorrectly ring HAOS instead of the selected direct target.
+func routeForHAOSRingCode(ep *store.SIPEndpoint) (routeTo string, haosRingCode bool) {
+	if mode, target := gatewayInboundPolicy(ep); mode == "direct_target" && target != "" {
+		return target, false
+	}
+	return "", true
 }
 
 func (s *Server) routeIncomingSIPDirectToExtension(accountID, ext, sourceExt string, in asterisk.IncomingSIPCall) bool {
@@ -2796,7 +2857,7 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 	}
 
 	rawDigits := digitsOnly(in.Extension)
-	trunk := s.selectOutboundGatewayTrunk(callerEP.AccountID, rawDigits)
+	trunk := s.selectSIPPhoneOutboundGatewayTrunk(callerEP, rawDigits)
 	// Desk/SIP phones should control the PSTN dial string, but Synway-style
 	// gateway trunks expect the same normalized form as HAOS-originated calls.
 	// Try that proven form first, then fall back to the handset's raw callback
@@ -2861,6 +2922,21 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 	s.log.Info("SIP-phone outbound gateway call originated", map[string]any{
 		"call_id": callID, "caller_ext": callerEP.Extension, "number": numbers[0], "candidates": strings.Join(numbers, ","), "trunk": trunk,
 	})
+}
+
+func (s *Server) selectSIPPhoneOutboundGatewayTrunk(callerEP *store.SIPEndpoint, rawDigits string) string {
+	if callerEP == nil {
+		return ""
+	}
+	accountID := callerEP.AccountID
+	if s.hasExplicitGatewayTrunkPrefix(accountID, rawDigits) {
+		return s.selectOutboundGatewayTrunk(accountID, rawDigits)
+	}
+	sourceTrunk := strings.TrimSpace(callerEP.Extension)
+	if s.isUsableOutboundGatewayTrunk(accountID, sourceTrunk) {
+		return sourceTrunk
+	}
+	return s.selectOutboundGatewayTrunk(accountID, rawDigits)
 }
 
 func (s *Server) selectOutboundGatewayTrunk(accountID, rawDigits string) string {
@@ -3024,19 +3100,47 @@ func (s *Server) prefersLeadingZeroGatewayDial(accountID, trunk string) bool {
 		ep.Description,
 		ep.RouteTo,
 	}, " "))
-	for _, marker := range []string{"fxo", "landline", "pstn", "grandstream", "ht813", "ht841", "synway", "smg", "gsm"} {
-		if strings.Contains(meta, marker) {
-			return true
-		}
-	}
-	return false
+	preferLeadingZero, _ := gatewayDialProfileFromMetadata(meta)
+	return preferLeadingZero
 }
 
 func (s *Server) gatewayPostAnswerDTMF(accountID, trunk string) string {
-	if s.prefersLeadingZeroGatewayDial(accountID, trunk) {
-		return "#"
+	trunk = strings.TrimSpace(trunk)
+	if trunk == "" {
+		return ""
 	}
-	return ""
+	ep, err := s.store.GetSIPEndpointByExtension(trunk)
+	if err != nil || ep == nil || ep.AccountID != accountID {
+		return ""
+	}
+	meta := strings.ToLower(strings.Join([]string{
+		ep.Extension,
+		ep.Username,
+		ep.Description,
+		ep.RouteTo,
+	}, " "))
+	_, postAnswerDTMF := gatewayDialProfileFromMetadata(meta)
+	return postAnswerDTMF
+}
+
+// gatewayDialProfileFromMetadata separates two-stage GSM/Synway gateways from
+// direct-dial FXO devices. Grandstream HT8xx gateways answer the SIP leg before
+// the PSTN call is connected, but still expect the destination directly in the
+// Request-URI; prepending 0 and sending a trailing # can leave them off-hook
+// until their internal dial timeout expires.
+func gatewayDialProfileFromMetadata(meta string) (preferLeadingZero bool, postAnswerDTMF string) {
+	meta = strings.ToLower(strings.TrimSpace(meta))
+	for _, marker := range []string{"grandstream", "ht813", "ht814", "ht818", "ht841"} {
+		if strings.Contains(meta, marker) {
+			return false, ""
+		}
+	}
+	for _, marker := range []string{"synway", "smg", "gsm gateway", "gsm active port"} {
+		if strings.Contains(meta, marker) {
+			return true, "#"
+		}
+	}
+	return false, ""
 }
 
 func (s *Server) setSIPOutboundRetry(callID string, retry *sipOutboundRetry) {
@@ -3226,6 +3330,49 @@ func (s *Server) hangupAsteriskChannelAsync(channel, reason string) {
 	}()
 }
 
+func (s *Server) scheduleGatewayHangupFallback(callID, channel string) {
+	key := strings.TrimSpace(callID) + "|" + strings.TrimSpace(channel)
+	if key == "|" {
+		return
+	}
+	s.gatewayHangupFallbackMu.Lock()
+	if _, exists := s.gatewayHangupFallback[key]; exists {
+		s.gatewayHangupFallbackMu.Unlock()
+		return
+	}
+	s.gatewayHangupFallback[key] = time.Now()
+	s.gatewayHangupFallbackMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.gatewayHangupFallbackMu.Lock()
+			delete(s.gatewayHangupFallback, key)
+			s.gatewayHangupFallbackMu.Unlock()
+		}()
+		timer := time.NewTimer(3 * time.Second)
+		defer timer.Stop()
+		<-timer.C
+		if s.asterisk == nil {
+			return
+		}
+		// If Asterisk already replaced this attempt with a retry, the old
+		// channel is no longer mapped to the call and must not end the retry.
+		if mapped, ok := s.asterisk.CallIDForChannel(channel); !ok || mapped != callID {
+			return
+		}
+		call := s.calls.Get(callID)
+		if call == nil || call.State != calls.StateRinging {
+			return
+		}
+		s.log.Warn("gateway originate response missing after channel hangup; finalizing attempt",
+			map[string]any{"call_id": callID, "channel": channel})
+		// Re-enter the normal retry/exhaustion path. If another number form is
+		// available it is attempted; otherwise the call and all tracked legs are
+		// ended through the existing cleanup path.
+		s.handleSIPOriginateResult(callID, false, "gateway_channel_hangup_timeout")
+	}()
+}
+
 // handleSIPChannelHangup cleans up a call when the SIP channel hangs up.
 func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 	if s.asterisk == nil {
@@ -3239,6 +3386,11 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 	}
 	callID, ok := s.asterisk.CallIDForChannel(channel)
 	if !ok {
+		return
+	}
+	if s.shouldIgnoreGatewayTransferHangup(callID, channel) {
+		s.log.Debug("ignoring expected gateway bridge transfer leg hangup",
+			map[string]any{"call_id": callID, "channel": channel})
 		return
 	}
 	if s.handleAdvancedRouteHangup(callID, channel) {
@@ -3281,10 +3433,12 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 		callerExt := strings.TrimPrefix(call.FromNode, "sip:")
 		trunk := extractEndpointFromChannel(channel)
 		if isGatewayLikeTrunk(trunk, s.cfg.Asterisk.DefaultPSTNTrunk) {
-			// Let the OriginateResponse drive retry/exhaustion. Ending here can
-			// cut off the SIP phone before the alternate dial form is attempted.
+			// Let the OriginateResponse drive retry/exhaustion. A few gateways emit
+			// only this channel hangup, though; the bounded fallback below prevents
+			// that missing response from leaving the physical port in use forever.
 			s.log.Info("gateway leg hung up before answer; waiting for originate result",
 				map[string]any{"call_id": callID, "channel": channel, "trunk": trunk})
+			s.scheduleGatewayHangupFallback(callID, channel)
 			return
 		}
 		if callerExt != "" && strings.HasPrefix(channel, "PJSIP/"+callerExt+"-") {
@@ -3509,6 +3663,18 @@ func (s *Server) isSIPPhoneOutboundGatewayCall(c *calls.Call) bool {
 	}
 	to := strings.TrimPrefix(strings.ToLower(c.ToNode), "sip:")
 	return isExternalDialString(to)
+}
+
+// isSIPBridgeFeatureCall covers the active bridge types on which account
+// feature codes are safe: a SIP handset to an outside gateway, a normal
+// handset-to-handset bridge, or an inbound gateway call routed to a handset.
+// It intentionally requires a tracked SIP bridge and a SIP source, so a
+// feature code cannot operate on HAOS-only or unrelated calls.
+func (s *Server) isSIPBridgeFeatureCall(c *calls.Call) bool {
+	if c == nil || c.CallType != "sip" || c.SIPBridgeID == "" {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(c.FromNode)), "sip:")
 }
 
 func (s *Server) isOutboundGatewayCall(c *calls.Call) bool {

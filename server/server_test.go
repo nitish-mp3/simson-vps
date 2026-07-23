@@ -36,6 +36,20 @@ func TestOutboundGatewayDialCandidatesKeepShortIntercomExtensionSingleForm(t *te
 	}
 }
 
+func TestGatewayDialProfileKeepsGrandstreamFXODirect(t *testing.T) {
+	leadingZero, postAnswer := gatewayDialProfileFromMetadata("7014 grandstream port 1 airtel fxo landline")
+	if leadingZero || postAnswer != "" {
+		t.Fatalf("Grandstream profile = leadingZero:%v postAnswer:%q, want direct dialing", leadingZero, postAnswer)
+	}
+}
+
+func TestGatewayDialProfilePreservesSynwayTwoStageDial(t *testing.T) {
+	leadingZero, postAnswer := gatewayDialProfileFromMetadata("7009 synway smg4008 gsm active port")
+	if !leadingZero || postAnswer != "#" {
+		t.Fatalf("Synway profile = leadingZero:%v postAnswer:%q, want leading zero and #", leadingZero, postAnswer)
+	}
+}
+
 func TestStripOutboundTrunkPrefixSupportsShortIntercomExtension(t *testing.T) {
 	got := stripOutboundTrunkPrefix("7013198", "7013")
 	if got != "198" {
@@ -141,6 +155,36 @@ func TestGatewaySelectionDoesNotLeakDefaultTrunkAcrossAccounts(t *testing.T) {
 	}
 }
 
+func TestSIPPhoneOutboundGatewayPrefersSourceGatewayUnlessPrefixOverrides(t *testing.T) {
+	st := newServerTestStore(t)
+	if err := st.CreateAccount("site-a", "Site A", 10, 5); err != nil {
+		t.Fatal(err)
+	}
+	endpoints := []store.SIPEndpoint{
+		{ID: "gw-default", AccountID: "site-a", Extension: "7009", Username: "7009", Password: "secret", Description: "Synway", DefaultOutbound: true, Enabled: true},
+		{ID: "gw-fxo", AccountID: "site-a", Extension: "7014", Username: "7014", Password: "secret", Description: "Grandstream FXO", Enabled: true},
+		{ID: "phone", AccountID: "site-a", Extension: "1027", Username: "1027", Password: "secret", Description: "Desk phone", Enabled: true},
+	}
+	for _, ep := range endpoints {
+		if err := st.CreateSIPEndpoint(ep); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s := &Server{store: st, cfg: config.DefaultConfig()}
+	gatewayCaller := &store.SIPEndpoint{AccountID: "site-a", Extension: "7014", Enabled: true}
+	if got := s.selectSIPPhoneOutboundGatewayTrunk(gatewayCaller, "9123208334"); got != "7014" {
+		t.Fatalf("source gateway trunk = %q, want 7014", got)
+	}
+	if got := s.selectSIPPhoneOutboundGatewayTrunk(gatewayCaller, "70099123208334"); got != "7009" {
+		t.Fatalf("explicit gateway prefix trunk = %q, want 7009", got)
+	}
+	deskCaller := &store.SIPEndpoint{AccountID: "site-a", Extension: "1027", Enabled: true}
+	if got := s.selectSIPPhoneOutboundGatewayTrunk(deskCaller, "9123208334"); got != "7009" {
+		t.Fatalf("desk phone default trunk = %q, want 7009", got)
+	}
+}
+
 func TestAdvancedRouteDeclineKeepsOtherHAOSDestination(t *testing.T) {
 	run := &advancedRouteRun{
 		invitedNodes: map[string]bool{"haos-a": true, "haos-b": true},
@@ -242,6 +286,46 @@ func TestAdvancedRouteSourceDoesNotCrossAccountBoundary(t *testing.T) {
 	}
 	if got := s.resolveAdvancedRouteSource("site-a", "1028", in); got != "1028" {
 		t.Fatalf("cross-account source = %q, want safe fallback 1028", got)
+	}
+}
+
+func TestRouteForHAOSRingCodeHonorsGatewayDirectTarget(t *testing.T) {
+	tests := []struct {
+		name      string
+		endpoint  *store.SIPEndpoint
+		wantRoute string
+		wantHAOS  bool
+	}{
+		{
+			name: "direct gateway uses its selected SIP destination",
+			endpoint: &store.SIPEndpoint{
+				Extension: "7014", GatewayInboundMode: "direct_target", GatewayDirectTarget: "1027",
+			},
+			wantRoute: "1027",
+		},
+		{
+			name: "gateway configured for HAOS keeps extension 100 behavior",
+			endpoint: &store.SIPEndpoint{
+				Extension: "7014", GatewayInboundMode: "haos_then_fallback", GatewayDirectTarget: "1027",
+			},
+			wantHAOS: true,
+		},
+		{
+			name: "ordinary SIP phone still rings HAOS",
+			endpoint: &store.SIPEndpoint{
+				Extension: "1027",
+			},
+			wantHAOS: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			route, haos := routeForHAOSRingCode(test.endpoint)
+			if route != test.wantRoute || haos != test.wantHAOS {
+				t.Fatalf("routeForHAOSRingCode() = (%q, %v), want (%q, %v)", route, haos, test.wantRoute, test.wantHAOS)
+			}
+		})
 	}
 }
 

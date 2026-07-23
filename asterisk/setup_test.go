@@ -697,6 +697,23 @@ func readTestFile(t *testing.T, path string) string {
 	return string(data)
 }
 
+func TestDirectSIPConferenceBargeDialplan(t *testing.T) {
+	root := t.TempDir()
+	if err := writeDialplanConf(root, "from-simson-sip", "from-simson-node", "from-simson-out", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
+	for _, want := range []string{
+		"[simson-direct-conference]",
+		"ChanSpy(${SIMSON_SPY_CHANNEL},qBE)",
+		"same  => n(invalid),Hangup(21)",
+	} {
+		if !strings.Contains(dialplan, want) {
+			t.Fatalf("generated direct conference dialplan missing %q:\n%s", want, dialplan)
+		}
+	}
+}
+
 func section(content, start, end string) string {
 	startIndex := strings.Index(content, start)
 	if startIndex < 0 {
