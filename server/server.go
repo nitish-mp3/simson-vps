@@ -2173,9 +2173,9 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		return
 	}
 
-	// Advanced plans can be keyed by either the landing endpoint or the calling
-	// endpoint. Landing plans take precedence for an exact destination; source
-	// plans remain the fallback for ordinary internal/outbound calls.
+	// Advanced plans are keyed by the called/landing endpoint. Never apply a
+	// route merely because the caller owns that extension: doing so hijacks
+	// normal calls made by every phone that also has an incoming route plan.
 	advancedSourceExt := s.resolveAdvancedRouteSource(accountID, sourceExt, in)
 	if !isHAOSBypassCode(in.Extension) {
 		// A gateway may first resolve to a SIP landing endpoint (for example
@@ -2192,9 +2192,6 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 			if s.tryStartAdvancedRouteForIngress(accountID, landingExt, advancedSourceExt, in) {
 				return
 			}
-		}
-		if s.tryStartAdvancedRoute(accountID, advancedSourceExt, in) {
-			return
 		}
 	}
 
@@ -2343,9 +2340,9 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	})
 }
 
-// advancedRouteLandingCandidates returns exact dialled/resolved destinations
-// before the caller-source fallback. This keeps a call such as 1027 -> 1040
-// attached to 1040's landing plan rather than 1027's source plan.
+// advancedRouteLandingCandidates returns only exact dialled/resolved
+// destinations. This keeps a call such as 1027 -> 1040 attached to 1040's
+// landing plan and never activates a plan merely because 1027 is the caller.
 func advancedRouteLandingCandidates(dialledExt, endpointExt, routeTo, sourceExt string) []string {
 	values := []string{dialledExt, endpointExt, routeTo}
 	seen := make(map[string]struct{}, len(values))

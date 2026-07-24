@@ -184,6 +184,18 @@ func TestAdvancedRouteValidationIsAccountScopedAndCapabilitySafe(t *testing.T) {
 		t.Fatalf("valid landed-SIP fallback route rejected: %v", err)
 	}
 
+	implicitLanding := landedSIPFallback
+	implicitLanding.Stages = []store.RouteStage{
+		{Name: "Ring landing phone", RingSeconds: 10, AnswerMode: "first_answer"},
+		{
+			Name: "Fallback", RingSeconds: 10, AnswerMode: "first_answer",
+			Targets: []store.RouteTarget{{Kind: "sip", Value: "1026", Enabled: true}},
+		},
+	}
+	if err := api.validateAdvancedRoute(&implicitLanding); err != nil {
+		t.Fatalf("implicit landed-SIP first stage rejected: %v", err)
+	}
+
 	landingPhoneInLaterStage := landedSIPFallback
 	landingPhoneInLaterStage.Stages = append([]store.RouteStage(nil), landedSIPFallback.Stages...)
 	landingPhoneInLaterStage.Stages[0].Targets = []store.RouteTarget{{Kind: "sip", Value: "1027", Enabled: true}}

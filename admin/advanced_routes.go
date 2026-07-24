@@ -188,7 +188,17 @@ func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {
 		if stage.AnswerMode == "private_hub" && route.Enabled {
 			return fmt.Errorf("private_hub requires the isolated-media hub capability; save this route disabled until a HAOS browser hub is assigned")
 		}
-		if len(stage.Targets) == 0 || len(stage.Targets) > 20 {
+		implicitLanding := route.IngressKind == "sip" && stageIndex == 0
+		explicitLanding := false
+		if implicitLanding {
+			for _, target := range stage.Targets {
+				if target.Enabled && strings.EqualFold(strings.TrimSpace(target.Kind), "sip") && strings.TrimSpace(target.Value) == route.IngressValue {
+					explicitLanding = true
+					break
+				}
+			}
+		}
+		if (len(stage.Targets) == 0 && !implicitLanding) || len(stage.Targets) > 20 {
 			return fmt.Errorf("stage %d must contain between 1 and 20 targets", stageIndex+1)
 		}
 		if stage.AnswerMode == "first_answer" {
@@ -198,6 +208,10 @@ func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {
 		}
 		seen := map[string]bool{}
 		enabledTargets := 0
+		if implicitLanding && !explicitLanding {
+			enabledTargets = 1
+			seenRouteTargets["endpoint:"+route.IngressValue] = stageIndex + 1
+		}
 		externalTargets := 0
 		hubTargets := 0
 		for targetIndex := range stage.Targets {

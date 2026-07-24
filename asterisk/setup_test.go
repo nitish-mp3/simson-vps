@@ -166,6 +166,10 @@ func TestConfBridgeDoesNotStackJitterOrInjectHoldAudio(t *testing.T) {
 	if !strings.Contains(user, "music_on_hold_when_empty=no") {
 		t.Fatalf("ConfBridge must not leak hold/ringback audio while a participant is alone:\n%s", user)
 	}
+	waiting := section(conf, "[simson_waiting_user]", "\n[nonexistent]")
+	if !strings.Contains(waiting, "music_on_hold_when_empty=yes") || !strings.Contains(waiting, "music_on_hold_class=default") {
+		t.Fatalf("advanced-route callers must hear waiting audio while phones ring:\n%s", waiting)
+	}
 }
 
 func TestGatewayWelcomeAnnouncementIsScopedToGatewayIngress(t *testing.T) {
@@ -547,6 +551,19 @@ func TestAdvancedIngressEndpointUsesRouteEventInsteadOfDirectDial(t *testing.T) 
 	}
 	if strings.Contains(dialplan, "exten => 1040,1,NoOp(Simson direct SIP endpoint") {
 		t.Fatal("advanced-ingress endpoint must reach the catch-all SimsonRoute handler")
+	}
+	advanced := buildAdvancedIngressDialplan(endpoints)
+	for _, want := range []string{
+		"exten => 1040,1,NoOp(Simson advanced landing call",
+		"UserEvent(SimsonRoute,Extension: ${EXTEN}",
+		"ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_waiting_user)",
+	} {
+		if !strings.Contains(advanced, want) {
+			t.Fatalf("advanced landing dialplan missing %q:\n%s", want, advanced)
+		}
+	}
+	if strings.Contains(advanced, "exten => 1027,") {
+		t.Fatalf("ordinary endpoint was incorrectly emitted as advanced ingress:\n%s", advanced)
 	}
 }
 

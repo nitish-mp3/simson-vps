@@ -56,3 +56,42 @@ func TestUnsafeExternalAdvancedStage(t *testing.T) {
 		})
 	}
 }
+
+func TestAdvancedRouteStageWithLandingPhone(t *testing.T) {
+	run := &advancedRouteRun{
+		ingressExt: "1040",
+		plan:       store.AdvancedRoute{IngressKind: "sip", IngressValue: "1040"},
+	}
+	stage := store.RouteStage{Targets: []store.RouteTarget{{Kind: "sip", Value: "1027", Enabled: true}}}
+
+	got := advancedRouteStageWithLandingPhone(run, stage, 0, "1034")
+	if len(got.Targets) != 2 || got.Targets[0].Value != "1040" || got.Targets[1].Value != "1027" {
+		t.Fatalf("landing phone was not prepended to stage one: %#v", got.Targets)
+	}
+	if len(stage.Targets) != 1 {
+		t.Fatalf("configured stage was mutated: %#v", stage.Targets)
+	}
+
+	explicit := store.RouteStage{Targets: []store.RouteTarget{{Kind: "sip", Value: "1040", Enabled: true}}}
+	got = advancedRouteStageWithLandingPhone(run, explicit, 0, "1034")
+	if len(got.Targets) != 1 {
+		t.Fatalf("explicit landing phone was duplicated: %#v", got.Targets)
+	}
+
+	got = advancedRouteStageWithLandingPhone(run, stage, 1, "1034")
+	if len(got.Targets) != 1 {
+		t.Fatalf("landing phone was added outside stage one: %#v", got.Targets)
+	}
+
+	got = advancedRouteStageWithLandingPhone(run, stage, 0, "1040")
+	if len(got.Targets) != 1 {
+		t.Fatalf("caller was routed back to itself: %#v", got.Targets)
+	}
+}
+
+func TestAdvancedRouteLandingCandidatesNeverUseCaller(t *testing.T) {
+	got := advancedRouteLandingCandidates("1040", "1040", "1027", "1027")
+	if len(got) != 1 || got[0] != "1040" {
+		t.Fatalf("landing candidates = %#v, want only called extension 1040", got)
+	}
+}

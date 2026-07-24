@@ -32,6 +32,7 @@ type advancedRouteRun struct {
 	parentID      string
 	accountID     string
 	bridgeID      string
+	ingressExt    string
 	sourceChannel string
 	plan          store.AdvancedRoute
 	events        chan advancedRouteEvent
@@ -42,10 +43,6 @@ type advancedRouteRun struct {
 	conference    bool
 	closed        bool
 	done          chan struct{}
-}
-
-func (s *Server) tryStartAdvancedRoute(accountID, sourceExt string, in asterisk.IncomingSIPCall) bool {
-	return s.tryStartAdvancedRouteForIngress(accountID, sourceExt, sourceExt, in)
 }
 
 // tryStartAdvancedRouteForIngress starts the plan identified by ingressExt,
@@ -89,7 +86,7 @@ func (s *Server) tryStartAdvancedRouteForIngress(accountID, ingressExt, sourceEx
 	}
 	run := &advancedRouteRun{
 		parentID: callID, accountID: accountID, bridgeID: in.BridgeID,
-		sourceChannel: in.Channel, plan: *plan, events: make(chan advancedRouteEvent, 64),
+		ingressExt: ingressExt, sourceChannel: in.Channel, plan: *plan, events: make(chan advancedRouteEvent, 64),
 		children: make(map[string]*advancedRouteLeg), invitedNodes: make(map[string]bool),
 		answered: make(map[string]bool), done: make(chan struct{}),
 	}
@@ -110,7 +107,8 @@ func (s *Server) tryStartAdvancedRouteForIngress(accountID, ingressExt, sourceEx
 
 func (s *Server) executeAdvancedRoute(run *advancedRouteRun, in asterisk.IncomingSIPCall, sourceExt string) {
 	seenTargets := make(map[string]bool)
-	for stageIndex, stage := range run.plan.Stages {
+	for stageIndex, configuredStage := range run.plan.Stages {
+		stage := advancedRouteStageWithLandingPhone(run, configuredStage, stageIndex, sourceExt)
 		if s.advancedRouteClosed(run) {
 			return
 		}
@@ -216,6 +214,32 @@ func (s *Server) executeAdvancedRoute(run *advancedRouteRun, in asterisk.Incomin
 		s.cancelAdvancedRoutePending(run, "stage_timeout")
 	}
 	s.endAdvancedRoute(run, "route_exhausted", true)
+}
+
+// advancedRouteStageWithLandingPhone guarantees the basic PBX contract for a
+// SIP landing route: calling the configured extension must ring that phone.
+// Older plans could omit the landing phone because the UI treated every stage
+// as fallback-only; those plans silently parked the caller until another stage
+// ran. Keep explicitly configured parallel destinations, but add the landing
+// endpoint to stage one when it is safe and not already present.
+func advancedRouteStageWithLandingPhone(run *advancedRouteRun, stage store.RouteStage, stageIndex int, sourceExt string) store.RouteStage {
+	if run == nil || stageIndex != 0 || run.plan.IngressKind != "sip" {
+		return stage
+	}
+	landing := strings.TrimSpace(run.ingressExt)
+	if landing == "" || landing == strings.TrimSpace(sourceExt) {
+		return stage
+	}
+	for _, target := range stage.Targets {
+		if target.Enabled && (target.Kind == "sip" || target.Kind == "gateway") && strings.TrimSpace(target.Value) == landing {
+			return stage
+		}
+	}
+	stage.Targets = append([]store.RouteTarget{{
+		ID: "landing_" + landing, Kind: "sip", Value: landing,
+		Label: "Landing phone", Enabled: true,
+	}}, stage.Targets...)
+	return stage
 }
 
 // unsafeExternalAdvancedStage is a runtime safety net for plans that predate

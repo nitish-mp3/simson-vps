@@ -556,6 +556,19 @@ announce_only_user=no
 wait_marked=no
 end_marked=no
 music_on_hold_when_empty=no
+
+; Advanced-route ingress profile. The caller has already reached the PBX, so
+; provide audible waiting audio while the landing phone and later stages ring.
+; Ordinary direct calls continue to use simson_user and never receive this MOH.
+[simson_waiting_user]
+type=user
+quiet=yes
+announce_join_leave=no
+announce_only_user=no
+wait_marked=no
+end_marked=no
+music_on_hold_when_empty=yes
+music_on_hold_class=default
 `
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(content), 0640)
@@ -639,6 +652,7 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 	}
 
 	supervisionRoutes := buildSupervisionDialplan(endpoints)
+	advancedIngressRoutes := buildAdvancedIngressDialplan(endpoints)
 	directEndpointRoutes := buildDirectEndpointDialplan(endpoints)
 	autoAnswerExtensionRoutes := buildAutoAnswerExtensionDialplan(endpoints)
 	accountTransferRoutes := buildAccountTransferDialplan(endpoints)
@@ -918,7 +932,7 @@ exten => t,1,Hangup(16)
 ; BLF/presence hints for desk phones that subscribe to extension state.
 %s
 %s
-`, inCtx, nodeCtx, outCtx, inCtx, supervisionRoutes, directEndpointRoutes, nodeCtx, autoAnswerExtensionRoutes, outCtx, outCtx, anonymousRoutes, blfHints, accountTransferRoutes)
+`, inCtx, nodeCtx, outCtx, inCtx, supervisionRoutes, advancedIngressRoutes+directEndpointRoutes, nodeCtx, autoAnswerExtensionRoutes, outCtx, outCtx, anonymousRoutes, blfHints, accountTransferRoutes)
 
 	return os.WriteFile(filepath.Join(dir, "simson.conf"), []byte(content), 0640)
 }
@@ -1062,12 +1076,16 @@ func stringSet(values []string) map[string]struct{} {
 
 func buildAnonymousInboundDialplan(extensions []string, endpoints []SIPEndpointDef) string {
 	ivrByExt := map[string]string{}
+	advancedIngress := map[string]bool{}
 	for _, ep := range endpoints {
 		ext := sanitizeID(strings.TrimSpace(ep.Extension))
-		if ext == "" || !ep.GatewayIVREnabled {
+		if ext == "" {
 			continue
 		}
-		ivrByExt[ext] = sanitizeSoundName(ep.GatewayIVRSound)
+		advancedIngress[ext] = ep.AdvancedIngress
+		if ep.GatewayIVREnabled {
+			ivrByExt[ext] = sanitizeSoundName(ep.GatewayIVRSound)
+		}
 	}
 	seen := map[string]struct{}{}
 	var sb strings.Builder
@@ -1086,7 +1104,40 @@ func buildAnonymousInboundDialplan(extensions []string, endpoints []SIPEndpointD
 		if sound, ok := ivrByExt[ext]; ok {
 			fmt.Fprintf(&sb, " same  => n,Gosub(simson-gateway-announcement,s,1(%s))\n", sound)
 		}
-		sb.WriteString(" same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)\n")
+		profile := "simson_user"
+		if advancedIngress[ext] {
+			profile = "simson_waiting_user"
+		}
+		fmt.Fprintf(&sb, " same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,%s)\n", profile)
+		sb.WriteString(" same  => n,Hangup()\n")
+	}
+	return sb.String()
+}
+
+// buildAdvancedIngressDialplan emits exact routes before the generic catch-all.
+// These channels use an audible waiting profile while the server executes the
+// configured landing/fallback plan. Keeping this exact and account-generated
+// avoids changing media behavior for every other SIP call.
+func buildAdvancedIngressDialplan(endpoints []SIPEndpointDef) string {
+	seen := map[string]struct{}{}
+	var sb strings.Builder
+	for _, ep := range endpoints {
+		if !ep.Enabled || !ep.AdvancedIngress {
+			continue
+		}
+		ext := sanitizeID(strings.TrimSpace(ep.Extension))
+		if ext == "" || isReservedGatewayExtension(ext) {
+			continue
+		}
+		if _, ok := seen[ext]; ok {
+			continue
+		}
+		seen[ext] = struct{}{}
+		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson advanced landing call ${CALLERID(num)} -> ${EXTEN})\n", ext)
+		sb.WriteString(" same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})\n")
+		sb.WriteString(" same  => n,Set(JITTERBUFFER(adaptive)=default)\n")
+		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
+		sb.WriteString(" same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_waiting_user)\n")
 		sb.WriteString(" same  => n,Hangup()\n")
 	}
 	return sb.String()
