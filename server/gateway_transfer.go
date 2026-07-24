@@ -16,6 +16,9 @@ type gatewayBridgeFeatureAction string
 const (
 	gatewayBridgeTransfer   gatewayBridgeFeatureAction = "transfer"
 	gatewayBridgeConference gatewayBridgeFeatureAction = "conference"
+	gatewayBridgeListen     gatewayBridgeFeatureAction = "invite_listen"
+	gatewayBridgeWhisper    gatewayBridgeFeatureAction = "invite_whisper"
+	gatewayBridgeBarge      gatewayBridgeFeatureAction = "invite_barge"
 )
 
 type gatewayBridgeFeatureCode struct {
@@ -95,17 +98,21 @@ func advanceGatewayTransferCapture(c *gatewayTransferCapture, digit string) (tar
 	if digit == "#" {
 		return c.Target, c.Target != "", false
 	}
-	if digit < "0" || digit > "9" || len(c.Target) >= 20 {
+	if (digit < "0" || digit > "9") && digit != "*" {
+		return "", false, false
+	}
+	if len(c.Target) >= 40 {
 		return "", false, false
 	}
 	c.Target += digit
 	return "", false, true
 }
 
-func configuredGatewayBridgeFeatureCodes(transferCode, conferenceCode string) []gatewayBridgeFeatureCode {
+func configuredGatewayBridgeFeatureCodes(transferCode, conferenceCode, listenCode, whisperCode, bargeCode string) []gatewayBridgeFeatureCode {
 	transferCode = normalizeTransferCode(transferCode)
 	conferenceCode = normalizeTransferCode(conferenceCode)
-	codes := make([]gatewayBridgeFeatureCode, 0, 2)
+	listenCode, whisperCode, bargeCode = normalizeTransferCode(listenCode), normalizeTransferCode(whisperCode), normalizeTransferCode(bargeCode)
+	codes := make([]gatewayBridgeFeatureCode, 0, 5)
 	if transferCode != "" {
 		codes = append(codes, gatewayBridgeFeatureCode{Code: transferCode, Action: gatewayBridgeTransfer})
 	}
@@ -113,6 +120,13 @@ func configuredGatewayBridgeFeatureCodes(transferCode, conferenceCode string) []
 	// because it preserves the account's existing *84 behavior.
 	if conferenceCode != "" && conferenceCode != transferCode {
 		codes = append(codes, gatewayBridgeFeatureCode{Code: conferenceCode, Action: gatewayBridgeConference})
+	}
+	used := map[string]bool{transferCode: true, conferenceCode: true}
+	for _, feature := range []gatewayBridgeFeatureCode{{listenCode, gatewayBridgeListen}, {whisperCode, gatewayBridgeWhisper}, {bargeCode, gatewayBridgeBarge}} {
+		if feature.Code != "" && !used[feature.Code] {
+			codes = append(codes, feature)
+			used[feature.Code] = true
+		}
 	}
 	return codes
 }
@@ -178,9 +192,11 @@ func (s *Server) handleGatewayBridgeDTMF(info asterisk.ChannelDTMF) {
 	if err != nil || features == nil || !features.Enabled {
 		return
 	}
-	codes := configuredGatewayBridgeFeatureCodes(features.TransferCode, features.ConferenceCode)
+	codes := configuredGatewayBridgeFeatureCodes(features.TransferCode, features.ConferenceCode,
+		features.InviteListenCode, features.InviteWhisperCode, features.InviteBargeCode)
 	if !managedBridge {
-		codes = configuredGatewayBridgeFeatureCodes("", features.ConferenceCode)
+		codes = configuredGatewayBridgeFeatureCodes("", features.ConferenceCode,
+			features.InviteListenCode, features.InviteWhisperCode, features.InviteBargeCode)
 	}
 	if len(codes) == 0 {
 		return
@@ -208,6 +224,10 @@ func (s *Server) handleGatewayBridgeDTMF(info asterisk.ChannelDTMF) {
 			SourceExt: sourceExt, Codes: codes,
 		}
 		s.gatewayTransferCaptures[info.Channel] = capture
+		s.log.Debug("active-call feature capture started", map[string]any{
+			"account_id": accountID, "source": sourceExt, "channel": info.Channel,
+			"managed_call": managedBridge,
+		})
 	}
 	target, complete, keep := advanceGatewayTransferCapture(capture, info.Digit)
 	if !keep {
@@ -236,13 +256,17 @@ func (s *Server) handleGatewayBridgeDTMF(info asterisk.ChannelDTMF) {
 	s.gatewayTransferMu.Unlock()
 
 	if complete {
+		s.log.Info("active-call feature code accepted", map[string]any{
+			"account_id": accountID, "call_id": callID, "source": sourceExt,
+			"action": action, "target": target,
+		})
 		s.startGatewayBridgeFeature(action, callID, info.Channel, sourceExt, target)
 		return
 	}
 	// Exact, unambiguous onsite extensions can transfer immediately without an
 	// artificial timeout. Variable-length or outside destinations still use #
 	// (or the short inter-digit timeout) to determine completion.
-	if keep && candidate != "" && s.isUnambiguousGatewayTransferTarget(accountID, candidate) {
+	if keep && !strings.Contains(candidate, "*") && candidate != "" && s.isUnambiguousGatewayTransferTarget(accountID, candidate) {
 		s.gatewayTransferMu.Lock()
 		if current := s.gatewayTransferCaptures[info.Channel]; current == capture {
 			delete(s.gatewayTransferCaptures, info.Channel)
@@ -250,6 +274,10 @@ func (s *Server) handleGatewayBridgeDTMF(info asterisk.ChannelDTMF) {
 		}
 		s.gatewayTransferMu.Unlock()
 		if target != "" {
+			s.log.Info("active-call feature code accepted", map[string]any{
+				"account_id": accountID, "call_id": callID, "source": sourceExt,
+				"action": action, "target": target, "completion": "exact_extension",
+			})
 			s.startGatewayBridgeFeature(action, callID, info.Channel, sourceExt, target)
 		}
 	}
@@ -265,6 +293,10 @@ func (s *Server) finishGatewayTransferCapture(channel string, generation uint64)
 	delete(s.gatewayTransferCaptures, channel)
 	callID, sourceExt, target, action := capture.CallID, capture.SourceExt, capture.Target, capture.Action
 	s.gatewayTransferMu.Unlock()
+	s.log.Info("active-call feature code accepted", map[string]any{
+		"account_id": capture.AccountID, "call_id": callID, "source": sourceExt,
+		"action": action, "target": target, "completion": "interdigit_timeout",
+	})
 	s.startGatewayBridgeFeature(action, callID, channel, sourceExt, target)
 }
 
@@ -291,6 +323,10 @@ func (s *Server) isUnambiguousGatewayTransferTarget(accountID, target string) bo
 }
 
 func (s *Server) startGatewayBridgeFeature(action gatewayBridgeFeatureAction, callID, sourceChannel, sourceExt, target string) {
+	if action == gatewayBridgeListen || action == gatewayBridgeWhisper || action == gatewayBridgeBarge {
+		s.startDirectSIPSupervision(sourceChannel, sourceExt, target, strings.TrimPrefix(string(action), "invite_"))
+		return
+	}
 	if callID == "" {
 		if action == gatewayBridgeConference {
 			s.startDirectSIPConference(sourceChannel, sourceExt, target)
@@ -302,7 +338,14 @@ func (s *Server) startGatewayBridgeFeature(action gatewayBridgeFeatureAction, ca
 		return
 	}
 	target = strings.TrimSpace(target)
-	targetEP, err := s.store.GetSIPEndpointByExtension(target)
+	if trunk, number, external, parseErr := s.resolveBridgeFeatureTarget(call.AccountID, target); parseErr != nil {
+		s.log.Warn("gateway bridge outside target rejected", map[string]any{"call_id": callID, "target": target, "err": parseErr.Error()})
+		return
+	} else if external {
+		s.startManagedExternalBridgeFeature(action, call, sourceChannel, sourceExt, trunk, number)
+		return
+	}
+	targetEP, err := s.store.GetSIPEndpointByAccountAndExtension(call.AccountID, target)
 	if err != nil || targetEP == nil || !targetEP.Enabled || targetEP.AccountID != call.AccountID || isReservedGatewayExtension(target) || target == sourceExt {
 		s.log.Warn("gateway bridge transfer rejected", map[string]any{
 			"call_id": callID, "source": sourceExt, "target": target, "reason": "target is not an enabled same-site SIP phone",
@@ -353,12 +396,27 @@ func (s *Server) startGatewayBridgeFeature(action gatewayBridgeFeatureAction, ca
 }
 
 func (s *Server) startDirectSIPConference(sourceChannel, sourceExt, target string) {
+	s.startDirectSIPSupervision(sourceChannel, sourceExt, target, "barge")
+}
+
+func (s *Server) startDirectSIPSupervision(sourceChannel, sourceExt, target, mode string) {
 	sourceEP, err := s.store.GetSIPEndpointByExtension(sourceExt)
 	if err != nil || sourceEP == nil || !sourceEP.Enabled {
 		return
 	}
 	target = strings.TrimSpace(target)
-	targetEP, err := s.store.GetSIPEndpointByExtension(target)
+	if trunk, number, external, parseErr := s.resolveBridgeFeatureTarget(sourceEP.AccountID, target); parseErr != nil {
+		s.log.Warn("direct SIP outside invitation rejected", map[string]any{"source": sourceExt, "target": target, "mode": mode, "err": parseErr.Error()})
+		return
+	} else if external {
+		callerID := formatSIPCallerID("Call invitation", sourceExt)
+		if _, err := s.asterisk.OriginateDirectExternalSupervision(number, trunk, s.cfg.Asterisk.OutContext,
+			sourceChannel, callerID, mode, s.cfg.CallTimeoutSec); err != nil {
+			s.log.Warn("direct SIP outside invitation originate failed", map[string]any{"source": sourceExt, "number": number, "trunk": trunk, "mode": mode, "err": err.Error()})
+		}
+		return
+	}
+	targetEP, err := s.store.GetSIPEndpointByAccountAndExtension(sourceEP.AccountID, target)
 	if err != nil || targetEP == nil || !targetEP.Enabled || targetEP.AccountID != sourceEP.AccountID ||
 		isReservedGatewayExtension(target) || target == sourceExt {
 		s.log.Warn("direct SIP conference rejected", map[string]any{
@@ -366,18 +424,74 @@ func (s *Server) startDirectSIPConference(sourceChannel, sourceExt, target strin
 		})
 		return
 	}
-	callerID := formatSIPCallerID("Conference", sourceExt)
-	if _, err := s.asterisk.OriginateDirectConference(target, sourceChannel, callerID, s.cfg.CallTimeoutSec); err != nil {
+	callerID := formatSIPCallerID("Call "+mode, sourceExt)
+	if _, err := s.asterisk.OriginateDirectSupervision(target, sourceChannel, callerID, mode, s.cfg.CallTimeoutSec); err != nil {
 		s.log.Warn("direct SIP conference originate failed", map[string]any{
 			"source": sourceExt, "target": target, "channel": sourceChannel, "err": err.Error(),
 		})
 		return
 	}
-	s.store.WriteAudit(sourceEP.AccountID, "sip:"+sourceExt, "direct_sip_conference",
-		fmt.Sprintf("source=%s added=%s channel=%s", sourceExt, target, sourceChannel), "")
-	s.log.Info("direct SIP conference participant ringing", map[string]any{
-		"source": sourceExt, "target": target, "channel": sourceChannel,
+	s.store.WriteAudit(sourceEP.AccountID, "sip:"+sourceExt, "direct_sip_invitation",
+		fmt.Sprintf("source=%s added=%s mode=%s channel=%s", sourceExt, target, mode, sourceChannel), "")
+	s.log.Info("direct SIP invited participant ringing", map[string]any{
+		"source": sourceExt, "target": target, "mode": mode, "channel": sourceChannel,
 	})
+}
+
+// resolveBridgeFeatureTarget accepts either a same-site SIP extension, a plain
+// outside number using the account default gateway, or *gateway*number.
+func (s *Server) resolveBridgeFeatureTarget(accountID, raw string) (trunk, number string, external bool, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false, fmt.Errorf("missing destination")
+	}
+	if strings.HasPrefix(raw, "*") {
+		parts := strings.Split(strings.TrimPrefix(raw, "*"), "*")
+		if len(parts) != 2 || digitsOnly(parts[0]) == "" || digitsOnly(parts[1]) == "" {
+			return "", "", false, fmt.Errorf("use *gateway*number")
+		}
+		trunk, number = digitsOnly(parts[0]), digitsOnly(parts[1])
+		if !s.isUsableOutboundGatewayTrunk(accountID, trunk) {
+			return "", "", false, fmt.Errorf("gateway %s is not enabled in this account", trunk)
+		}
+		return trunk, number, true, nil
+	}
+	if ep, lookupErr := s.store.GetSIPEndpointByAccountAndExtension(accountID, raw); lookupErr == nil && ep != nil && ep.Enabled && !isReservedGatewayExtension(raw) {
+		return "", "", false, nil
+	}
+	number = digitsOnly(raw)
+	if number == "" {
+		return "", "", false, fmt.Errorf("invalid destination")
+	}
+	trunk = s.selectOutboundGatewayTrunk(accountID, "")
+	if trunk == "" {
+		return "", "", false, fmt.Errorf("no default outbound gateway is available")
+	}
+	return trunk, number, true, nil
+}
+
+func (s *Server) startManagedExternalBridgeFeature(action gatewayBridgeFeatureAction, call *calls.Call, sourceChannel, sourceExt, trunk, number string) {
+	if call == nil || s.asterisk == nil {
+		return
+	}
+	pending := &gatewayTransferPending{CallID: call.ID, AccountID: call.AccountID, SourceExt: sourceExt,
+		SourceChannel: sourceChannel, TargetExt: "outside:" + number, Action: action}
+	s.gatewayTransferMu.Lock()
+	if _, exists := s.gatewayTransferPending[call.ID]; exists {
+		s.gatewayTransferMu.Unlock()
+		return
+	}
+	s.gatewayTransferPending[call.ID] = pending
+	s.gatewayTransferMu.Unlock()
+	_, err := s.asterisk.OriginateBridgeExternalParticipant(number, trunk, s.cfg.Asterisk.OutContext,
+		s.cfg.Asterisk.NodeContext, call.SIPBridgeID, formatSIPCallerID("Transferred call", number),
+		call.ID, call.FromNode, sourceChannel, sourceExt, s.cfg.CallTimeoutSec, action == gatewayBridgeTransfer)
+	if err != nil {
+		s.gatewayTransferMu.Lock()
+		delete(s.gatewayTransferPending, call.ID)
+		s.gatewayTransferMu.Unlock()
+		s.log.Warn("gateway bridge outside participant originate failed", map[string]any{"call_id": call.ID, "trunk": trunk, "number": number, "err": err.Error()})
+	}
 }
 
 func (s *Server) handleGatewayBridgeTransferResult(result asterisk.BridgeTransferResult) {

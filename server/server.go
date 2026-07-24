@@ -141,6 +141,7 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 		router := asterisk.NewRouter(ami, log)
 		router.OnIncomingCall = s.handleSIPIncomingCall
 		router.OnIntercomCallback = s.handleSIPIntercomCallback
+		router.OnDirectSIPCall = s.handleDirectSIPCall
 		router.OnChannelHangup = s.handleSIPChannelHangup
 		router.OnOriginateResult = s.handleSIPOriginateResult
 		router.OnChannelDTMF = s.enqueueGatewayBridgeDTMF
@@ -150,6 +151,45 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 	}
 
 	return s
+}
+
+func (s *Server) handleDirectSIPCall(event asterisk.DirectSIPCallEvent) {
+	if event.AccountID == "" || event.CallID == "" {
+		return
+	}
+	switch event.Phase {
+	case "ringing":
+		call := &calls.Call{
+			ID:        event.CallID,
+			FromNode:  "sip:" + event.Source,
+			ToNode:    "sip:" + event.Target,
+			AccountID: event.AccountID,
+			CallType:  "sip",
+			CallerID:  event.Source,
+		}
+		if !s.calls.Create(call) {
+			return
+		}
+		if s.asterisk != nil && event.Channel != "" {
+			s.asterisk.TrackCall(event.CallID, event.Channel)
+		}
+		s.notifyCallStatus(call)
+	case "active":
+		if call, ok := s.calls.Accept(event.CallID, ""); ok {
+			s.notifyCallStatus(call)
+		}
+	case "ended":
+		reason := strings.ToLower(strings.TrimSpace(event.DialStatus))
+		if reason == "" {
+			reason = "hangup"
+		}
+		if call, ok := s.calls.End(event.CallID, reason); ok {
+			s.notifyCallStatus(call)
+		}
+		if s.asterisk != nil {
+			s.asterisk.UntrackCall(event.CallID)
+		}
+	}
 }
 
 // Hub returns the live session hub (for admin API).
@@ -1762,6 +1802,10 @@ func (s *Server) notifyCallStatus(c *calls.Call) {
 		Status:      string(c.State),
 		Reason:      c.EndReason,
 		SIPBridgeID: c.SIPBridgeID,
+		FromNodeID:  c.FromNode,
+		ToNodeID:    c.ToNode,
+		CallerID:    c.CallerID,
+		CallType:    c.CallType,
 	})
 	data, _ := status.Encode()
 
@@ -1804,6 +1848,10 @@ func (s *Server) notifyCallStatusToNode(nodeID string, c *calls.Call, status, re
 		Reason:           reason,
 		SIPBridgeID:      c.SIPBridgeID,
 		AnsweredByUserID: answeredBy,
+		FromNodeID:       c.FromNode,
+		ToNodeID:         c.ToNode,
+		CallerID:         c.CallerID,
+		CallType:         c.CallType,
 	})
 	data, _ := env.Encode()
 	nodeSess.Send(data)
@@ -2134,22 +2182,13 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 		// 7016 -> 1027). Check both the dialled endpoint and that resolved
 		// landing target so a plan for 1027 is not bypassed by the gateway's
 		// direct-target setting.
-		landingCandidates := []string{strings.TrimSpace(in.Extension)}
+		endpointExt := ""
 		if ep != nil {
-			landingCandidates = append(landingCandidates, strings.TrimSpace(ep.Extension))
+			endpointExt = ep.Extension
 		}
-		if routeTo != "" && routeTo != sourceExt {
-			landingCandidates = append(landingCandidates, strings.TrimSpace(routeTo))
-		}
-		seenLanding := make(map[string]struct{}, len(landingCandidates))
-		for _, landingExt := range landingCandidates {
-			if landingExt == "" || landingExt == advancedSourceExt {
-				continue
-			}
-			if _, seen := seenLanding[landingExt]; seen {
-				continue
-			}
-			seenLanding[landingExt] = struct{}{}
+		for _, landingExt := range advancedRouteLandingCandidates(
+			in.Extension, endpointExt, routeTo, advancedSourceExt,
+		) {
 			if s.tryStartAdvancedRouteForIngress(accountID, landingExt, advancedSourceExt, in) {
 				return
 			}
@@ -2302,6 +2341,27 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	s.log.Info("SIP invite dispatched", map[string]any{
 		"call_id": callID, "extension": in.Extension, "targets": sentCount,
 	})
+}
+
+// advancedRouteLandingCandidates returns exact dialled/resolved destinations
+// before the caller-source fallback. This keeps a call such as 1027 -> 1040
+// attached to 1040's landing plan rather than 1027's source plan.
+func advancedRouteLandingCandidates(dialledExt, endpointExt, routeTo, sourceExt string) []string {
+	values := []string{dialledExt, endpointExt, routeTo}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || value == strings.TrimSpace(sourceExt) {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func normalizeSIPRouteTarget(routeTo string) (string, bool) {
@@ -3990,6 +4050,24 @@ func (s *Server) configureAsteriskFromStore() {
 	for _, features := range accountFeatures {
 		featuresByAccount[features.AccountID] = features
 	}
+	advancedIngress := make(map[string]bool)
+	seenRouteAccounts := make(map[string]bool)
+	for _, ep := range endpoints {
+		if seenRouteAccounts[ep.AccountID] {
+			continue
+		}
+		seenRouteAccounts[ep.AccountID] = true
+		routes, routeErr := s.store.ListAdvancedRoutes(ep.AccountID)
+		if routeErr != nil {
+			s.log.Error("could not load advanced routes for Asterisk config", map[string]any{"account_id": ep.AccountID, "err": routeErr.Error()})
+			return
+		}
+		for _, route := range routes {
+			if route.Enabled && route.IngressKind == "sip" {
+				advancedIngress[ep.AccountID+"\x00"+strings.TrimSpace(route.IngressValue)] = true
+			}
+		}
+	}
 
 	defs := make([]asterisk.SIPEndpointDef, 0, len(endpoints))
 	for _, ep := range endpoints {
@@ -4019,6 +4097,7 @@ func (s *Server) configureAsteriskFromStore() {
 			AccountTransferCode:       features.TransferCode,
 			AccountConferenceCode:     features.ConferenceCode,
 			AccountFeaturesEnabled:    features.Enabled,
+			AdvancedIngress:           advancedIngress[ep.AccountID+"\x00"+strings.TrimSpace(ep.Extension)],
 			DefaultOutbound:           ep.DefaultOutbound,
 			Enabled:                   ep.Enabled,
 		})

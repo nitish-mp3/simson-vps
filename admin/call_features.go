@@ -40,6 +40,26 @@ func (a *API) handlePutAccountCallFeatures(w http.ResponseWriter, r *http.Reques
 	body.AccountID = accountID
 	body.TransferCode = normalizeAccountFeatureCode(body.TransferCode)
 	body.ConferenceCode = normalizeAccountFeatureCode(body.ConferenceCode)
+	body.InviteListenCode = normalizeAccountFeatureCode(body.InviteListenCode)
+	body.InviteWhisperCode = normalizeAccountFeatureCode(body.InviteWhisperCode)
+	body.InviteBargeCode = normalizeAccountFeatureCode(body.InviteBargeCode)
+	// Older addon versions only send transfer/conference. Preserve a safe
+	// upgrade path instead of rejecting their settings request.
+	if body.TransferCode == "" {
+		body.TransferCode = "*84"
+	}
+	if body.ConferenceCode == "" {
+		body.ConferenceCode = "*85"
+	}
+	if body.InviteListenCode == "" {
+		body.InviteListenCode = "*86"
+	}
+	if body.InviteWhisperCode == "" {
+		body.InviteWhisperCode = "*87"
+	}
+	if body.InviteBargeCode == "" {
+		body.InviteBargeCode = "*88"
+	}
 	if err := a.validateAccountCallFeatures(body); err != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 		return
@@ -50,7 +70,8 @@ func (a *API) handlePutAccountCallFeatures(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	a.store.WriteAudit(accountID, "admin", "account_call_features_updated",
-		fmt.Sprintf("transfer=%s conference=%s enabled=%t", body.TransferCode, body.ConferenceCode, body.Enabled), r.RemoteAddr)
+		fmt.Sprintf("transfer=%s conference=%s invite_listen=%s invite_whisper=%s invite_barge=%s enabled=%t",
+			body.TransferCode, body.ConferenceCode, body.InviteListenCode, body.InviteWhisperCode, body.InviteBargeCode, body.Enabled), r.RemoteAddr)
 	a.reconfigureAsterisk()
 	features, _ := a.store.GetAccountCallFeatures(accountID)
 	writeJSON(w, http.StatusOK, features)
@@ -71,11 +92,23 @@ func (a *API) validateAccountCallFeatures(features store.AccountCallFeatures) er
 	if !accountFeatureCode.MatchString(features.ConferenceCode) {
 		return fmt.Errorf("conference_code must be a star followed by 2 to 5 digits")
 	}
-	if features.TransferCode == features.ConferenceCode {
-		return fmt.Errorf("transfer and conference codes must be different")
+	codes := map[string]string{
+		"transfer_code": features.TransferCode, "conference_code": features.ConferenceCode,
+		"invite_listen_code": features.InviteListenCode, "invite_whisper_code": features.InviteWhisperCode,
+		"invite_barge_code": features.InviteBargeCode,
 	}
-	if features.TransferCode == "*100" || features.ConferenceCode == "*100" {
-		return fmt.Errorf("*100 is reserved for the HAOS card")
+	seen := map[string]string{}
+	for name, code := range codes {
+		if !accountFeatureCode.MatchString(code) {
+			return fmt.Errorf("%s must be a star followed by 2 to 5 digits", name)
+		}
+		if code == "*100" {
+			return fmt.Errorf("*100 is reserved for the HAOS card")
+		}
+		if previous := seen[code]; previous != "" {
+			return fmt.Errorf("%s conflicts with %s", name, previous)
+		}
+		seen[code] = name
 	}
 	endpoints, err := a.store.ListSIPEndpoints(features.AccountID)
 	if err != nil {
@@ -90,7 +123,7 @@ func (a *API) validateAccountCallFeatures(features store.AccountCallFeatures) er
 			continue
 		}
 		for _, key := range []string{"listen_key", "whisper_key", "barge_key"} {
-			if existing, _ := supervision[key].(string); normalizeAccountFeatureCode(existing) == features.TransferCode || normalizeAccountFeatureCode(existing) == features.ConferenceCode {
+			if existing, _ := supervision[key].(string); seen[normalizeAccountFeatureCode(existing)] != "" {
 				return fmt.Errorf("feature code conflicts with %s supervision on extension %s", key, ep.Extension)
 			}
 		}

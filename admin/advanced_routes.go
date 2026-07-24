@@ -40,6 +40,7 @@ func (a *API) handleCreateAdvancedRoute(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	a.store.WriteAudit(accountID, "admin", "advanced_route_created", "route="+route.ID, r.RemoteAddr)
+	a.reconfigureAsterisk()
 	created, _ := a.store.GetAdvancedRoute(route.ID)
 	writeJSON(w, http.StatusCreated, created)
 }
@@ -101,6 +102,7 @@ func (a *API) handleUpdateAdvancedRoute(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	a.store.WriteAudit(existing.AccountID, "admin", "advanced_route_updated", "route="+id, r.RemoteAddr)
+	a.reconfigureAsterisk()
 	updated, _ := a.store.GetAdvancedRoute(id)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -122,6 +124,7 @@ func (a *API) handleDeleteAdvancedRoute(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	a.store.WriteAudit(existing.AccountID, "admin", "advanced_route_deleted", "route="+id, r.RemoteAddr)
+	a.reconfigureAsterisk()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -142,7 +145,7 @@ func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {
 		return fmt.Errorf("ingress_value must be a valid SIP extension, gateway, or manual route key")
 	}
 	if route.IngressKind != "manual" {
-		ep, err := a.store.GetSIPEndpointByExtension(route.IngressValue)
+		ep, err := a.store.GetSIPEndpointByAccountAndExtension(route.AccountID, route.IngressValue)
 		if err != nil {
 			return fmt.Errorf("could not validate ingress endpoint")
 		}
@@ -210,6 +213,9 @@ func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {
 			if !target.Enabled {
 				continue
 			}
+			if route.IngressKind == "sip" && target.Kind == "sip" && target.Value == route.IngressValue && stageIndex != 0 {
+				return fmt.Errorf("stage %d target %d: the landing SIP phone may appear only in stage 1", stageIndex+1, targetIndex+1)
+			}
 			enabledTargets++
 			if target.Kind == "external" {
 				externalTargets++
@@ -275,11 +281,12 @@ func (a *API) validateAdvancedRouteTarget(route *store.AdvancedRoute, stage *sto
 	}
 	switch target.Kind {
 	case "sip", "gateway":
-		ep, err := a.store.GetSIPEndpointByExtension(target.Value)
+		ep, err := a.store.GetSIPEndpointByAccountAndExtension(route.AccountID, target.Value)
 		if err != nil || ep == nil || ep.AccountID != route.AccountID || !ep.Enabled {
 			return fmt.Errorf("SIP/gateway endpoint does not belong to this account or is disabled")
 		}
-		if route.IngressKind != "manual" && target.Value == route.IngressValue {
+		landingSIPTarget := route.IngressKind == "sip" && target.Kind == "sip" && target.Value == route.IngressValue
+		if route.IngressKind != "manual" && target.Value == route.IngressValue && !landingSIPTarget {
 			return fmt.Errorf("target loops back to the ingress endpoint")
 		}
 	case "haos":
@@ -294,7 +301,7 @@ func (a *API) validateAdvancedRouteTarget(route *store.AdvancedRoute, stage *sto
 		if target.Trunk == "" {
 			return fmt.Errorf("external target requires a gateway trunk")
 		}
-		trunk, err := a.store.GetSIPEndpointByExtension(target.Trunk)
+		trunk, err := a.store.GetSIPEndpointByAccountAndExtension(route.AccountID, target.Trunk)
 		if err != nil || trunk == nil || trunk.AccountID != route.AccountID || !trunk.Enabled {
 			return fmt.Errorf("external target gateway does not belong to this account or is disabled")
 		}

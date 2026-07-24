@@ -153,7 +153,9 @@ func TestAccountCallFeaturesDefaultAndUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if features.TransferCode != "*84" || features.ConferenceCode != "*85" || !features.Enabled {
+	if features.TransferCode != "*84" || features.ConferenceCode != "*85" ||
+		features.InviteListenCode != "*86" || features.InviteWhisperCode != "*87" ||
+		features.InviteBargeCode != "*88" || !features.Enabled {
 		t.Fatalf("unexpected defaults: %#v", features)
 	}
 	listed, err := st.ListAccountCallFeatures()
@@ -164,7 +166,10 @@ func TestAccountCallFeaturesDefaultAndUpdate(t *testing.T) {
 		t.Fatalf("existing account defaults were not listed: %#v", listed)
 	}
 
-	want := AccountCallFeatures{AccountID: "site-a", TransferCode: "*64", ConferenceCode: "*65", Enabled: true}
+	want := AccountCallFeatures{
+		AccountID: "site-a", TransferCode: "*64", ConferenceCode: "*65",
+		InviteListenCode: "*66", InviteWhisperCode: "*67", InviteBargeCode: "*68", Enabled: true,
+	}
 	if err := st.UpsertAccountCallFeatures(want); err != nil {
 		t.Fatal(err)
 	}
@@ -172,8 +177,47 @@ func TestAccountCallFeaturesDefaultAndUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if features.TransferCode != want.TransferCode || features.ConferenceCode != want.ConferenceCode || !features.Enabled {
+	if features.TransferCode != want.TransferCode || features.ConferenceCode != want.ConferenceCode ||
+		features.InviteListenCode != want.InviteListenCode || features.InviteWhisperCode != want.InviteWhisperCode ||
+		features.InviteBargeCode != want.InviteBargeCode || !features.Enabled {
 		t.Fatalf("account feature update was not persisted: %#v", features)
+	}
+}
+
+func TestGetSIPEndpointByAccountAndExtensionIsTenantScoped(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "tenant-sip.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	for _, accountID := range []string{"site-a", "site-b"} {
+		if err := st.CreateAccount(accountID, accountID, 10, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, ep := range []SIPEndpoint{
+		{ID: "site-a-1040", AccountID: "site-a", Extension: "1040", Username: "site-a-1040", Password: "secret-a", Description: "Site A phone", Enabled: true},
+		{ID: "site-b-1040", AccountID: "site-b", Extension: "1040", Username: "site-b-1040", Password: "secret-b", Description: "Site B phone", Enabled: true},
+	} {
+		if err := st.CreateSIPEndpoint(ep); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := st.GetSIPEndpointByAccountAndExtension("site-b", "1040")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ID != "site-b-1040" || got.AccountID != "site-b" {
+		t.Fatalf("tenant-scoped lookup returned wrong endpoint: %#v", got)
+	}
+	got, err = st.GetSIPEndpointByAccountAndExtension("site-a", "9999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("missing tenant endpoint should return nil, got %#v", got)
 	}
 }
 

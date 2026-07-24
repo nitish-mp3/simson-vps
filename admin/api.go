@@ -98,6 +98,7 @@ func (a *API) Router() http.Handler {
 	mux.HandleFunc("PUT /admin/sip-endpoints/{id}", a.auth(a.handleUpdateSIPEndpoint))
 	mux.HandleFunc("DELETE /admin/sip-endpoints/{id}", a.auth(a.handleDeleteSIPEndpoint))
 	mux.HandleFunc("POST /admin/sip-endpoints/{id}/clear-stuck", a.auth(a.handleClearStuckSIPEndpoint))
+	mux.HandleFunc("POST /admin/accounts/{accountId}/sip-endpoints/{id}/clear-stuck", a.auth(a.handleClearStuckSIPEndpoint))
 	mux.HandleFunc("POST /admin/accounts/{accountId}/door-events", a.auth(a.handleDoorEvent))
 
 	// Advanced account-scoped call routes. These are deliberately separate
@@ -109,6 +110,7 @@ func (a *API) Router() http.Handler {
 	mux.HandleFunc("DELETE /admin/accounts/{accountId}/advanced-routes/{id}", a.auth(a.handleDeleteAdvancedRoute))
 	mux.HandleFunc("GET /admin/accounts/{accountId}/call-features", a.auth(a.handleGetAccountCallFeatures))
 	mux.HandleFunc("PUT /admin/accounts/{accountId}/call-features", a.auth(a.handlePutAccountCallFeatures))
+	mux.HandleFunc("POST /admin/accounts/{accountId}/active-call-invite", a.auth(a.handleActiveCallInvite))
 
 	// Asterisk management
 	mux.HandleFunc("POST /admin/asterisk/reload-sip", a.auth(a.handleAsteriskReloadSIP))
@@ -797,6 +799,10 @@ func (a *API) handleGetSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 		return
 	}
+	if accountID := strings.TrimSpace(r.PathValue("accountId")); accountID != "" && ep.AccountID != accountID {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "SIP endpoint not found in this account"})
+		return
+	}
 	writeJSON(w, http.StatusOK, ep)
 }
 
@@ -1143,10 +1149,6 @@ func (a *API) handleDeleteSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 // handleClearStuckSIPEndpoint is a guarded recovery action for a gateway or
 // SIP endpoint that remains marked in use after its call has ended.
 func (a *API) handleClearStuckSIPEndpoint(w http.ResponseWriter, r *http.Request) {
-	if a.asterisk == nil || !a.asterisk.Connected() {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Asterisk integration unavailable"})
-		return
-	}
 	ep, err := a.store.GetSIPEndpoint(r.PathValue("id"))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
@@ -1156,6 +1158,14 @@ func (a *API) handleClearStuckSIPEndpoint(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "SIP endpoint not found"})
 		return
 	}
+	if accountID := strings.TrimSpace(r.PathValue("accountId")); accountID != "" && ep.AccountID != accountID {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "SIP endpoint not found"})
+		return
+	}
+	if a.asterisk == nil || !a.asterisk.Connected() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Asterisk integration unavailable"})
+		return
+	}
 	cleared, err := a.asterisk.ClearEndpointChannels(ep.Extension)
 	if err != nil {
 		a.log.Error("clear stuck SIP endpoint", map[string]any{"endpoint": ep.Extension, "err": err.Error()})
@@ -1163,7 +1173,101 @@ func (a *API) handleClearStuckSIPEndpoint(w http.ResponseWriter, r *http.Request
 		return
 	}
 	a.log.Info("cleared stuck SIP endpoint channels", map[string]any{"endpoint": ep.Extension, "cleared": cleared})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "extension": ep.Extension, "cleared": cleared})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "extension": ep.Extension, "cleared": cleared,
+		"hardware_action_required": cleared == 0,
+	})
+}
+
+// handleActiveCallInvite gives an authorised site operator a reliable control
+// path when a handset cannot send RFC4733 feature digits during an active call.
+// It never searches globally: source, destination, and gateway all belong to
+// the account in the URL.
+func (a *API) handleActiveCallInvite(w http.ResponseWriter, r *http.Request) {
+	if a.asterisk == nil || !a.asterisk.Connected() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Asterisk integration unavailable"})
+		return
+	}
+	accountID := strings.TrimSpace(r.PathValue("accountId"))
+	var body struct {
+		SourceExtension string `json:"source_extension"`
+		Target          string `json:"target"`
+		Mode            string `json:"mode"`
+		TimeoutSec      int    `json:"timeout_sec"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+	body.SourceExtension = strings.TrimSpace(body.SourceExtension)
+	body.Target = strings.TrimSpace(body.Target)
+	body.Mode = strings.ToLower(strings.TrimSpace(body.Mode))
+	if body.Mode != "listen" && body.Mode != "whisper" && body.Mode != "barge" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "mode must be listen, whisper, or barge"})
+		return
+	}
+	source, err := a.store.GetSIPEndpointByAccountAndExtension(accountID, body.SourceExtension)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	if source == nil || !source.Enabled || looksLikeGatewayEndpoint(*source) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "source SIP endpoint not found in this site"})
+		return
+	}
+	sourceChannel, err := a.asterisk.FindActiveEndpointChannel(body.SourceExtension)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+		return
+	}
+	if body.TimeoutSec < 5 || body.TimeoutSec > 120 {
+		body.TimeoutSec = 30
+	}
+	callerID := fmt.Sprintf("Simson %s <%s>", body.Mode, body.SourceExtension)
+	var actionID string
+	if strings.HasPrefix(body.Target, "*") {
+		parts := strings.Split(strings.TrimPrefix(body.Target, "*"), "*")
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "outside target must be *gateway*number"})
+			return
+		}
+		gateway, number := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		gatewayEP, lookupErr := a.store.GetSIPEndpointByAccountAndExtension(accountID, gateway)
+		if lookupErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+			return
+		}
+		if gatewayEP == nil || !gatewayEP.Enabled || !looksLikeGatewayEndpoint(*gatewayEP) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway is not an enabled gateway in this site"})
+			return
+		}
+		actionID, err = a.asterisk.OriginateDirectExternalSupervision(number, gateway, a.cfg.Asterisk.OutContext, sourceChannel, callerID, body.Mode, body.TimeoutSec)
+	} else {
+		target, lookupErr := a.store.GetSIPEndpointByAccountAndExtension(accountID, body.Target)
+		if lookupErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+			return
+		}
+		if target == nil || !target.Enabled || target.Extension == source.Extension || looksLikeGatewayEndpoint(*target) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "target must be a different enabled SIP phone in this site"})
+			return
+		}
+		actionID, err = a.asterisk.OriginateDirectSupervision(target.Extension, sourceChannel, callerID, body.Mode, body.TimeoutSec)
+	}
+	if err != nil {
+		a.log.Error("active-call invite failed", map[string]any{"account_id": accountID, "source": body.SourceExtension, "target": body.Target, "mode": body.Mode, "err": err.Error()})
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	a.log.Info("active-call invite started", map[string]any{"account_id": accountID, "source": body.SourceExtension, "target": body.Target, "mode": body.Mode, "action_id": actionID})
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "action_id": actionID, "source_channel": sourceChannel, "mode": body.Mode, "target": body.Target})
+}
+
+func looksLikeGatewayEndpoint(ep store.SIPEndpoint) bool {
+	text := strings.ToLower(strings.Join([]string{ep.Extension, ep.Username, ep.Description}, " "))
+	return ep.DefaultOutbound || strings.Contains(text, "gateway") || strings.Contains(text, "gsm") ||
+		strings.Contains(text, "fxo") || strings.Contains(text, "pstn") || strings.Contains(text, "landline") ||
+		strings.Contains(text, "synway")
 }
 
 // handleDoorEvent starts a native SIP-to-SIP door camera bridge. The source
@@ -1707,6 +1811,24 @@ func (a *API) reconfigureAsterisk() {
 	for _, features := range accountFeatures {
 		featuresByAccount[features.AccountID] = features
 	}
+	advancedIngress := make(map[string]bool)
+	seenRouteAccounts := make(map[string]bool)
+	for _, ep := range endpoints {
+		if seenRouteAccounts[ep.AccountID] {
+			continue
+		}
+		seenRouteAccounts[ep.AccountID] = true
+		routes, routeErr := a.store.ListAdvancedRoutes(ep.AccountID)
+		if routeErr != nil {
+			a.log.Error("could not load advanced routes for Asterisk config", map[string]any{"account_id": ep.AccountID, "err": routeErr.Error()})
+			return
+		}
+		for _, route := range routes {
+			if route.Enabled && route.IngressKind == "sip" {
+				advancedIngress[ep.AccountID+"\x00"+strings.TrimSpace(route.IngressValue)] = true
+			}
+		}
+	}
 
 	defs := make([]asterisk.SIPEndpointDef, 0, len(endpoints))
 	for _, ep := range endpoints {
@@ -1736,6 +1858,7 @@ func (a *API) reconfigureAsterisk() {
 			AccountTransferCode:       features.TransferCode,
 			AccountConferenceCode:     features.ConferenceCode,
 			AccountFeaturesEnabled:    features.Enabled,
+			AdvancedIngress:           advancedIngress[ep.AccountID+"\x00"+strings.TrimSpace(ep.Extension)],
 			DefaultOutbound:           ep.DefaultOutbound,
 			Enabled:                   ep.Enabled,
 		})

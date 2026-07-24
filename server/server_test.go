@@ -289,6 +289,18 @@ func TestAdvancedRouteSourceDoesNotCrossAccountBoundary(t *testing.T) {
 	}
 }
 
+func TestAdvancedRouteLandingCandidatesPreferDialledPhone(t *testing.T) {
+	got := advancedRouteLandingCandidates("1040", "1040", "1040", "1027")
+	if len(got) != 1 || got[0] != "1040" {
+		t.Fatalf("landing candidates = %#v, want [1040]", got)
+	}
+
+	got = advancedRouteLandingCandidates("7014", "7014", "1040", "7014")
+	if len(got) != 1 || got[0] != "1040" {
+		t.Fatalf("resolved gateway landing candidates = %#v, want [1040]", got)
+	}
+}
+
 func TestRouteForHAOSRingCodeHonorsGatewayDirectTarget(t *testing.T) {
 	tests := []struct {
 		name      string

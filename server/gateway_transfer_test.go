@@ -18,7 +18,7 @@ func TestNormalizeTransferCode(t *testing.T) {
 }
 
 func TestAdvanceGatewayTransferCapture(t *testing.T) {
-	capture := &gatewayTransferCapture{Codes: configuredGatewayBridgeFeatureCodes("*84", "*85")}
+	capture := &gatewayTransferCapture{Codes: configuredGatewayBridgeFeatureCodes("*84", "*85", "*86", "*87", "*88")}
 	for _, digit := range []string{"*", "8", "4", "1", "0", "2", "6"} {
 		target, completed, keep := advanceGatewayTransferCapture(capture, digit)
 		if target != "" || completed || !keep {
@@ -35,7 +35,7 @@ func TestAdvanceGatewayTransferCapture(t *testing.T) {
 }
 
 func TestAdvanceGatewayConferenceCaptureUsesSharedPrefix(t *testing.T) {
-	capture := &gatewayTransferCapture{Codes: configuredGatewayBridgeFeatureCodes("*84", "*85")}
+	capture := &gatewayTransferCapture{Codes: configuredGatewayBridgeFeatureCodes("*84", "*85", "*86", "*87", "*88")}
 	for _, digit := range []string{"*", "8", "5", "1", "0", "4", "0"} {
 		_, completed, keep := advanceGatewayTransferCapture(capture, digit)
 		if completed || !keep {
@@ -48,7 +48,7 @@ func TestAdvanceGatewayConferenceCaptureUsesSharedPrefix(t *testing.T) {
 }
 
 func TestAdvanceGatewayConferenceCaptureUsesCustomPrefix(t *testing.T) {
-	capture := &gatewayTransferCapture{Codes: configuredGatewayBridgeFeatureCodes("", "*89")}
+	capture := &gatewayTransferCapture{Codes: configuredGatewayBridgeFeatureCodes("", "*89", "*86", "*87", "*88")}
 	for _, digit := range []string{"*", "8", "9", "1", "0", "2", "6"} {
 		_, completed, keep := advanceGatewayTransferCapture(capture, digit)
 		if completed || !keep {
@@ -60,8 +60,54 @@ func TestAdvanceGatewayConferenceCaptureUsesCustomPrefix(t *testing.T) {
 	}
 }
 
+func TestAdvanceGatewayInviteModes(t *testing.T) {
+	tests := []struct {
+		digits string
+		want   gatewayBridgeFeatureAction
+	}{
+		{"*861026#", gatewayBridgeListen},
+		{"*871026#", gatewayBridgeWhisper},
+		{"*881026#", gatewayBridgeBarge},
+	}
+	for _, tc := range tests {
+		capture := &gatewayTransferCapture{Codes: configuredGatewayBridgeFeatureCodes("*84", "*85", "*86", "*87", "*88")}
+		var target string
+		var completed bool
+		for _, digit := range tc.digits {
+			target, completed, _ = advanceGatewayTransferCapture(capture, string(digit))
+		}
+		if capture.Action != tc.want || target != "1026" || !completed {
+			t.Fatalf("digits %q produced action=%q target=%q completed=%v", tc.digits, capture.Action, target, completed)
+		}
+	}
+}
+
+func TestAdvanceGatewayConferenceCaptureSupportsExplicitGateway(t *testing.T) {
+	capture := &gatewayTransferCapture{Codes: configuredGatewayBridgeFeatureCodes("*84", "*85", "*86", "*87", "*88")}
+	var target string
+	var completed bool
+	for _, digit := range "*85*7014*9123208334#" {
+		target, completed, _ = advanceGatewayTransferCapture(capture, string(digit))
+	}
+	if capture.Action != gatewayBridgeConference || target != "*7014*9123208334" || !completed {
+		t.Fatalf("explicit gateway produced action=%q target=%q completed=%v", capture.Action, target, completed)
+	}
+}
+
+func TestAdvanceGatewayTransferCaptureSupportsExplicitGateway(t *testing.T) {
+	capture := &gatewayTransferCapture{Codes: configuredGatewayBridgeFeatureCodes("*84", "*89", "*86", "*87", "*88")}
+	var target string
+	var completed bool
+	for _, digit := range "*84*7014*9123208334#" {
+		target, completed, _ = advanceGatewayTransferCapture(capture, string(digit))
+	}
+	if capture.Action != gatewayBridgeTransfer || target != "*7014*9123208334" || !completed {
+		t.Fatalf("explicit gateway transfer produced action=%q target=%q completed=%v", capture.Action, target, completed)
+	}
+}
+
 func TestAdvanceGatewayTransferCaptureRejectsMalformedSequence(t *testing.T) {
-	capture := &gatewayTransferCapture{Codes: configuredGatewayBridgeFeatureCodes("*84", "*85")}
+	capture := &gatewayTransferCapture{Codes: configuredGatewayBridgeFeatureCodes("*84", "*85", "*86", "*87", "*88")}
 	_, _, _ = advanceGatewayTransferCapture(capture, "*")
 	if target, completed, keep := advanceGatewayTransferCapture(capture, "9"); target != "" || completed || keep {
 		t.Fatalf("malformed sequence produced target=%q completed=%v keep=%v", target, completed, keep)

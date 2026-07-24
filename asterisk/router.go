@@ -2,6 +2,7 @@ package asterisk
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -32,6 +33,19 @@ type IntercomCallbackRequest struct {
 	SourceAutoMode  string
 	TargetAutoMode  string
 	ControlCode     bool
+}
+
+// DirectSIPCallEvent reports the lifecycle of an ordinary SIP-to-SIP Dial().
+// These calls deliberately stay in Asterisk's native bridge; the event exists
+// only so site addons can display an accurate live-call roster.
+type DirectSIPCallEvent struct {
+	Phase      string
+	CallID     string
+	AccountID  string
+	Source     string
+	Target     string
+	Channel    string
+	DialStatus string
 }
 
 // ContactStatus describes the live PJSIP registration/contact state for an AoR.
@@ -98,6 +112,7 @@ type Router struct {
 	// Callbacks set by server.go after construction.
 	OnIncomingCall     func(in IncomingSIPCall)                    // SIP phone dialled in
 	OnIntercomCallback func(req IntercomCallbackRequest)           // SIP direct route requested callback bridge
+	OnDirectSIPCall    func(event DirectSIPCallEvent)              // native direct SIP call lifecycle
 	OnChannelHangup    func(info ChannelHangup)                    // SIP channel hung up
 	OnOriginateResult  func(callID string, ok bool, reason string) // async Originate outcome
 	OnChannelDTMF      func(info ChannelDTMF)                      // completed received DTMF digit
@@ -145,11 +160,29 @@ func (r *Router) OriginateBridgeConference(targetExtension, context, bridgeExt, 
 	return r.originateBridgeParticipant(targetExtension, context, bridgeExt, callerID, callID, fromNode, sourceChannel, sourceExt, timeoutSec, false)
 }
 
+// OriginateBridgeExternalParticipant dials a number through an explicitly
+// selected same-account gateway and joins the answered leg to a managed bridge.
+func (r *Router) OriginateBridgeExternalParticipant(number, trunk, outContext, context, bridgeExt, callerID, callID, fromNode, sourceChannel, sourceExt string, timeoutSec int, replaceSource bool) (string, error) {
+	number, trunk = strings.TrimSpace(number), strings.TrimSpace(trunk)
+	if number == "" || trunk == "" || outContext == "" {
+		return "", fmt.Errorf("external bridge participant requires number, trunk, and outbound context")
+	}
+	channel := fmt.Sprintf("Local/%s@%s/n", number, outContext)
+	return r.originateBridgeParticipantChannel(channel, "outside:"+number, trunk, context, bridgeExt, callerID, callID, fromNode, sourceChannel, sourceExt, timeoutSec, replaceSource)
+}
+
 // OriginateDirectConference rings targetExtension and, once answered, barges
 // that handset into the existing direct SIP channel. This is intentionally
 // separate from Simson ConfBridge calls: ordinary SIP-to-SIP calls live in an
 // Asterisk basic bridge and therefore have no Simson bridge extension to join.
 func (r *Router) OriginateDirectConference(targetExtension, sourceChannel, callerID string, timeoutSec int) (string, error) {
+	return r.OriginateDirectSupervision(targetExtension, sourceChannel, callerID, "barge", timeoutSec)
+}
+
+// OriginateDirectSupervision lets an active participant invite an authorised
+// same-site handset to monitor, whisper to that participant, or barge. The
+// destination joins only after answering and the original bridge is untouched.
+func (r *Router) OriginateDirectSupervision(targetExtension, sourceChannel, callerID, mode string, timeoutSec int) (string, error) {
 	targetExtension = strings.TrimSpace(targetExtension)
 	sourceChannel = normalizeChannel(sourceChannel)
 	if targetExtension == "" || sourceChannel == "" {
@@ -158,22 +191,50 @@ func (r *Router) OriginateDirectConference(targetExtension, sourceChannel, calle
 	if timeoutSec <= 0 {
 		timeoutSec = 30
 	}
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != "listen" && mode != "whisper" && mode != "barge" {
+		return "", fmt.Errorf("invalid direct supervision mode")
+	}
 	actionID := uuid.NewString()
 	_, err := r.ami.OriginateWithVars(
 		fmt.Sprintf("PJSIP/%s", targetExtension),
-		"simson-direct-conference",
+		"simson-direct-supervision",
 		"s",
 		callerID,
 		timeoutSec*1000,
 		actionID,
 		map[string]string{
 			"SIMSON_SPY_CHANNEL": sourceChannel,
+			"SIMSON_SPY_MODE":    mode,
 		},
 	)
 	if err != nil {
 		return "", err
 	}
 	return actionID, nil
+}
+
+// OriginateDirectExternalSupervision is the explicit *gateway*number variant
+// for an active direct SIP call.
+func (r *Router) OriginateDirectExternalSupervision(number, trunk, outContext, sourceChannel, callerID, mode string, timeoutSec int) (string, error) {
+	number, trunk = strings.TrimSpace(number), strings.TrimSpace(trunk)
+	sourceChannel = normalizeChannel(sourceChannel)
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if number == "" || trunk == "" || outContext == "" || sourceChannel == "" {
+		return "", fmt.Errorf("external supervision requires number, trunk, context, and source channel")
+	}
+	if mode != "listen" && mode != "whisper" && mode != "barge" {
+		return "", fmt.Errorf("invalid direct supervision mode")
+	}
+	if timeoutSec <= 0 {
+		timeoutSec = 30
+	}
+	actionID := uuid.NewString()
+	_, err := r.ami.OriginateWithVars(fmt.Sprintf("Local/%s@%s/n", number, outContext),
+		"simson-direct-supervision", "s", callerID, timeoutSec*1000, actionID,
+		map[string]string{"SIMSON_SPY_CHANNEL": sourceChannel, "SIMSON_SPY_MODE": mode,
+			"SIMSON_TRUNK": trunk, "__SIMSON_TRUNK": trunk})
+	return actionID, err
 }
 
 func (r *Router) originateBridgeParticipant(targetExtension, context, bridgeExt, callerID, callID, fromNode, sourceChannel, sourceExt string, timeoutSec int, replaceSource bool) (string, error) {
@@ -183,9 +244,19 @@ func (r *Router) originateBridgeParticipant(targetExtension, context, bridgeExt,
 		return "", fmt.Errorf("bridge transfer requires target, bridge, call, and source channel")
 	}
 	channel := fmt.Sprintf("Local/%s@from-simson-extension/n", targetExtension)
+	return r.originateBridgeParticipantChannel(channel, targetExtension, "", context, bridgeExt, callerID, callID, fromNode, sourceChannel, sourceExt, timeoutSec, replaceSource)
+}
+
+func (r *Router) originateBridgeParticipantChannel(channel, targetLabel, trunk, context, bridgeExt, callerID, callID, fromNode, sourceChannel, sourceExt string, timeoutSec int, replaceSource bool) (string, error) {
+	sourceChannel = normalizeChannel(sourceChannel)
+	if channel == "" || targetLabel == "" || bridgeExt == "" || callID == "" || sourceChannel == "" {
+		return "", fmt.Errorf("bridge transfer requires target, bridge, call, and source channel")
+	}
 	actionID := uuid.NewString()
-	r.TrackPendingPrefix(callID, fmt.Sprintf("Local/%s@from-simson-extension-", targetExtension))
-	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", targetExtension))
+	r.TrackPendingPrefix(callID, strings.TrimSuffix(channel, "/n")+"-")
+	if !strings.HasPrefix(targetLabel, "outside:") {
+		r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", targetLabel))
+	}
 
 	r.originateMu.Lock()
 	if r.bridgeTransfers == nil {
@@ -193,7 +264,7 @@ func (r *Router) originateBridgeParticipant(targetExtension, context, bridgeExt,
 	}
 	r.bridgeTransfers[actionID] = pendingBridgeTransfer{
 		callID: callID, sourceChannel: sourceChannel, sourceExt: sourceExt,
-		targetExt: targetExtension, replaceSource: replaceSource,
+		targetExt: targetLabel, replaceSource: replaceSource,
 	}
 	r.originateMu.Unlock()
 
@@ -203,6 +274,10 @@ func (r *Router) originateBridgeParticipant(targetExtension, context, bridgeExt,
 		"SIMSON_FROM_NODE":    fromNode,
 		"__SIMSON_FROM_NODE":  fromNode,
 		"SIMSON_WAIT_TIMEOUT": fmt.Sprintf("%d", timeoutSec),
+	}
+	if trunk != "" {
+		vars["SIMSON_TRUNK"] = trunk
+		vars["__SIMSON_TRUNK"] = trunk
 	}
 	_, err := r.ami.OriginateWithVars(channel, context, bridgeExt, callerID, timeoutSec*1000, actionID, vars)
 	if err != nil {
@@ -881,23 +956,10 @@ func (r *Router) ClearEndpointChannels(extension string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	prefix := "PJSIP/" + extension + "-"
-	seen := make(map[string]struct{})
+	channels := endpointCleanupChannels(out, extension)
 	cleared := 0
 	var firstErr error
-	for _, line := range strings.Split(out, "\n") {
-		parts := strings.Split(strings.TrimSpace(line), "!")
-		if len(parts) == 0 {
-			continue
-		}
-		channel := normalizeChannel(parts[0])
-		if channel == "" || !strings.HasPrefix(channel, prefix) {
-			continue
-		}
-		if _, ok := seen[channel]; ok {
-			continue
-		}
-		seen[channel] = struct{}{}
+	for _, channel := range channels {
 		if err := r.ami.HangupChannel(channel); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "no such channel") {
 				continue
@@ -910,6 +972,145 @@ func (r *Router) ClearEndpointChannels(extension string) (int, error) {
 		cleared++
 	}
 	return cleared, firstErr
+}
+
+// FindActiveEndpointChannel resolves the one answered PJSIP channel currently
+// owned by an extension. Refusing ambiguous matches prevents a supervisor from
+// being attached to the wrong call when a handset has multiple appearances.
+func (r *Router) FindActiveEndpointChannel(extension string) (string, error) {
+	extension = strings.TrimSpace(extension)
+	if extension == "" || strings.ContainsAny(extension, "! \t\r\n") {
+		return "", fmt.Errorf("invalid endpoint extension")
+	}
+	out, err := r.ami.RunCommand("core show channels concise")
+	if err != nil {
+		return "", err
+	}
+	channels := activeEndpointChannels(out, extension)
+	switch len(channels) {
+	case 0:
+		return "", fmt.Errorf("SIP %s has no answered active call", extension)
+	case 1:
+		return channels[0], nil
+	default:
+		return "", fmt.Errorf("SIP %s has multiple active calls; select a call explicitly", extension)
+	}
+}
+
+func activeEndpointChannels(output, extension string) []string {
+	prefix := "PJSIP/" + strings.TrimSpace(extension) + "-"
+	seen := make(map[string]struct{})
+	channels := make([]string, 0, 1)
+	for _, line := range strings.Split(output, "\n") {
+		parts := strings.Split(strings.TrimSpace(line), "!")
+		if len(parts) < 5 {
+			continue
+		}
+		channel := normalizeChannel(parts[0])
+		state := strings.TrimSpace(parts[4])
+		if !strings.HasPrefix(channel, prefix) || !strings.EqualFold(state, "Up") {
+			continue
+		}
+		if _, ok := seen[channel]; ok {
+			continue
+		}
+		seen[channel] = struct{}{}
+		channels = append(channels, channel)
+	}
+	sort.Strings(channels)
+	return channels
+}
+
+type conciseChannel struct {
+	name     string
+	base     string
+	linkedID string
+	bridgeID string
+}
+
+// endpointCleanupChannels returns the complete Asterisk call family rooted at
+// one PJSIP endpoint. core show channels concise fields 11 and 12 are the
+// Linkedid and BridgeId on supported Asterisk versions. Clearing only the
+// PJSIP leg can leave its Local/ConfBridge sibling alive and keep an analog
+// gateway off-hook indefinitely.
+func endpointCleanupChannels(output, extension string) []string {
+	extension = strings.TrimSpace(extension)
+	prefix := "PJSIP/" + extension + "-"
+	rows := make([]conciseChannel, 0)
+	linkedIDs := map[string]struct{}{}
+	bridgeIDs := map[string]struct{}{}
+	selected := map[string]struct{}{}
+
+	for _, line := range strings.Split(output, "\n") {
+		parts := strings.Split(strings.TrimSpace(line), "!")
+		if len(parts) == 0 {
+			continue
+		}
+		row := conciseChannel{name: strings.TrimSpace(parts[0]), base: normalizeChannel(parts[0])}
+		if row.name == "" || row.base == "" {
+			continue
+		}
+		if len(parts) > 11 {
+			row.linkedID = strings.TrimSpace(parts[11])
+		}
+		if len(parts) > 12 {
+			row.bridgeID = strings.TrimSpace(parts[12])
+		}
+		rows = append(rows, row)
+		if strings.HasPrefix(row.base, prefix) {
+			selected[row.name] = struct{}{}
+			if row.linkedID != "" && row.linkedID != "0" {
+				linkedIDs[row.linkedID] = struct{}{}
+			}
+			if row.bridgeID != "" && row.bridgeID != "0" {
+				bridgeIDs[row.bridgeID] = struct{}{}
+			}
+		}
+	}
+
+	// Repeat because a linked Local channel may reveal a bridge shared with
+	// another leg that was not present on the original PJSIP row.
+	for changed := true; changed; {
+		changed = false
+		for _, row := range rows {
+			_, sameLinked := linkedIDs[row.linkedID]
+			_, sameBridge := bridgeIDs[row.bridgeID]
+			if !sameLinked && !sameBridge {
+				continue
+			}
+			if _, exists := selected[row.name]; !exists {
+				selected[row.name] = struct{}{}
+				changed = true
+			}
+			if row.linkedID != "" && row.linkedID != "0" {
+				if _, exists := linkedIDs[row.linkedID]; !exists {
+					linkedIDs[row.linkedID] = struct{}{}
+					changed = true
+				}
+			}
+			if row.bridgeID != "" && row.bridgeID != "0" {
+				if _, exists := bridgeIDs[row.bridgeID]; !exists {
+					bridgeIDs[row.bridgeID] = struct{}{}
+					changed = true
+				}
+			}
+		}
+	}
+
+	// Release helper/peer legs first and the selected gateway leg last, which
+	// ensures the final SIP BYE/on-hook signal is not masked by a live sibling.
+	channels := make([]string, 0, len(selected))
+	for _, row := range rows {
+		if _, ok := selected[row.name]; ok && !strings.HasPrefix(row.base, prefix) {
+			channels = append(channels, row.name)
+		}
+	}
+	for _, row := range rows {
+		if _, ok := selected[row.name]; ok && strings.HasPrefix(row.base, prefix) {
+			channels = append(channels, row.name)
+		}
+	}
+	return channels
 }
 
 // BridgeCall bridges the SIP channel of callID with a second Asterisk channel
@@ -1026,6 +1227,8 @@ func (r *Router) onEvent(ev Event) {
 			r.handleSimsonRoute(ev)
 		case "SimsonIntercomCallback":
 			r.handleSimsonIntercomCallback(ev)
+		case "SimsonDirectCall":
+			r.handleSimsonDirectCall(ev)
 		}
 
 	case "Hangup":
@@ -1053,6 +1256,29 @@ func (r *Router) onEvent(ev Event) {
 				r.TrackCall(callID, channel)
 			}
 		}
+	}
+}
+
+func (r *Router) handleSimsonDirectCall(ev Event) {
+	event := DirectSIPCallEvent{
+		Phase:      strings.ToLower(strings.TrimSpace(ev.Fields["Phase"])),
+		CallID:     strings.TrimSpace(ev.Fields["CallID"]),
+		AccountID:  strings.TrimSpace(ev.Fields["AccountID"]),
+		Source:     strings.TrimSpace(ev.Fields["Source"]),
+		Target:     strings.TrimSpace(ev.Fields["Target"]),
+		Channel:    normalizeChannel(ev.Fields["Channel"]),
+		DialStatus: strings.TrimSpace(ev.Fields["DialStatus"]),
+	}
+	if event.CallID == "" || event.AccountID == "" || event.Source == "" || event.Target == "" {
+		r.log.Warn("SimsonDirectCall event missing required fields", map[string]any{"fields": ev.Fields})
+		return
+	}
+	if event.Phase != "ringing" && event.Phase != "active" && event.Phase != "ended" {
+		r.log.Warn("SimsonDirectCall event has invalid phase", map[string]any{"phase": event.Phase, "call_id": event.CallID})
+		return
+	}
+	if r.OnDirectSIPCall != nil {
+		r.OnDirectSIPCall(event)
 	}
 }
 

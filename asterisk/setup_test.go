@@ -70,6 +70,12 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	if !strings.Contains(directDesk, "Ttb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^))") {
 		t.Fatalf("direct SIP called leg should receive the media pre-dial handler:\n%s", directDesk)
 	}
+	if !strings.Contains(directDesk, "U(simson-direct-observer-answer^${SIMSON_CALL_ID}^${CALLERID(num)}^${EXTEN}^)") {
+		t.Fatalf("direct SIP answer observer must use Dial U(context^args), without b/B-style extension and priority fields:\n%s", directDesk)
+	}
+	if strings.Contains(directDesk, "U(simson-direct-observer-answer^s^1(") {
+		t.Fatalf("direct SIP answer observer uses invalid Dial U syntax:\n%s", directDesk)
+	}
 	inboundSIP := section(dialplan, "\n[from-simson-sip]\n", "\n[from-simson-node]\n")
 	if strings.Contains(inboundSIP, "@7009") {
 		t.Fatal("SIP-phone PSTN calls should route through SimsonRoute, not a hardwired default trunk")
@@ -527,6 +533,20 @@ func TestCallbackBridgeDialplanIsAllowlistedAndCarriesBothAutoModes(t *testing.T
 		if !strings.Contains(sourceAfterTarget, want) {
 			t.Fatalf("callback source-after-target dialplan missing %q:\n%s", want, sourceAfterTarget)
 		}
+	}
+}
+
+func TestAdvancedIngressEndpointUsesRouteEventInsteadOfDirectDial(t *testing.T) {
+	endpoints := []SIPEndpointDef{
+		{ID: "direct", Extension: "1027", Username: "1027", Password: "secret", Enabled: true},
+		{ID: "routed", Extension: "1040", Username: "1040", Password: "secret", Enabled: true, AdvancedIngress: true},
+	}
+	dialplan := buildDirectEndpointDialplan(endpoints)
+	if !strings.Contains(dialplan, "exten => 1027,1,NoOp(Simson direct SIP endpoint") {
+		t.Fatal("ordinary SIP endpoint lost its direct dial route")
+	}
+	if strings.Contains(dialplan, "exten => 1040,1,NoOp(Simson direct SIP endpoint") {
+		t.Fatal("advanced-ingress endpoint must reach the catch-all SimsonRoute handler")
 	}
 }
 

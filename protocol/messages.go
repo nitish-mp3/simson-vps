@@ -100,6 +100,10 @@ type CallStatusPayload struct {
 	Reason           string `json:"reason,omitempty"`
 	SIPBridgeID      string `json:"sip_bridge_id,omitempty"`
 	AnsweredByUserID string `json:"answered_by_user_id,omitempty"`
+	FromNodeID       string `json:"from_node_id,omitempty"`
+	ToNodeID         string `json:"to_node_id,omitempty"`
+	CallerID         string `json:"caller_id,omitempty"`
+	CallType         string `json:"call_type,omitempty"`
 }
 
 // --- Error ---

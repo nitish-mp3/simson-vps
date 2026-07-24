@@ -131,6 +131,55 @@ func TestHandleDTMFAcceptsDigitReceivedOnDTMFEnd(t *testing.T) {
 	}
 }
 
+func TestEndpointCleanupChannelsIncludesLinkedAndBridgedLegs(t *testing.T) {
+	output := strings.Join([]string{
+		"PJSIP/7009-0001!from-simson-sip!100!1!Up!ConfBridge!bridge-a!100!!!10.1!10.1!bridge-a!",
+		"Local/9123@from-simson-out-0001;1!from-simson-node!s!1!Up!ConfBridge!bridge-a!100!!!10.2!10.1!bridge-a!",
+		"PJSIP/1027-0002!from-simson-extension!1027!1!Up!Dial!PJSIP/1028!1027!!!20.1!20.1!bridge-b!",
+	}, "\n")
+	got := endpointCleanupChannels(output, "7009")
+	want := []string{"Local/9123@from-simson-out-0001;1", "PJSIP/7009-0001"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("cleanup channels = %v, want %v", got, want)
+	}
+}
+
+func TestEndpointCleanupChannelsDoesNotCrossCalls(t *testing.T) {
+	output := strings.Join([]string{
+		"PJSIP/7009-0001!ctx!s!1!Up!Dial!x!100!!!10.1!10.1!bridge-a!",
+		"PJSIP/7014-0002!ctx!s!1!Up!Dial!x!100!!!20.1!20.1!bridge-b!",
+	}, "\n")
+	got := endpointCleanupChannels(output, "7009")
+	if len(got) != 1 || got[0] != "PJSIP/7009-0001" {
+		t.Fatalf("cleanup crossed endpoint boundary: %v", got)
+	}
+}
+
+func TestActiveEndpointChannelsRequiresAnsweredExactEndpoint(t *testing.T) {
+	output := strings.Join([]string{
+		"PJSIP/1027-0003!from-simson-extension!1028!1!Up!Dial!PJSIP/1028!1027!!!30.1!30.1!bridge-c!",
+		"PJSIP/1027-0002!from-simson-extension!1028!1!Ringing!Dial!PJSIP/1028!1027!!!20.1!20.1!!",
+		"PJSIP/10270-0001!from-simson-extension!1028!1!Up!Dial!PJSIP/1028!10270!!!10.1!10.1!bridge-a!",
+		"PJSIP/1028-0004!from-simson-extension!1027!1!Up!AppDial!(Outgoing Line)!1028!!!30.2!30.1!bridge-c!",
+	}, "\n")
+	got := activeEndpointChannels(output, "1027")
+	if len(got) != 1 || got[0] != "PJSIP/1027-0003" {
+		t.Fatalf("active channels = %v, want exact answered 1027 channel", got)
+	}
+}
+
+func TestActiveEndpointChannelsReturnsStableAmbiguousSet(t *testing.T) {
+	output := strings.Join([]string{
+		"PJSIP/1027-0009!ctx!s!1!Up!Dial!x!1027!!!90.1!90.1!b!",
+		"PJSIP/1027-0001!ctx!s!1!Up!Dial!x!1027!!!10.1!10.1!a!",
+	}, "\n")
+	got := activeEndpointChannels(output, "1027")
+	want := []string{"PJSIP/1027-0001", "PJSIP/1027-0009"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("active channels = %v, want %v", got, want)
+	}
+}
+
 func TestBridgeTransferOriginateFailureDoesNotReachParentCallCallback(t *testing.T) {
 	r := newTrackingOnlyRouter()
 	r.bridgeTransfers["transfer-action"] = pendingBridgeTransfer{

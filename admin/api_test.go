@@ -167,6 +167,40 @@ func TestAdvancedRouteValidationIsAccountScopedAndCapabilitySafe(t *testing.T) {
 		t.Fatalf("valid connected-call limit rejected: %v", err)
 	}
 
+	landedSIPFallback := route
+	landedSIPFallback.IngressKind = "sip"
+	landedSIPFallback.IngressValue = "1025"
+	landedSIPFallback.Stages = []store.RouteStage{
+		{
+			Name: "Ring landing phone", RingSeconds: 10, AnswerMode: "first_answer",
+			Targets: []store.RouteTarget{{Kind: "sip", Value: "1025", Enabled: true}},
+		},
+		{
+			Name: "Fallback", RingSeconds: 10, AnswerMode: "first_answer",
+			Targets: []store.RouteTarget{{Kind: "sip", Value: "1026", Enabled: true}},
+		},
+	}
+	if err := api.validateAdvancedRoute(&landedSIPFallback); err != nil {
+		t.Fatalf("valid landed-SIP fallback route rejected: %v", err)
+	}
+
+	landingPhoneInLaterStage := landedSIPFallback
+	landingPhoneInLaterStage.Stages = append([]store.RouteStage(nil), landedSIPFallback.Stages...)
+	landingPhoneInLaterStage.Stages[0].Targets = []store.RouteTarget{{Kind: "sip", Value: "1027", Enabled: true}}
+	landingPhoneInLaterStage.Stages[1].Targets = []store.RouteTarget{{Kind: "sip", Value: "1025", Enabled: true}}
+	if err := api.validateAdvancedRoute(&landingPhoneInLaterStage); err == nil {
+		t.Fatal("landing SIP phone was accepted outside stage 1")
+	}
+
+	gatewaySelfLoop := route
+	gatewaySelfLoop.Stages = []store.RouteStage{{
+		Name: "Loop", RingSeconds: 10, AnswerMode: "first_answer",
+		Targets: []store.RouteTarget{{Kind: "gateway", Value: "7001", Enabled: true}},
+	}}
+	if err := api.validateAdvancedRoute(&gatewaySelfLoop); err == nil {
+		t.Fatal("gateway ingress self-loop was accepted")
+	}
+
 	repeatedAcrossStages := route
 	repeatedAcrossStages.Stages = []store.RouteStage{
 		{

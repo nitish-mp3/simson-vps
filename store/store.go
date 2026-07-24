@@ -29,11 +29,14 @@ type Account struct {
 // AccountCallFeatures contains site-wide PBX feature codes. Codes are scoped
 // to one account and are applied only to that account's authenticated phones.
 type AccountCallFeatures struct {
-	AccountID      string    `json:"account_id"`
-	TransferCode   string    `json:"transfer_code"`
-	ConferenceCode string    `json:"conference_code"`
-	Enabled        bool      `json:"enabled"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	AccountID         string    `json:"account_id"`
+	TransferCode      string    `json:"transfer_code"`
+	ConferenceCode    string    `json:"conference_code"`
+	InviteListenCode  string    `json:"invite_listen_code"`
+	InviteWhisperCode string    `json:"invite_whisper_code"`
+	InviteBargeCode   string    `json:"invite_barge_code"`
+	Enabled           bool      `json:"enabled"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 // Node represents a registered node (addon install).
@@ -305,6 +308,15 @@ func (s *Store) migrate() error {
 	if err := s.ensureColumn("sip_endpoints", "supervision_config", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn("account_call_features", "invite_listen_code", "TEXT NOT NULL DEFAULT '*86'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("account_call_features", "invite_whisper_code", "TEXT NOT NULL DEFAULT '*87'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("account_call_features", "invite_barge_code", "TEXT NOT NULL DEFAULT '*88'"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -379,10 +391,14 @@ func (s *Store) UpdateAccountLicense(id, status string) error {
 }
 
 func (s *Store) GetAccountCallFeatures(accountID string) (*AccountCallFeatures, error) {
-	row := s.db.QueryRow(`SELECT account_id, transfer_code, conference_code, enabled, updated_at
+	row := s.db.QueryRow(`SELECT account_id, transfer_code, conference_code,
+		invite_listen_code, invite_whisper_code, invite_barge_code, enabled, updated_at
 		FROM account_call_features WHERE account_id = ?`, accountID)
-	features := &AccountCallFeatures{AccountID: accountID, TransferCode: "*84", ConferenceCode: "*85", Enabled: true}
-	if err := row.Scan(&features.AccountID, &features.TransferCode, &features.ConferenceCode, &features.Enabled, &features.UpdatedAt); err != nil {
+	features := &AccountCallFeatures{AccountID: accountID, TransferCode: "*84", ConferenceCode: "*85",
+		InviteListenCode: "*86", InviteWhisperCode: "*87", InviteBargeCode: "*88", Enabled: true}
+	if err := row.Scan(&features.AccountID, &features.TransferCode, &features.ConferenceCode,
+		&features.InviteListenCode, &features.InviteWhisperCode, &features.InviteBargeCode,
+		&features.Enabled, &features.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return features, nil
 		}
@@ -394,6 +410,8 @@ func (s *Store) GetAccountCallFeatures(accountID string) (*AccountCallFeatures, 
 func (s *Store) ListAccountCallFeatures() ([]AccountCallFeatures, error) {
 	rows, err := s.db.Query(`SELECT a.id,
 		COALESCE(f.transfer_code, '*84'), COALESCE(f.conference_code, '*85'),
+		COALESCE(f.invite_listen_code, '*86'), COALESCE(f.invite_whisper_code, '*87'),
+		COALESCE(f.invite_barge_code, '*88'),
 		COALESCE(f.enabled, 1), CAST(strftime('%s', COALESCE(f.updated_at, a.updated_at)) AS INTEGER)
 		FROM accounts a LEFT JOIN account_call_features f ON f.account_id = a.id ORDER BY a.id`)
 	if err != nil {
@@ -404,7 +422,9 @@ func (s *Store) ListAccountCallFeatures() ([]AccountCallFeatures, error) {
 	for rows.Next() {
 		var features AccountCallFeatures
 		var updatedUnix int64
-		if err := rows.Scan(&features.AccountID, &features.TransferCode, &features.ConferenceCode, &features.Enabled, &updatedUnix); err != nil {
+		if err := rows.Scan(&features.AccountID, &features.TransferCode, &features.ConferenceCode,
+			&features.InviteListenCode, &features.InviteWhisperCode, &features.InviteBargeCode,
+			&features.Enabled, &updatedUnix); err != nil {
 			return nil, err
 		}
 		features.UpdatedAt = time.Unix(updatedUnix, 0).UTC()
@@ -415,12 +435,16 @@ func (s *Store) ListAccountCallFeatures() ([]AccountCallFeatures, error) {
 
 func (s *Store) UpsertAccountCallFeatures(features AccountCallFeatures) error {
 	_, err := s.db.Exec(`INSERT INTO account_call_features
-		(account_id, transfer_code, conference_code, enabled, updated_at)
-		VALUES (?, ?, ?, ?, datetime('now'))
+		(account_id, transfer_code, conference_code, invite_listen_code,
+		 invite_whisper_code, invite_barge_code, enabled, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
 		ON CONFLICT(account_id) DO UPDATE SET transfer_code=excluded.transfer_code,
-		conference_code=excluded.conference_code, enabled=excluded.enabled,
+		conference_code=excluded.conference_code, invite_listen_code=excluded.invite_listen_code,
+		invite_whisper_code=excluded.invite_whisper_code, invite_barge_code=excluded.invite_barge_code,
+		enabled=excluded.enabled,
 		updated_at=datetime('now')`, features.AccountID, features.TransferCode,
-		features.ConferenceCode, features.Enabled)
+		features.ConferenceCode, features.InviteListenCode, features.InviteWhisperCode,
+		features.InviteBargeCode, features.Enabled)
 	return err
 }
 
@@ -586,6 +610,16 @@ func (s *Store) GetSIPEndpointByExtension(extension string) (*SIPEndpoint, error
 	row := s.db.QueryRow(
 		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, gateway_inbound_mode, gateway_direct_target, gateway_ivr_enabled, gateway_ivr_sound, answer_announcement, answer_announcement_text, pre_ring_announcement, pre_ring_announcement_text, call_duration_rules, supervision_config, enabled, created_at, updated_at
 		 FROM sip_endpoints WHERE extension = ? AND enabled = 1 LIMIT 1`, extension)
+	return scanSIPEndpoint(row)
+}
+
+// GetSIPEndpointByAccountAndExtension resolves an extension inside one tenant.
+// Extensions may be reused by different customer sites, so account-scoped
+// control paths must never rely on the global compatibility lookup above.
+func (s *Store) GetSIPEndpointByAccountAndExtension(accountID, extension string) (*SIPEndpoint, error) {
+	row := s.db.QueryRow(
+		`SELECT id, account_id, extension, username, password, description, route_to, video_enabled, auto_answer, auto_answer_callers, auto_speaker, auto_speaker_callers, callback_bridge, callback_bridge_callers, callback_caller_auto_answer, callback_caller_auto_speaker, default_outbound, gateway_inbound_mode, gateway_direct_target, gateway_ivr_enabled, gateway_ivr_sound, answer_announcement, answer_announcement_text, pre_ring_announcement, pre_ring_announcement_text, call_duration_rules, supervision_config, enabled, created_at, updated_at
+		 FROM sip_endpoints WHERE account_id = ? AND extension = ? AND enabled = 1 LIMIT 1`, accountID, extension)
 	return scanSIPEndpoint(row)
 }
 

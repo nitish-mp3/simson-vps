@@ -76,6 +76,9 @@ type SIPEndpointDef struct {
 	AccountTransferCode    string
 	AccountConferenceCode  string
 	AccountFeaturesEnabled bool
+	// AdvancedIngress keeps this exact extension out of the direct Dial path so
+	// its enabled per-line route can be evaluated by the Simson control plane.
+	AdvancedIngress bool
 	// DefaultOutbound marks this endpoint as its account's selected gateway.
 	// It is used only for account-authorized outside-number feature calls.
 	DefaultOutbound bool
@@ -796,7 +799,7 @@ exten => _X.,1,NoOp(Simson outbound trunk call ${EXTEN} via ${SIMSON_TRUNK})
  same  => n,Set(SIMSON_DIAL_TARGET=${EXTEN}${SIMSON_DIAL_SUFFIX})
  same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))
  same  => n,GotoIf($["${SIMSON_POST_ANSWER_DTMF}" = ""]?dial)
- same  => n,Set(SIMSON_DIAL_OPTIONS=${SIMSON_DIAL_OPTIONS}U(simson-outbound-postanswer^s^1(${SIMSON_POST_ANSWER_DTMF})))
+ same  => n,Set(SIMSON_DIAL_OPTIONS=${SIMSON_DIAL_OPTIONS}U(simson-outbound-postanswer^${SIMSON_POST_ANSWER_DTMF}))
  same  => n(dial),Dial(PJSIP/${SIMSON_DIAL_TARGET}@${SIMSON_TRUNK},${SIMSON_WAIT_TIMEOUT:=120},${SIMSON_DIAL_OPTIONS})
  same  => n,Hangup()
 
@@ -874,6 +877,28 @@ exten => s,1,NoOp(Simson direct SIP conference into ${SIMSON_SPY_CHANNEL})
  same  => n,ChanSpy(${SIMSON_SPY_CHANNEL},qBE)
  same  => n,Hangup()
  same  => n(invalid),Hangup(21)
+
+[simson-direct-supervision]
+; Invited active-call participant. Listen is silent, whisper talks only to the
+; inviting channel, and barge joins both directions. E exits with the source.
+exten => s,1,NoOp(Simson direct supervision ${SIMSON_SPY_MODE} into ${SIMSON_SPY_CHANNEL})
+ same  => n,GotoIf($["${SIMSON_SPY_CHANNEL}" = ""]?invalid)
+ same  => n,GotoIf($["${SIMSON_SPY_MODE}" = "listen"]?listen)
+ same  => n,GotoIf($["${SIMSON_SPY_MODE}" = "whisper"]?whisper)
+ same  => n,GotoIf($["${SIMSON_SPY_MODE}" = "barge"]?barge)
+ same  => n(invalid),Hangup(21)
+ same  => n(listen),ChanSpy(${SIMSON_SPY_CHANNEL},qE)
+ same  => n,Hangup()
+ same  => n(whisper),ChanSpy(${SIMSON_SPY_CHANNEL},qwE)
+ same  => n,Hangup()
+ same  => n(barge),ChanSpy(${SIMSON_SPY_CHANNEL},qBE)
+ same  => n,Hangup()
+
+[simson-direct-observer-answer]
+; Called-channel U() hook used only for live-state observation. It does not
+; answer early, alter media, or move either endpoint out of the native bridge.
+exten => s,1,UserEvent(SimsonDirectCall,Phase: active,CallID: ${ARG1},AccountID: ${ARG4},Source: ${ARG2},Target: ${ARG3},Channel: ${CHANNEL})
+ same  => n,Return()
 
 [simson-outbound-mark]
 exten => s,1,NoOp(Mark Simson outbound child channel ${ARG1})
@@ -1128,7 +1153,7 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 	}
 	var sb strings.Builder
 	for _, ep := range endpoints {
-		if !ep.Enabled || strings.TrimSpace(ep.RouteTo) != "" {
+		if !ep.Enabled || strings.TrimSpace(ep.RouteTo) != "" || ep.AdvancedIngress {
 			continue
 		}
 		ext := sanitizeID(strings.TrimSpace(ep.Extension))
@@ -1143,6 +1168,9 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		}
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
+		sb.WriteString(" same  => n,Set(SIMSON_CALL_ID=direct-${UNIQUEID})\n")
+		sb.WriteString(" same  => n,Set(__SIMSON_CALL_ID=${SIMSON_CALL_ID})\n")
+		fmt.Fprintf(&sb, " same  => n,UserEvent(SimsonDirectCall,Phase: ringing,CallID: ${SIMSON_CALL_ID},AccountID: %s,Source: ${CALLERID(num)},Target: ${EXTEN},Channel: ${CHANNEL})\n", sanitizeID(ep.AccountID))
 		sb.WriteString(" same  => n,Set(JITTERBUFFER(adaptive)=default)\n")
 		appendAccountTransferChannelVars(&sb, ep)
 		appendCallerPreRingAnnouncement(&sb, ep.PreRingAnnouncement)
@@ -1167,7 +1195,9 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=Ttb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE})))\n")
 		appendCalledPartyAnnouncement(&sb, ep.AnswerAnnouncement)
 		appendCallDurationRules(&sb, ep.CallDurationRules)
+		fmt.Fprintf(&sb, " same  => n,Set(SIMSON_DIAL_OPTIONS=${SIMSON_DIAL_OPTIONS}U(simson-direct-observer-answer^${SIMSON_CALL_ID}^${CALLERID(num)}^${EXTEN}^%s))\n", sanitizeID(ep.AccountID))
 		sb.WriteString(" same  => n,Dial(PJSIP/${EXTEN},${SIMSON_WAIT_TIMEOUT:=60},${SIMSON_DIAL_OPTIONS})\n")
+		fmt.Fprintf(&sb, " same  => n,UserEvent(SimsonDirectCall,Phase: ended,CallID: ${SIMSON_CALL_ID},AccountID: %s,Source: ${CALLERID(num)},Target: ${EXTEN},Channel: ${CHANNEL},DialStatus: ${DIALSTATUS})\n", sanitizeID(ep.AccountID))
 		sb.WriteString(" same  => n,Hangup()\n")
 		if ep.CallbackBridge {
 			fmt.Fprintf(&sb, "exten => *%s,1,NoOp(Simson callback feature code ${CALLERID(num)} -> %s)\n", ext, ext)
