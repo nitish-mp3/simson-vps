@@ -185,6 +185,41 @@ func TestSIPPhoneOutboundGatewayPrefersSourceGatewayUnlessPrefixOverrides(t *tes
 	}
 }
 
+func TestOutboundGatewaySelectionSkipsUnavailableDefault(t *testing.T) {
+	endpoints := []store.SIPEndpoint{
+		{Extension: "7009", DefaultOutbound: true, Enabled: true},
+		{Extension: "7014", Enabled: true},
+	}
+	available := func(ext string) bool { return ext == "7014" }
+
+	if got := selectOutboundGatewayEndpoint(endpoints, "9123208334", "7009", available); got != "7014" {
+		t.Fatalf("available fallback trunk = %q, want 7014", got)
+	}
+}
+
+func TestOutboundGatewaySelectionDoesNotRerouteUnavailableExplicitTrunk(t *testing.T) {
+	endpoints := []store.SIPEndpoint{
+		{Extension: "7009", DefaultOutbound: true, Enabled: true},
+		{Extension: "7014", Enabled: true},
+	}
+	available := func(ext string) bool { return ext == "7014" }
+
+	if got := selectOutboundGatewayEndpoint(endpoints, "70099123208334", "7009", available); got != "" {
+		t.Fatalf("unavailable explicit trunk rerouted through %q, want no trunk", got)
+	}
+}
+
+func TestOutboundGatewaySelectionReturnsEmptyWhenAllGatewaysUnavailable(t *testing.T) {
+	endpoints := []store.SIPEndpoint{
+		{Extension: "7009", DefaultOutbound: true, Enabled: true},
+		{Extension: "7014", Enabled: true},
+	}
+
+	if got := selectOutboundGatewayEndpoint(endpoints, "9123208334", "7009", func(string) bool { return false }); got != "" {
+		t.Fatalf("unavailable gateway selection = %q, want no trunk", got)
+	}
+}
+
 func TestAdvancedRouteDeclineKeepsOtherHAOSDestination(t *testing.T) {
 	run := &advancedRouteRun{
 		invitedNodes: map[string]bool{"haos-a": true, "haos-b": true},

@@ -1823,7 +1823,7 @@ func (s *Server) notifyCallStatus(c *calls.Call) {
 			nodeSess.Send(data)
 		}
 	}
-	if c.CallType == "sip" && c.AccountID != "" {
+	if shouldBroadcastCallStatusToAccount(c) {
 		for _, accountSess := range s.hub.ListByAccount(c.AccountID) {
 			if accountSess == nil || accountSess.NodeID == "" ||
 				accountSess.NodeID == c.FromNode || accountSess.NodeID == c.ToNode {
@@ -1832,6 +1832,20 @@ func (s *Server) notifyCallStatus(c *calls.Call) {
 			accountSess.Send(data)
 		}
 	}
+}
+
+// shouldBroadcastCallStatusToAccount keeps ordinary PBX extension calls out of
+// Home Assistant. Direct SIP calls are tracked for hangup, transfer, and admin
+// observability, but only calls involving a HAOS node, an explicit HAOS invite,
+// or a Simson media bridge belong on account dashboards.
+func shouldBroadcastCallStatusToAccount(c *calls.Call) bool {
+	if c == nil || c.CallType != "sip" || c.AccountID == "" {
+		return false
+	}
+	if c.SIPBridgeID != "" || len(c.InviteNodes) > 0 {
+		return true
+	}
+	return !strings.HasPrefix(c.FromNode, "sip:") || !strings.HasPrefix(c.ToNode, "sip:")
 }
 
 func (s *Server) notifyCallStatusToNode(nodeID string, c *calls.Call, status, reason, answeredBy string) {
@@ -3007,20 +3021,53 @@ func (s *Server) selectOutboundGatewayTrunk(accountID, rawDigits string) string 
 	if defaultTrunk == "" {
 		defaultTrunk = "7009"
 	}
+	available := func(ext string) bool {
+		// Preserve routing while AMI is reconnecting. Once AMI is healthy, a
+		// gateway without a live contact cannot successfully place the call.
+		if s.asterisk == nil || !s.asterisk.Connected() {
+			return true
+		}
+		if s.asterisk.EndpointHasContacts(ext) {
+			return true
+		}
+		s.log.Warn("skipping outbound gateway with no registered contact",
+			map[string]any{"account": accountID, "trunk": ext})
+		return false
+	}
+	return selectOutboundGatewayEndpoint(endpoints, rawDigits, defaultTrunk, available)
+}
+
+func selectOutboundGatewayEndpoint(endpoints []store.SIPEndpoint, rawDigits, defaultTrunk string, available func(string) bool) string {
+	if available == nil {
+		available = func(string) bool { return true }
+	}
+	digits := digitsOnly(rawDigits)
+
+	// An explicit trunk prefix is an instruction, not a preference. If that
+	// trunk is offline, fail safely instead of placing the call through a
+	// different site's telephone line or a surprising fallback gateway.
+	for _, ep := range endpoints {
+		ext := strings.TrimSpace(ep.Extension)
+		if !ep.Enabled || !isGatewayLikeTrunk(ext, defaultTrunk) || !strings.HasPrefix(digits, digitsOnly(ext)) {
+			continue
+		}
+		rest := strings.TrimPrefix(digits, digitsOnly(ext))
+		if len(rest) >= 1 && len(rest) <= 15 {
+			if available(ext) {
+				return ext
+			}
+			return ""
+		}
+	}
+
 	var fallback string
 	fallbackRank := -1
 	var defaultAvailable string
 	var accountDefault string
 	for _, ep := range endpoints {
 		ext := strings.TrimSpace(ep.Extension)
-		if !ep.Enabled || !isGatewayLikeTrunk(ext, defaultTrunk) {
+		if !ep.Enabled || !isGatewayLikeTrunk(ext, defaultTrunk) || !available(ext) {
 			continue
-		}
-		if rawDigits != "" && strings.HasPrefix(rawDigits, ext) {
-			rest := strings.TrimPrefix(rawDigits, ext)
-			if len(rest) >= 1 && len(rest) <= 15 {
-				return ext
-			}
 		}
 		if ext == defaultTrunk {
 			defaultAvailable = ext

@@ -281,6 +281,16 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 	appendTransportNATConfig(&sb, externalIP)
 	sb.WriteString("\n")
 
+	// Alternate SIP transports bypass broken SIP ALG and UDP/5060 NAT mapping
+	// collisions at sites with several phones or gateways behind one router.
+	// Existing devices remain on 5060; only affected devices use 15060.
+	sb.WriteString("[simson-udp-alt]\ntype=transport\nprotocol=udp\nbind=0.0.0.0:15060\n")
+	if cfg.SIPDomain != "" {
+		sb.WriteString("domain=" + cfg.SIPDomain + "\n")
+	}
+	appendTransportNATConfig(&sb, externalIP)
+	sb.WriteString("\n")
+
 	// ── TCP transport ──────────────────────────────────────────────────────────
 	// Some phones / ISPs prefer or require TCP for SIP signalling.
 	sb.WriteString("[simson-tcp]\ntype=transport\nprotocol=tcp\nbind=0.0.0.0:5060\n")
@@ -465,6 +475,8 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 					"dtmf_mode=inband\n" +
 					"preferred_codec_only=yes\n" +
 					"timers=no\n" +
+					"rtp_timeout=120\n" +
+					"rtp_timeout_hold=300\n" +
 					"100rel=no\n",
 			)
 		}

@@ -27,6 +27,9 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	}
 
 	pjsip := readTestFile(t, filepath.Join(root, "pjsip.d", "simson.conf"))
+	if !strings.Contains(pjsip, "[simson-udp-alt]\ntype=transport\nprotocol=udp\nbind=0.0.0.0:15060") {
+		t.Fatal("alternate SIP UDP transport must listen on port 15060")
+	}
 	if !strings.Contains(pjsip, "keep_alive_interval=25") {
 		t.Fatal("PJSIP global config must keep TCP/TLS phone NAT bindings alive")
 	}
@@ -149,6 +152,30 @@ func TestPJSIPEndpointCarriesServerAssignedAuthorizationIdentity(t *testing.T) {
 	endpoint := section(pjsip, "[1027](simson-ep-tpl)", "[1027-auth]")
 	if !strings.Contains(endpoint, "set_var=SIMSON_ENDPOINT_ID=1027") {
 		t.Fatalf("endpoint must carry its server-assigned supervision identity:\n%s", endpoint)
+	}
+}
+
+func TestGatewayEndpointsExpireStaleMediaLegs(t *testing.T) {
+	root := t.TempDir()
+	endpoints := []SIPEndpointDef{
+		{Extension: "7014", Username: "7014", Password: "test-secret", Enabled: true},
+		{Extension: "1027", Username: "1027", Password: "test-secret", Enabled: true},
+	}
+	if err := writePJSIPConf(root, SetupConfig{
+		SIPDomain:               "simson-vps.vipsy.in",
+		NoAuthInboundExtensions: []string{"7014"},
+	}, endpoints); err != nil {
+		t.Fatal(err)
+	}
+
+	pjsip := readTestFile(t, filepath.Join(root, "pjsip.d", "simson.conf"))
+	gateway := section(pjsip, "[7014](simson-ep-tpl)", "[7014-auth]")
+	if !strings.Contains(gateway, "rtp_timeout=120") || !strings.Contains(gateway, "rtp_timeout_hold=300") {
+		t.Fatalf("gateway endpoint must expire stale media legs:\n%s", gateway)
+	}
+	deskPhone := section(pjsip, "[1027](simson-ep-tpl)", "[1027-auth]")
+	if strings.Contains(deskPhone, "rtp_timeout=120") || strings.Contains(deskPhone, "rtp_timeout_hold=300") {
+		t.Fatalf("stale gateway watchdog must not alter desk-phone media policy:\n%s", deskPhone)
 	}
 }
 

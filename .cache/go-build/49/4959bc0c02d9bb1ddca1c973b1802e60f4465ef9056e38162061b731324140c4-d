@@ -1,6 +1,0 @@
-./advanced_routes.go
-./gateway_transfer.go
-./server.go
-./advanced_routes_safety_test.go
-./gateway_transfer_test.go
-./server_test.go

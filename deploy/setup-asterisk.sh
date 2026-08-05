@@ -231,19 +231,18 @@ cat > /etc/logrotate.d/asterisk <<'LREOF'
         endscript
 }
 LREOF
-sed -i 's/^messages => .*/messages => warning,error/; s/^full => .*/full => warning,error/' \
+sed -i 's/^console => .*/console => notice,error/; s/^messages => .*/messages => notice,warning,error/; s/^full => .*/full => warning,error/' \
     /etc/asterisk/logger.conf 2>/dev/null || true
 asterisk -rx "logger reload" >/dev/null 2>&1 || true
 
 # Public SIP ports are required for independently deployed homes and gateways,
-# but they attract constant credential scanners. Asterisk rejection notices are
-# emitted through journald, so use the systemd backend instead of the reduced
-# on-disk warning/error log configured above.
+# but they attract constant credential scanners. Keep warnings in Asterisk's
+# rotated messages file for fail2ban while excluding them from the service
+# console; this preserves actionable diagnostics without flooding journald.
 cat > /etc/fail2ban/filter.d/simson-asterisk.conf <<'F2BFILTER'
 [Definition]
 failregex = ^.*log_failed_request.*failed for '<HOST>:[0-9]+'.* - (?:No matching endpoint found|Failed to authenticate)\s*$
 ignoreregex =
-journalmatch = _SYSTEMD_UNIT=asterisk.service
 F2BFILTER
 
 cat > /etc/fail2ban/jail.d/simson-asterisk.local <<'F2BJAIL'
@@ -252,7 +251,8 @@ enabled = true
 port = 5060,5061,15060
 protocol = all
 filter = simson-asterisk
-backend = systemd
+backend = auto
+logpath = /var/log/asterisk/messages
 maxretry = 8
 findtime = 10m
 bantime = 1h
@@ -261,6 +261,57 @@ F2BJAIL
 systemctl enable fail2ban
 systemctl restart fail2ban
 info "fail2ban SIP scanner jail enabled"
+
+# A few scanners send hundreds of unauthenticated UDP REGISTER packets per
+# second. Those requests fall through to the deliberately restricted anonymous
+# gateway endpoint, whose Asterisk warning does not include the source IP and
+# therefore cannot be matched by fail2ban. Limit only extreme per-source bursts;
+# the 400-packet burst allowance leaves ample room for large sites re-registering
+# many phones behind one NAT after an outage.
+cat > /usr/local/sbin/simson-sip-guard <<'SIPGUARD'
+#!/usr/bin/env bash
+set -u
+
+RULE=(-p udp --dport 5060 -m hashlimit --hashlimit-above 200/second
+      --hashlimit-burst 400 --hashlimit-mode srcip
+      --hashlimit-name simson_sip_udp -j DROP)
+
+if ! command -v iptables >/dev/null 2>&1; then
+    exit 0
+fi
+
+iptables -C INPUT "${RULE[@]}" >/dev/null 2>&1 || iptables -I INPUT 1 "${RULE[@]}"
+SIPGUARD
+chmod 0755 /usr/local/sbin/simson-sip-guard
+
+cat > /etc/systemd/system/simson-sip-guard.service <<'SIPGUARDUNIT'
+[Unit]
+Description=Simson abusive SIP burst guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/simson-sip-guard
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SIPGUARDUNIT
+
+# Preserve normal call diagnostics while preventing a malformed packet storm
+# from monopolising journald. This limits service output, not SIP processing.
+mkdir -p /etc/systemd/system/asterisk.service.d
+cat > /etc/systemd/system/asterisk.service.d/20-simson-log-rate.conf <<'ASTERISKLOGRATE'
+[Service]
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=500
+ASTERISKLOGRATE
+
+systemctl daemon-reload
+systemctl enable --now simson-sip-guard.service || \
+    warn "SIP burst guard could not be enabled; fail2ban remains active"
+info "SIP burst and journal flood protection enabled"
 
 # Ensure minimal manager.conf if missing
 MANAGER_CONF=/etc/asterisk/manager.conf
