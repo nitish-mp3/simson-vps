@@ -36,10 +36,17 @@ func TestOutboundGatewayDialCandidatesKeepShortIntercomExtensionSingleForm(t *te
 	}
 }
 
-func TestGatewayDialProfileKeepsGrandstreamFXODirect(t *testing.T) {
+func TestGatewayDialProfilePrefersLandlinePrefixForGrandstreamFXO(t *testing.T) {
 	leadingZero, postAnswer := gatewayDialProfileFromMetadata("7014 grandstream port 1 airtel fxo landline")
+	if !leadingZero || postAnswer != "" {
+		t.Fatalf("Grandstream FXO profile = leadingZero:%v postAnswer:%q, want leading-zero dialing without post-answer DTMF", leadingZero, postAnswer)
+	}
+}
+
+func TestGatewayDialProfileKeepsGrandstreamIntercomDirect(t *testing.T) {
+	leadingZero, postAnswer := gatewayDialProfileFromMetadata("7015 grandstream port 2 intercom")
 	if leadingZero || postAnswer != "" {
-		t.Fatalf("Grandstream profile = leadingZero:%v postAnswer:%q, want direct dialing", leadingZero, postAnswer)
+		t.Fatalf("Grandstream intercom profile = leadingZero:%v postAnswer:%q, want direct dialing", leadingZero, postAnswer)
 	}
 }
 

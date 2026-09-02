@@ -26,14 +26,15 @@ import (
 
 // Server is the main control-plane process.
 type Server struct {
-	cfg      *config.Config
-	store    *store.Store
-	hub      *hub.Hub
-	calls    *calls.Manager
-	limiter  *ratelimit.Limiter
-	log      *logging.Logger
-	upgrader websocket.Upgrader
-	asterisk *asterisk.Router // nil when Asterisk integration is disabled
+	cfg              *config.Config
+	store            *store.Store
+	hub              *hub.Hub
+	calls            *calls.Manager
+	limiter          *ratelimit.Limiter
+	sipOutboundGuard *sipPhoneOutboundGuard
+	log              *logging.Logger
+	upgrader         websocket.Upgrader
+	asterisk         *asterisk.Router // nil when Asterisk integration is disabled
 
 	// recentSIPInvites tracks short-lived SIP source keys to suppress rapid
 	// duplicate AMI UserEvent bursts from misdialing phones.
@@ -86,15 +87,16 @@ type Server struct {
 }
 
 type sipOutboundRetry struct {
-	Numbers        []string
-	Index          int
-	Trunk          string
-	BridgeID       string
-	CallerID       string
-	DialTerminator string
-	PostAnswerDTMF string
-	FromNode       string
-	CallerExt      string
+	Numbers         []string
+	Index           int
+	Trunk           string
+	BridgeID        string
+	CallerID        string
+	DialTerminator  string
+	PostAnswerDTMF  string
+	MaxConnectedSec int
+	FromNode        string
+	CallerExt       string
 }
 
 // New constructs a Server.
@@ -105,6 +107,7 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 		hub:                          hub.New(),
 		calls:                        calls.NewManager(),
 		limiter:                      ratelimit.New(cfg.RateLimitPerSec, cfg.RateLimitPerSec*2),
+		sipOutboundGuard:             newSIPPhoneOutboundGuard(),
 		log:                          log,
 		recentSIPInvites:             make(map[string]time.Time),
 		sipOutboundRetries:           make(map[string]*sipOutboundRetry),
@@ -1890,6 +1893,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 
 	callerID := ""
 	trunk := ""
+	maxConnectedSec := 0
 	if len(req.Metadata) > 0 {
 		var metaMap map[string]any
 		if err := json.Unmarshal(req.Metadata, &metaMap); err == nil {
@@ -1901,6 +1905,11 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 			if v, ok := metaMap["trunk"]; ok {
 				if s, ok := v.(string); ok {
 					trunk = strings.TrimSpace(s)
+				}
+			}
+			if v, ok := metaMap["max_duration_sec"]; ok {
+				if parsed, err := strconv.Atoi(strings.TrimSpace(fmt.Sprint(v))); err == nil && parsed >= 15 {
+					maxConnectedSec = min(parsed, 3600)
 				}
 			}
 		}
@@ -1942,6 +1951,9 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		trunk = s.selectOutboundGatewayTrunk(sess.AccountID, digitsOnly(ext))
 	}
 	if ep == nil && trunk != "" {
+		if maxConnectedSec == 0 {
+			maxConnectedSec = 120
+		}
 		if !s.isUsableOutboundGatewayTrunk(sess.AccountID, trunk) {
 			if c2, ended := s.calls.End(callID, "gateway_unavailable"); ended {
 				s.notifyCallStatus(c2)
@@ -2027,12 +2039,13 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 			dialCandidates = []string{ext}
 		}
 		s.setSIPOutboundRetry(callID, &sipOutboundRetry{
-			Numbers:        dialCandidates,
-			Trunk:          trunk,
-			BridgeID:       bridgeID,
-			CallerID:       callerID,
-			PostAnswerDTMF: s.gatewayPostAnswerDTMF(sess.AccountID, trunk),
-			FromNode:       sess.NodeID,
+			Numbers:         dialCandidates,
+			Trunk:           trunk,
+			BridgeID:        bridgeID,
+			CallerID:        callerID,
+			PostAnswerDTMF:  s.gatewayPostAnswerDTMF(sess.AccountID, trunk),
+			MaxConnectedSec: maxConnectedSec,
+			FromNode:        sess.NodeID,
 		})
 		if !s.trySIPPhoneOutboundGateway(callID) {
 			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "AMI originate failed")
@@ -2950,6 +2963,14 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 		s.hangupAsteriskChannelAsync(in.Channel, "account call limit reached")
 		return
 	}
+	if !s.sipOutboundGuard.Allow(callerEP.AccountID + ":" + callerEP.Extension) {
+		s.log.Warn("rejecting SIP-phone outbound gateway dial: extension rate limit reached",
+			map[string]any{"account": callerEP.AccountID, "caller_ext": callerEP.Extension, "number": number})
+		s.store.WriteAudit(callerEP.AccountID, "sip:"+callerEP.Extension, "sip_phone_outbound_gateway_rate_limited",
+			fmt.Sprintf("number=%s trunk=%s", number, trunk), "")
+		s.hangupAsteriskChannelAsync(in.Channel, "SIP outbound rate limit reached")
+		return
+	}
 
 	callID := "call_" + uuid.NewString()
 	c := &calls.Call{
@@ -3236,6 +3257,11 @@ func gatewayDialProfileFromMetadata(meta string) (preferLeadingZero bool, postAn
 	meta = strings.ToLower(strings.TrimSpace(meta))
 	for _, marker := range []string{"grandstream", "ht813", "ht814", "ht818", "ht841"} {
 		if strings.Contains(meta, marker) {
+			for _, landlineMarker := range []string{"airtel", "jio", "landline", "fxo", "pstn"} {
+				if strings.Contains(meta, landlineMarker) {
+					return true, ""
+				}
+			}
 			return false, ""
 		}
 	}
@@ -3339,6 +3365,7 @@ func (s *Server) trySIPPhoneOutboundGateway(callID string) bool {
 		retry.DialTerminator,
 		retry.PostAnswerDTMF,
 		s.cfg.CallTimeoutSec,
+		retry.MaxConnectedSec,
 	)
 	if err != nil {
 		s.log.Warn("SIP-phone outbound gateway originate attempt failed",

@@ -621,7 +621,7 @@ func (r *Router) originateIntercomCallbackTargetFirst(sourceExtension, targetExt
 // OriginateToTrunk dials an external number through an existing PJSIP trunk and
 // then sends the answered leg into the same ConfBridge extension used by SIP
 // phone calls.
-func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, bridgeExt, callerID, callID, fromNode, dialTerminator, postAnswerDTMF string, timeoutSec int) (string, error) {
+func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, bridgeExt, callerID, callID, fromNode, dialTerminator, postAnswerDTMF string, timeoutSec, maxConnectedSec int) (string, error) {
 	if outContext == "" {
 		outContext = "from-simson-out"
 	}
@@ -645,6 +645,9 @@ func (r *Router) OriginateToTrunk(number, trunk, outContext, bridgeContext, brid
 		"SIMSON_DIAL_SUFFIX":      dialTerminator,
 		"SIMSON_POST_ANSWER_DTMF": postAnswerDTMF,
 		"SIMSON_WAIT_TIMEOUT":     fmt.Sprintf("%d", timeoutSec),
+	}
+	if maxConnectedSec > 0 {
+		vars["SIMSON_MAX_CONNECTED_MS"] = fmt.Sprintf("%d", maxConnectedSec*1000)
 	}
 	_, err := r.ami.OriginateWithVars(channel, bridgeContext, bridgeExt, callerID, timeoutSec*1000, actionID, vars)
 	if err != nil {

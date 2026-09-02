@@ -329,7 +329,7 @@ func (s *Server) originateAdvancedRouteLeg(run *advancedRouteRun, target store.R
 		_, err = s.asterisk.OriginateToTrunk(
 			target.Value, target.Trunk, s.cfg.Asterisk.OutContext,
 			s.cfg.Asterisk.NodeContext, run.bridgeID, callerID, legID,
-			"route:"+run.plan.ID, "", "", timeout,
+			"route:"+run.plan.ID, "", "", timeout, 0,
 		)
 	} else {
 		_, err = s.asterisk.OriginateToExtension(

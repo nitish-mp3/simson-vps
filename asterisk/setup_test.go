@@ -778,6 +778,25 @@ func TestDirectSIPConferenceBargeDialplan(t *testing.T) {
 	}
 }
 
+func TestOutboundTrunkDialplanAppliesOptionalConnectedCallLimit(t *testing.T) {
+	root := t.TempDir()
+	if err := writeDialplanConf(root, "from-simson-sip", "from-simson-node", "from-simson-out", "7009", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
+	outbound := section(dialplan, "[from-simson-out]", "[simson-outbound-postanswer]")
+	for _, want := range []string{
+		`GotoIf($["${SIMSON_POST_ANSWER_DTMF}" = ""]?dial-limit)`,
+		`GotoIf($["${SIMSON_MAX_CONNECTED_MS}" = ""]?dial)`,
+		`Set(SIMSON_DIAL_OPTIONS=${SIMSON_DIAL_OPTIONS}L(${SIMSON_MAX_CONNECTED_MS}))`,
+	} {
+		if !strings.Contains(outbound, want) {
+			t.Fatalf("outbound trunk dialplan missing %q:\n%s", want, outbound)
+		}
+	}
+}
+
 func section(content, start, end string) string {
 	startIndex := strings.Index(content, start)
 	if startIndex < 0 {
