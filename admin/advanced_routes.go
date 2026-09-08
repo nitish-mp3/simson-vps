@@ -93,6 +93,10 @@ func (a *API) handleUpdateAdvancedRoute(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 		return
 	}
+	if !route.Enabled && a.gatewayRoutePlanInUse(existing.AccountID, existing.ID) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "this route is selected by a gateway; choose another gateway target before disabling it"})
+		return
+	}
 	if err := a.store.UpdateAdvancedRoute(route); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			writeJSON(w, http.StatusConflict, map[string]any{"error": "an advanced route already exists for this ingress"})
@@ -119,6 +123,10 @@ func (a *API) handleDeleteAdvancedRoute(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "route not found"})
 		return
 	}
+	if a.gatewayRoutePlanInUse(existing.AccountID, existing.ID) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "this route is selected by a gateway; choose another gateway target before deleting it"})
+		return
+	}
 	if err := a.store.DeleteAdvancedRoute(id, existing.AccountID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
@@ -126,6 +134,20 @@ func (a *API) handleDeleteAdvancedRoute(w http.ResponseWriter, r *http.Request) 
 	a.store.WriteAudit(existing.AccountID, "admin", "advanced_route_deleted", "route="+id, r.RemoteAddr)
 	a.reconfigureAsterisk()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *API) gatewayRoutePlanInUse(accountID, routeID string) bool {
+	endpoints, err := a.store.ListSIPEndpoints(accountID)
+	if err != nil {
+		a.log.Error("lookup gateway route references", map[string]any{"account_id": accountID, "route_id": routeID, "err": err.Error()})
+		return true
+	}
+	for _, endpoint := range endpoints {
+		if strings.EqualFold(strings.TrimSpace(endpoint.GatewayInboundMode), "direct_target") && strings.TrimSpace(endpoint.GatewayDirectTarget) == routeID {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *API) validateAdvancedRoute(route *store.AdvancedRoute) error {

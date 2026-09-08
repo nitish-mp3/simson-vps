@@ -383,6 +383,23 @@ func TestRouteForHAOSRingCodeHonorsGatewayDirectTarget(t *testing.T) {
 	}
 }
 
+func TestSelectedAdvancedRouteIDAcceptsOnlySafeRouteIDs(t *testing.T) {
+	valid := []string{
+		"route_123",
+		"route_25b9fdc7-a13e-4f11-a9c4-123456789abc",
+	}
+	for _, value := range valid {
+		if got, ok := selectedAdvancedRouteID(value); !ok || got != value {
+			t.Fatalf("selectedAdvancedRouteID(%q) = (%q, %v), want accepted exact ID", value, got, ok)
+		}
+	}
+	for _, value := range []string{"", "1027", "route_../../etc", "route_bad space", "route_!"} {
+		if got, ok := selectedAdvancedRouteID(value); ok || got != "" {
+			t.Fatalf("selectedAdvancedRouteID(%q) = (%q, %v), want rejected", value, got, ok)
+		}
+	}
+}
+
 func newServerTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "simson.db"))

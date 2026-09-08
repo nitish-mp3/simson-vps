@@ -25,6 +25,38 @@ func TestSafeSIPUsernameRejectsBrokenAORNames(t *testing.T) {
 	}
 }
 
+func TestGatewayDirectRouteTargetsStayAccountScoped(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "gateway-targets.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, account := range []string{"site-a", "site-b"} {
+		if err := st.CreateAccount(account, account, 10, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.CreateAdvancedRoute(store.AdvancedRoute{
+		ID: "route_site_a", AccountID: "site-a", Name: "Site A route", IngressKind: "gateway", IngressValue: "7009", Enabled: true,
+		Stages: []store.RouteStage{{ID: "stage_1", Name: "Ring", RingSeconds: 10, AnswerMode: "first_answer", MaxAnswered: 1, Targets: []store.RouteTarget{{ID: "target_1", Kind: "haos", Value: "node-a", Enabled: true}}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateAdvancedRoute(store.AdvancedRoute{
+		ID: "route_site_b", AccountID: "site-b", Name: "Site B route", IngressKind: "gateway", IngressValue: "7009", Enabled: true,
+		Stages: []store.RouteStage{{ID: "stage_1", Name: "Ring", RingSeconds: 10, AnswerMode: "first_answer", MaxAnswered: 1, Targets: []store.RouteTarget{{ID: "target_1", Kind: "haos", Value: "node-b", Enabled: true}}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	api := &API{store: st}
+	if !api.validGatewayDirectTarget(httptest.NewRecorder(), "site-a", "route_site_a") {
+		t.Fatal("same-account enabled route target was rejected")
+	}
+	if api.validGatewayDirectTarget(httptest.NewRecorder(), "site-a", "route_site_b") {
+		t.Fatal("cross-account route target was accepted")
+	}
+}
+
 func TestCallDurationRulesAreExactAndAccountScoped(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "simson.db"))
 	if err != nil {

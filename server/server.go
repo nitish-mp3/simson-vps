@@ -2204,6 +2204,21 @@ func (s *Server) handleSIPIncomingCall(in asterisk.IncomingSIPCall) {
 	// route merely because the caller owns that extension: doing so hijacks
 	// normal calls made by every phone that also has an incoming route plan.
 	advancedSourceExt := s.resolveAdvancedRouteSource(accountID, sourceExt, in)
+	if routeID, ok := selectedAdvancedRouteID(routeTo); ok {
+		if s.tryStartAdvancedRouteByID(accountID, routeID, advancedSourceExt, in) {
+			return
+		}
+		s.log.Error("selected gateway route is unavailable", map[string]any{
+			"account_id": accountID, "route_id": routeID, "extension": in.Extension,
+			"source_ext": advancedSourceExt,
+		})
+		s.store.WriteAudit(accountID, "sip:"+advancedSourceExt, "gateway_route_unavailable",
+			fmt.Sprintf("route=%s ext=%s", routeID, in.Extension), "")
+		if s.asterisk != nil {
+			s.hangupAsteriskChannelAsync(in.Channel, "selected gateway route unavailable")
+		}
+		return
+	}
 	if !isHAOSBypassCode(in.Extension) {
 		// A gateway may first resolve to a SIP landing endpoint (for example
 		// 7016 -> 1027). Check both the dialled endpoint and that resolved
@@ -2396,6 +2411,29 @@ func normalizeSIPRouteTarget(routeTo string) (string, bool) {
 		return "", false
 	}
 	return text, true
+}
+
+func selectedAdvancedRouteID(routeTo string) (string, bool) {
+	target := strings.TrimSpace(routeTo)
+	if !strings.HasPrefix(target, "route_") || len(target) > 96 {
+		return "", false
+	}
+	for _, ch := range target {
+		if ch == '-' || ch == '_' || ch == '.' {
+			continue
+		}
+		if ch >= '0' && ch <= '9' {
+			continue
+		}
+		if ch >= 'A' && ch <= 'Z' {
+			continue
+		}
+		if ch >= 'a' && ch <= 'z' {
+			continue
+		}
+		return "", false
+	}
+	return target, true
 }
 
 func gatewayInboundPolicy(ep *store.SIPEndpoint) (string, string) {

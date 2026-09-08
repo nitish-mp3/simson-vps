@@ -145,7 +145,7 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":           "ok",
-		"server_version":   "1.5.2",
+		"server_version":   "1.5.3",
 		"protocol_version": "1.0.0",
 	})
 }
@@ -531,6 +531,9 @@ func (a *API) handleCreateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 	gatewayDirectTarget, ok := normalizeGatewayDirectTarget(body.GatewayDirectTarget)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_direct_target must be a node id, route id, or SIP extension token"})
+		return
+	}
+	if !a.validGatewayDirectTarget(w, accountID, gatewayDirectTarget) {
 		return
 	}
 	gatewayIVRSound, ok := normalizeGatewayIVRSound(body.GatewayIVRSound)
@@ -926,6 +929,9 @@ func (a *API) handleUpdateSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 		target, ok := normalizeGatewayDirectTarget(*body.GatewayDirectTarget)
 		if !ok {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_direct_target must be a node id, route id, or SIP extension token"})
+			return
+		}
+		if target != strings.TrimSpace(ep.GatewayDirectTarget) && !a.validGatewayDirectTarget(w, ep.AccountID, target) {
 			return
 		}
 		ep.GatewayDirectTarget = target
@@ -1622,6 +1628,49 @@ func normalizeGatewayDirectTarget(value string) (string, bool) {
 		return "", false
 	}
 	return target, true
+}
+
+// validGatewayDirectTarget prevents a gateway in one customer account from
+// targeting a SIP phone, HAOS node, or route plan owned by another account.
+// Empty remains valid for inherited HAOS routing.
+func (a *API) validGatewayDirectTarget(w http.ResponseWriter, accountID, target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return true
+	}
+	if strings.HasPrefix(target, "route_") {
+		route, err := a.store.GetAdvancedRoute(target)
+		if err != nil {
+			a.log.Error("lookup gateway route target", map[string]any{"account_id": accountID, "route_id": target, "err": err.Error()})
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "could not validate gateway route target"})
+			return false
+		}
+		if route == nil || route.AccountID != accountID || !route.Enabled {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway route target must be an enabled route plan in this account"})
+			return false
+		}
+		return true
+	}
+	endpoint, endpointErr := a.store.GetSIPEndpointByAccountAndExtension(accountID, target)
+	if endpointErr != nil {
+		a.log.Error("lookup gateway SIP target", map[string]any{"account_id": accountID, "target": target, "err": endpointErr.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "could not validate gateway target"})
+		return false
+	}
+	if endpoint != nil && endpoint.Enabled {
+		return true
+	}
+	node, nodeErr := a.store.GetNode(target)
+	if nodeErr != nil {
+		a.log.Error("lookup gateway HAOS target", map[string]any{"account_id": accountID, "target": target, "err": nodeErr.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "could not validate gateway target"})
+		return false
+	}
+	if node != nil && node.AccountID == accountID && node.Enabled {
+		return true
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway target must be an enabled SIP phone, HAOS node, or route plan in this account"})
+	return false
 }
 
 func normalizeGatewayIVRSound(value string) (string, bool) {

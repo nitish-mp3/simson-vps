@@ -75,7 +75,35 @@ func (s *Server) tryStartAdvancedRouteForIngress(accountID, ingressExt, sourceEx
 	if plan == nil || !plan.Enabled {
 		return false
 	}
+	return s.startAdvancedRoute(accountID, ingressExt, sourceExt, in, plan)
+}
 
+// tryStartAdvancedRouteByID starts an explicitly selected gateway route plan.
+// Gateway hardware does not always use the extension named in a route plan, so
+// the selected plan ID is an intentional, account-scoped override rather than
+// a best-effort lookup by the dialled extension.
+func (s *Server) tryStartAdvancedRouteByID(accountID, routeID, sourceExt string, in asterisk.IncomingSIPCall) bool {
+	if s.asterisk == nil || accountID == "" || sourceExt == "" {
+		return false
+	}
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return false
+	}
+	plan, err := s.store.GetAdvancedRoute(routeID)
+	if err != nil {
+		s.log.Error("selected gateway route lookup failed", map[string]any{
+			"account_id": accountID, "route_id": routeID, "err": err.Error(),
+		})
+		return false
+	}
+	if plan == nil || plan.AccountID != accountID || !plan.Enabled {
+		return false
+	}
+	return s.startAdvancedRoute(accountID, routeID, sourceExt, in, plan)
+}
+
+func (s *Server) startAdvancedRoute(accountID, ingressExt, sourceExt string, in asterisk.IncomingSIPCall, plan *store.AdvancedRoute) bool {
 	callID := "call_" + uuid.NewString()
 	call := &calls.Call{
 		ID: callID, FromNode: "sip:" + sourceExt, ToNode: "route:" + plan.ID,
