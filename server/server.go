@@ -994,7 +994,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// Send auth result.
 	authResult := protocol.NewEnvelope(protocol.TypeAuthResult, protocol.AuthResultPayload{
 		OK:              true,
-		ServerVersion:   "1.5.0",
+		ServerVersion:   "1.5.8",
 		ProtocolVersion: protocol.ProtocolVersion,
 		HeartbeatSec:    s.cfg.HeartbeatSec,
 	})
@@ -3707,7 +3707,7 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 		// Map Asterisk reason code to a descriptive end reason.
 		endReason := "no_answer"
 		if c := s.calls.Get(callID); c != nil {
-			if s.isOutboundGatewayCall(c) && c.State == calls.StateRinging {
+			if s.isOutboundGatewayCall(c) && c.State == calls.StateRinging && gatewayOriginateRetryAllowed(reason) {
 				if same, retryOK := s.clearSIPOutboundDialTerminator(callID); retryOK {
 					s.log.Info("outbound gateway attempt failed; retrying same number without fast-dial terminator",
 						map[string]any{"call_id": callID, "reason": reason, "number": same.Numbers[same.Index], "attempt": same.Index + 1})
@@ -3723,6 +3723,9 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 					}()
 					return
 				}
+			} else if s.isOutboundGatewayCall(c) && c.State == calls.StateRinging {
+				s.log.Info("not retrying definitive outbound gateway result",
+					map[string]any{"call_id": callID, "reason": reason})
 			}
 			if s.isInboundSIPBridgeCall(c) && !s.isDirectGatewaySIPRoute(c) {
 				s.log.Info("SIP bridge add-on leg did not answer; keeping original incoming call alive",
@@ -3767,6 +3770,15 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 			s.log.Info("SIP outbound call not answered",
 				map[string]any{"call_id": callID, "reason": endReason})
 		}
+	}
+}
+
+func gatewayOriginateRetryAllowed(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "", "0", "4", "16", "17", "busy", "user busy", "normal clearing", "gateway_channel_hangup_timeout":
+		return false
+	default:
+		return true
 	}
 }
 

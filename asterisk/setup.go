@@ -884,10 +884,10 @@ exten => s,1,NoOp(Add Simson SIP auto-answer headers mode=${ARG1})
 
 [simson-extension-predial]
 exten => s,1,NoOp(Mark Simson extension leg and optionally add auto-answer headers)
- same  => n,Gosub(simson-outbound-mark^s^1(${ARG1}))
+ same  => n,Gosub(simson-outbound-mark,s,1(${ARG1}))
  same  => n,ExecIf($["${SIMSON_BLINDXFER_CODE}" != ""]?Set(FEATUREMAP(blindxfer)=${SIMSON_BLINDXFER_CODE}))
  same  => n,GotoIf($["${ARG2}" = ""]?done)
- same  => n,Gosub(simson-auto-answer^s^1(${ARG2}))
+ same  => n,Gosub(simson-auto-answer,s,1(${ARG2}))
  same  => n(done),Return()
 
 [simson-account-conference]
@@ -1312,7 +1312,8 @@ func appendAccountTransferChannelVars(sb *strings.Builder, ep SIPEndpointDef) {
 		return
 	}
 	fmt.Fprintf(sb, " same  => n,Set(__SIMSON_BLINDXFER_CODE=%s)\n", code)
-	fmt.Fprintf(sb, " same  => n,Set(FEATUREMAP(blindxfer)=%s)\n", code)
+	fmt.Fprintf(sb, " same  => n,ExecIf($[\"${SIMSON_CALL_ID}\" = \"\"]?Set(FEATUREMAP(blindxfer)=%s))\n", code)
+	fmt.Fprintf(sb, " same  => n,ExecIf($[\"${SIMSON_CALL_ID:0:7}\" = \"direct-\"]?Set(FEATUREMAP(blindxfer)=%s))\n", code)
 	fmt.Fprintf(sb, " same  => n,Set(__TRANSFER_CONTEXT=%s)\n", context)
 	fmt.Fprintf(sb, " same  => n,Set(TRANSFER_CONTEXT=%s)\n", context)
 }
@@ -1323,9 +1324,10 @@ func appendAccountTransferChannelVars(sb *strings.Builder, ep SIPEndpointDef) {
 // that account's explicitly selected default outbound gateway.
 func buildAccountTransferDialplan(endpoints []SIPEndpointDef) string {
 	type transferAccount struct {
-		members map[string]struct{}
-		trunk   string
-		enabled bool
+		members  map[string]struct{}
+		gateways map[string]struct{}
+		trunk    string
+		enabled  bool
 	}
 	accounts := map[string]*transferAccount{}
 	for _, ep := range endpoints {
@@ -1335,7 +1337,7 @@ func buildAccountTransferDialplan(endpoints []SIPEndpointDef) string {
 		accountID := strings.TrimSpace(ep.AccountID)
 		account := accounts[accountID]
 		if account == nil {
-			account = &transferAccount{members: map[string]struct{}{}}
+			account = &transferAccount{members: map[string]struct{}{}, gateways: map[string]struct{}{}}
 			accounts[accountID] = account
 		}
 		if ep.AccountFeaturesEnabled && normalizeAccountDialCode(ep.AccountTransferCode) != "" {
@@ -1344,6 +1346,9 @@ func buildAccountTransferDialplan(endpoints []SIPEndpointDef) string {
 		ext := sanitizeID(strings.TrimSpace(ep.Extension))
 		if ext == "" {
 			continue
+		}
+		if isReservedGatewayExtension(ext) {
+			account.gateways[ext] = struct{}{}
 		}
 		if ep.DefaultOutbound && isReservedGatewayExtension(ext) {
 			account.trunk = ext
@@ -1375,6 +1380,23 @@ func buildAccountTransferDialplan(endpoints []SIPEndpointDef) string {
 		for _, ext := range members {
 			fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson same-site blind transfer to %s)\n", ext, ext)
 			fmt.Fprintf(&sb, " same  => n,Goto(from-simson-sip,%s,1)\n", ext)
+			fmt.Fprintf(&sb, "exten => %s#,1,NoOp(Simson same-site blind transfer with terminator to %s)\n", ext, ext)
+			fmt.Fprintf(&sb, " same  => n,Goto(from-simson-sip,%s,1)\n", ext)
+		}
+		gateways := make([]string, 0, len(account.gateways))
+		for trunk := range account.gateways {
+			gateways = append(gateways, trunk)
+		}
+		sort.Strings(gateways)
+		for _, trunk := range gateways {
+			prefixLength := len(trunk) + 2
+			fmt.Fprintf(&sb, "exten => _*%s*X.,1,NoOp(Simson explicit gateway blind transfer ${EXTEN} via %s)\n", trunk, trunk)
+			fmt.Fprintf(&sb, " same  => n,Set(SIMSON_XFER_NUMBER=${FILTER(0-9,${EXTEN:%d})})\n", prefixLength)
+			sb.WriteString(" same  => n,GotoIf($[${LEN(${SIMSON_XFER_NUMBER})} < 7]?invalid)\n")
+			fmt.Fprintf(&sb, " same  => n,Set(SIMSON_TRUNK=%s)\n", trunk)
+			sb.WriteString(" same  => n,Set(SIMSON_CALL_ID=transfer-${UNIQUEID})\n")
+			sb.WriteString(" same  => n,Goto(from-simson-out,${SIMSON_XFER_NUMBER},1)\n")
+			sb.WriteString(" same  => n(invalid),Hangup(28)\n")
 		}
 		if account.trunk != "" {
 			for _, pattern := range []string{"_+X.", "_X."} {
@@ -1788,7 +1810,7 @@ func buildAutoAnswerExtensionDialplan(endpoints []SIPEndpointDef) string {
 		}
 		appendAccountTransferChannelVars(&sb, ep)
 		appendCallerPreRingAnnouncement(&sb, ep.PreRingAnnouncement)
-		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-outbound-mark^s^1(${SIMSON_CALL_ID})))\n")
+		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^)))\n")
 		sb.WriteString(" same  => n,GotoIf($[\"${SIMSON_AUTO_ANSWER_MODE}\" = \"\"]?simson-dial)\n")
 		sb.WriteString(" same  => n,Set(SIMSON_DIAL_OPTIONS=rTb(simson-extension-predial^s^1(${SIMSON_CALL_ID}^${SIMSON_AUTO_ANSWER_MODE})))\n")
 		appendCalledPartyAnnouncement(&sb, ep.AnswerAnnouncement)

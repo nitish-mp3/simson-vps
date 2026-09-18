@@ -57,6 +57,17 @@ func TestGatewayDialProfilePreservesSynwayTwoStageDial(t *testing.T) {
 	}
 }
 
+func TestGatewayOriginateRetryAllowed(t *testing.T) {
+	for _, reason := range []string{"", "0", "4", "16", "17", "busy", "gateway_channel_hangup_timeout"} {
+		if gatewayOriginateRetryAllowed(reason) {
+			t.Fatalf("gatewayOriginateRetryAllowed(%q) = true, want false", reason)
+		}
+	}
+	if !gatewayOriginateRetryAllowed("transport_failure") {
+		t.Fatal("gatewayOriginateRetryAllowed(transport_failure) = false, want true")
+	}
+}
+
 func TestStripOutboundTrunkPrefixSupportsShortIntercomExtension(t *testing.T) {
 	got := stripOutboundTrunkPrefix("7013198", "7013")
 	if got != "198" {

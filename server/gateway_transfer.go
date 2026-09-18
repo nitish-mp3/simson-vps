@@ -182,10 +182,11 @@ func (s *Server) handleGatewayBridgeDTMF(info asterisk.ChannelDTMF) {
 		}
 		accountID = call.AccountID
 	} else {
-		// Direct SIP calls are not represented by a Simson call/bridge. They
-		// may use only the conference code; *84 remains Asterisk's native
-		// transfer path and must not be duplicated here.
-		callID = ""
+		// A direct gateway-to-phone bridge uses Asterisk's native *84 transfer
+		// feature. Do not capture the remaining DTMF here: partial feature
+		// sequences can otherwise be mistaken for listen/whisper/barge codes
+		// and originate malformed outside calls.
+		return
 	}
 
 	features, err := s.store.GetAccountCallFeatures(accountID)

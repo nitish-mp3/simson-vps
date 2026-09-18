@@ -716,10 +716,13 @@ func TestAccountFeatureCodesAreGeneratedAndAccountScoped(t *testing.T) {
 	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
 	for _, want := range []string{
 		"Set(__SIMSON_BLINDXFER_CODE=*84)",
-		"Set(FEATUREMAP(blindxfer)=*84)",
+		"ExecIf($[\"${SIMSON_CALL_ID}\" = \"\"]?Set(FEATUREMAP(blindxfer)=*84))",
+		"ExecIf($[\"${SIMSON_CALL_ID:0:7}\" = \"direct-\"]?Set(FEATUREMAP(blindxfer)=*84))",
 		"Set(__TRANSFER_CONTEXT=simson-transfer-site-a)",
 		"Set(TRANSFER_CONTEXT=simson-transfer-site-a)",
 		"Set(SIMSON_DIAL_OPTIONS=Ttb(simson-extension-predial",
+		"Gosub(simson-outbound-mark,s,1(${ARG1}))",
+		"Gosub(simson-auto-answer,s,1(${ARG2}))",
 		"exten => *851028,1,NoOp(Simson site conference launch",
 		`"${CHANNEL(pjsip,endpoint)}" = "site-a-1027"`,
 		"exten => *852020,1,NoOp(Simson site conference launch",
@@ -729,6 +732,10 @@ func TestAccountFeatureCodesAreGeneratedAndAccountScoped(t *testing.T) {
 		"[simson-account-conference]",
 		"[simson-transfer-site-a]",
 		"exten => 1028,1,NoOp(Simson same-site blind transfer to 1028)",
+		"exten => 1028#,1,NoOp(Simson same-site blind transfer with terminator to 1028)",
+		"exten => _*7009*X.,1,NoOp(Simson explicit gateway blind transfer",
+		"Set(SIMSON_XFER_NUMBER=${FILTER(0-9,${EXTEN:6})})",
+		"Set(SIMSON_TRUNK=7009)",
 		"Set(SIMSON_TRUNK=7009)",
 		"Goto(from-simson-out,${SIMSON_XFER_NUMBER},1)",
 	} {
