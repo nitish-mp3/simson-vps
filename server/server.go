@@ -41,8 +41,10 @@ type Server struct {
 	recentSIPInvitesMu sync.Mutex
 	recentSIPInvites   map[string]time.Time
 
-	sipOutboundMu      sync.Mutex
-	sipOutboundRetries map[string]*sipOutboundRetry
+	sipOutboundMu        sync.Mutex
+	sipOutboundRetries   map[string]*sipOutboundRetry
+	sipGatewayCallbackMu sync.Mutex
+	sipGatewayCallbacks  map[string]*sipGatewayCallback
 
 	// Some gateway channel hangups arrive without a matching OriginateResponse.
 	// Keep a bounded per-channel fallback so a physical FXO/GSM port cannot stay
@@ -99,6 +101,12 @@ type sipOutboundRetry struct {
 	CallerExt       string
 }
 
+type sipGatewayCallback struct {
+	SourceExtension string
+	Trunk           string
+	Stage           string
+}
+
 // New constructs a Server.
 func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 	s := &Server{
@@ -111,6 +119,7 @@ func New(cfg *config.Config, st *store.Store, log *logging.Logger) *Server {
 		log:                          log,
 		recentSIPInvites:             make(map[string]time.Time),
 		sipOutboundRetries:           make(map[string]*sipOutboundRetry),
+		sipGatewayCallbacks:          make(map[string]*sipGatewayCallback),
 		gatewayHangupFallback:        make(map[string]time.Time),
 		gatewayTransferCaptures:      make(map[string]*gatewayTransferCapture),
 		gatewayTransferPending:       make(map[string]*gatewayTransferPending),
@@ -427,6 +436,137 @@ func (s *Server) HandleNodeDoorEvent(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleNodeSIPGatewayCallback(w http.ResponseWriter, r *http.Request, node *store.Node, source, number, trunk, sourceMode, callerID string, timeout int) {
+	source = strings.TrimSpace(source)
+	number = strings.TrimSpace(number)
+	trunk = strings.TrimSpace(trunk)
+	if !isSafeDoorSIPExtension(source) || isReservedGatewayExtension(source) || !isSafeDialNumber(number) {
+		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "source_extension must be a handset extension and phone_number must contain 2-15 digits"})
+		return
+	}
+	if trunk == "" {
+		trunk = strings.TrimSpace(s.cfg.Asterisk.DefaultPSTNTrunk)
+		if trunk == "" {
+			trunk = "7009"
+		}
+	}
+	if !isSafeAsteriskName(trunk) {
+		writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid gateway trunk extension"})
+		return
+	}
+	sourceEP, err := s.store.GetSIPEndpointByExtension(source)
+	if err != nil {
+		s.log.Error("gateway callback source lookup failed", map[string]any{"source": source, "err": err.Error()})
+		writeNodeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	trunkEP, err := s.store.GetSIPEndpointByExtension(trunk)
+	if err != nil {
+		s.log.Error("gateway callback trunk lookup failed", map[string]any{"trunk": trunk, "err": err.Error()})
+		writeNodeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+		return
+	}
+	if sourceEP == nil || !sourceEP.Enabled || sourceEP.AccountID != node.AccountID || trunkEP == nil || !trunkEP.Enabled || trunkEP.AccountID != node.AccountID {
+		writeNodeJSON(w, http.StatusNotFound, map[string]any{"error": "source handset or gateway trunk is not configured for this site"})
+		return
+	}
+	if !s.asterisk.EndpointHasContacts(source) {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "source SIP handset is not registered", "source_extension": source})
+		return
+	}
+	if !s.isUsableOutboundGatewayTrunk(node.AccountID, trunk) {
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "outbound gateway trunk is offline or unavailable", "trunk": trunk})
+		return
+	}
+	for _, endpoint := range []struct{ extension, label string }{{source, "source SIP handset"}, {trunk, "gateway trunk"}} {
+		inUse, checkErr := s.asterisk.EndpointInUse(endpoint.extension)
+		if checkErr != nil {
+			s.log.Warn("could not verify SIP endpoint call state", map[string]any{"extension": endpoint.extension, "err": checkErr.Error()})
+			writeNodeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "could not verify that the SIP handset and gateway are available; retry shortly"})
+			return
+		}
+		if inUse {
+			writeNodeJSON(w, http.StatusConflict, map[string]any{"error": endpoint.label + " already has an active call", "extension": endpoint.extension})
+			return
+		}
+	}
+	for _, active := range s.calls.ListAll() {
+		if active == nil || active.AccountID != node.AccountID || (active.State != calls.StateRinging && active.State != calls.StateActive) {
+			continue
+		}
+		if active.FromNode == "sip:"+source {
+			writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "source SIP handset already has an active call", "source_extension": source, "call_id": active.ID})
+			return
+		}
+	}
+	acct, err := s.store.GetAccount(node.AccountID)
+	if err == nil && acct != nil && s.calls.CountActiveByAccount(node.AccountID) >= acct.MaxCalls {
+		writeNodeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "account call limit reached"})
+		return
+	}
+	if timeout < 5 {
+		timeout = 30
+	}
+	if timeout > 120 {
+		timeout = 120
+	}
+	mode := sanitizeAutoAnswerMode(sourceMode)
+	if mode == "" {
+		mode = "speaker"
+	}
+	callID := "call_" + uuid.NewString()
+	bridgeID := "simson-" + strings.TrimPrefix(callID, "call_")
+	s.sipGatewayCallbackMu.Lock()
+	for activeID, pending := range s.sipGatewayCallbacks {
+		if pending != nil && (pending.Trunk == trunk || pending.SourceExtension == source) {
+			s.sipGatewayCallbackMu.Unlock()
+			message := "source SIP handset or gateway trunk already has an automation call in progress"
+			writeNodeJSON(w, http.StatusConflict, map[string]any{"error": message, "trunk": trunk, "source_extension": source, "call_id": activeID})
+			return
+		}
+	}
+	s.sipGatewayCallbacks[callID] = &sipGatewayCallback{SourceExtension: source, Trunk: trunk, Stage: "source"}
+	s.sipGatewayCallbackMu.Unlock()
+	caller := firstNonBlank(callerID, sourceEP.Description, source)
+	call := &calls.Call{
+		ID: callID, FromNode: "sip:" + source, ToNode: "sip:" + number,
+		AccountID: node.AccountID, CallType: "sip", SIPBridgeID: bridgeID, CallerID: caller,
+	}
+	if !s.calls.Create(call) {
+		s.sipGatewayCallbackMu.Lock()
+		delete(s.sipGatewayCallbacks, callID)
+		s.sipGatewayCallbackMu.Unlock()
+		writeNodeJSON(w, http.StatusConflict, map[string]any{"error": "could not reserve call state; retry"})
+		return
+	}
+	rawDigits := digitsOnly(number)
+	preferred := normalizePSTNDigits(rawDigits, trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
+	dialCandidates := outboundGatewayDialCandidates(rawDigits, preferred, s.prefersLeadingZeroGatewayDial(node.AccountID, trunk))
+	s.setSIPOutboundRetry(callID, &sipOutboundRetry{
+		Numbers: dialCandidates, Trunk: trunk, BridgeID: bridgeID, CallerID: caller,
+		PostAnswerDTMF:  s.gatewayPostAnswerDTMF(node.AccountID, trunk),
+		MaxConnectedSec: endpointCallDurationForSource(trunkEP, source),
+		FromNode:        "automation:" + node.ID, CallerExt: source,
+	})
+	s.notifyCallStatus(call)
+	if _, err := s.asterisk.OriginateCallbackToBridge(source, s.cfg.Asterisk.NodeContext, bridgeID, caller, callID, mode, timeout); err != nil {
+		s.clearSIPOutboundRetry(callID)
+		s.sipGatewayCallbackMu.Lock()
+		delete(s.sipGatewayCallbacks, callID)
+		s.sipGatewayCallbackMu.Unlock()
+		if ended, ok := s.calls.End(callID, "originate_failed"); ok {
+			s.notifyCallStatus(ended)
+		}
+		s.asterisk.UntrackCall(callID)
+		writeNodeJSON(w, http.StatusBadGateway, map[string]any{"error": "could not call the source SIP handset"})
+		return
+	}
+	s.store.WriteAudit(node.AccountID, node.ID, "sip_gateway_callback",
+		fmt.Sprintf("call=%s source=%s trunk=%s number=%s mode=%s", callID, source, trunk, number, mode), extractIP(r))
+	s.log.Info("SIP handset gateway callback started", map[string]any{"call_id": callID, "source": source, "trunk": trunk, "number": number})
+	writeNodeJSON(w, http.StatusAccepted, map[string]any{"call_id": callID, "status": "calling_handset", "source_extension": source, "phone_number": number, "trunk": trunk})
+}
+
 // HandleNodeSIPIntercom starts an authenticated site-scoped SIP intercom bridge.
 //
 // This endpoint is used by the addon, Home Assistant services, and phone action
@@ -453,6 +593,8 @@ func (s *Server) HandleNodeSIPIntercom(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SourceExtension string `json:"source_extension"`
 		TargetExtension string `json:"target_extension"`
+		PhoneNumber     string `json:"phone_number"`
+		Trunk           string `json:"trunk"`
 		SourceAutoMode  string `json:"source_auto_mode"`
 		TargetAutoMode  string `json:"target_auto_mode"`
 		CallerID        string `json:"caller_id"`
@@ -464,6 +606,10 @@ func (s *Server) HandleNodeSIPIntercom(w http.ResponseWriter, r *http.Request) {
 			writeNodeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
 			return
 		}
+	}
+	if strings.TrimSpace(body.PhoneNumber) != "" {
+		s.handleNodeSIPGatewayCallback(w, r, node, body.SourceExtension, body.PhoneNumber, body.Trunk, body.SourceAutoMode, body.CallerID, body.TimeoutSec)
+		return
 	}
 	q := r.URL.Query()
 	if v := strings.TrimSpace(q.Get("source")); v != "" {
@@ -994,7 +1140,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// Send auth result.
 	authResult := protocol.NewEnvelope(protocol.TypeAuthResult, protocol.AuthResultPayload{
 		OK:              true,
-		ServerVersion:   "1.5.8",
+		ServerVersion:   "1.6.1",
 		ProtocolVersion: protocol.ProtocolVersion,
 		HeartbeatSec:    s.cfg.HeartbeatSec,
 	})
@@ -3622,6 +3768,10 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 	if !ok {
 		return
 	}
+	s.sipGatewayCallbackMu.Lock()
+	delete(s.sipGatewayCallbacks, callID)
+	s.sipGatewayCallbackMu.Unlock()
+	s.clearSIPOutboundRetry(callID)
 	s.finishSIPIntercomCallback(callID, "", false)
 	s.releaseSIPBridgeTransferForCall(c)
 	s.notifyCallStatus(c)
@@ -3692,6 +3842,9 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 // handleSIPOriginateResult is the AMI callback when an async Originate
 // (outbound call to an IP phone) either connects or fails.
 func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string) {
+	if s.handleSIPGatewayCallbackResult(callID, ok, reason) {
+		return
+	}
 	if s.handleAdvancedRouteOriginateResult(callID, ok, reason) {
 		return
 	}
@@ -3747,6 +3900,9 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 		}
 		c, ended := s.calls.End(callID, endReason)
 		if ended {
+			s.sipGatewayCallbackMu.Lock()
+			delete(s.sipGatewayCallbacks, callID)
+			s.sipGatewayCallbackMu.Unlock()
 			s.clearSIPOutboundRetry(callID)
 			s.finishSIPIntercomCallback(callID, "", true)
 			s.releaseSIPBridgeTransferForCall(c)
@@ -3771,6 +3927,39 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 				map[string]any{"call_id": callID, "reason": endReason})
 		}
 	}
+}
+
+func (s *Server) handleSIPGatewayCallbackResult(callID string, ok bool, reason string) bool {
+	s.sipGatewayCallbackMu.Lock()
+	callback := s.sipGatewayCallbacks[callID]
+	if callback == nil {
+		s.sipGatewayCallbackMu.Unlock()
+		return false
+	}
+	if callback.Stage == "source" && !ok {
+		delete(s.sipGatewayCallbacks, callID)
+		s.sipGatewayCallbackMu.Unlock()
+		s.clearSIPOutboundRetry(callID)
+		return false
+	}
+	if callback.Stage == "source" && ok {
+		callback.Stage = "gateway"
+		s.sipGatewayCallbackMu.Unlock()
+		s.log.Info("SIP gateway callback handset answered; originating PSTN leg", map[string]any{
+			"call_id": callID, "source": callback.SourceExtension,
+		})
+		if !s.trySIPPhoneOutboundGateway(callID) {
+			s.sipGatewayCallbackMu.Lock()
+			delete(s.sipGatewayCallbacks, callID)
+			s.sipGatewayCallbackMu.Unlock()
+		}
+		return true
+	}
+	s.sipGatewayCallbackMu.Unlock()
+	if callback.Stage == "gateway" {
+		return false
+	}
+	return false
 }
 
 func gatewayOriginateRetryAllowed(reason string) bool {
@@ -4397,6 +4586,10 @@ func (s *Server) StartBackgroundTasks() {
 			expired := s.calls.SweepExpired(callTimeout)
 			for _, c := range expired {
 				s.log.Info("call timed out", map[string]any{"call_id": c.ID})
+				s.sipGatewayCallbackMu.Lock()
+				delete(s.sipGatewayCallbacks, c.ID)
+				s.sipGatewayCallbackMu.Unlock()
+				s.clearSIPOutboundRetry(c.ID)
 				s.store.WriteAudit(c.AccountID, c.FromNode, "call_timeout", "call="+c.ID, "")
 				if c.CallType == "sip" && s.asterisk != nil {
 					_ = s.asterisk.HangupCall(c.ID)

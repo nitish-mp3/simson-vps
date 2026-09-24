@@ -56,7 +56,7 @@ type CallRequestPayload struct {
 	CallID     string          `json:"call_id"`
 	FromNodeID string          `json:"from_node_id"`
 	ToNodeID   string          `json:"to_node_id"`
-	CallType   string          `json:"call_type"` // "voice", "intercom", "sip"
+	CallType   string          `json:"call_type"` // "voice", "video", "intercom", "sip"
 	Metadata   json.RawMessage `json:"metadata,omitempty"`
 }
 

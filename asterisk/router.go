@@ -436,6 +436,32 @@ func (r *Router) OriginateToExtension(extension, context, bridgeExt, callerID, c
 	return actionID, nil
 }
 
+// OriginateCallbackToBridge calls a SIP handset with caller-side auto-answer
+// hints, then joins it to a Simson ConfBridge room after it answers.
+func (r *Router) OriginateCallbackToBridge(extension, context, bridgeExt, callerID, callID, sourceAutoMode string, timeoutSec int) (string, error) {
+	channel := fmt.Sprintf("Local/%s@from-simson-callback-source/n", extension)
+	actionID := uuid.NewString()
+	r.TrackPendingPrefix(callID, fmt.Sprintf("Local/%s@from-simson-callback-source-", extension))
+	r.TrackPendingPrefix(callID, fmt.Sprintf("PJSIP/%s-", extension))
+	r.originateMu.Lock()
+	r.actionIDToCallID[actionID] = callID
+	r.originateMu.Unlock()
+	vars := map[string]string{
+		"SIMSON_CALL_ID": callID, "__SIMSON_CALL_ID": callID,
+		"SIMSON_WAIT_TIMEOUT":       fmt.Sprintf("%d", timeoutSec),
+		"SIMSON_SOURCE_AUTO_MODE":   sourceAutoMode,
+		"__SIMSON_SOURCE_AUTO_MODE": sourceAutoMode,
+	}
+	_, err := r.ami.OriginateWithVars(channel, context, bridgeExt, callerID, timeoutSec*1000, actionID, vars)
+	if err != nil {
+		r.originateMu.Lock()
+		delete(r.actionIDToCallID, actionID)
+		r.originateMu.Unlock()
+		return "", err
+	}
+	return actionID, nil
+}
+
 // OriginateDoorStationCall calls an outdoor SIP station first and, once that
 // device auto-answers, dials the selected indoor SIP extension through a plain
 // Asterisk Dial bridge. Keeping this path outside ConfBridge preserves native
@@ -998,6 +1024,35 @@ func (r *Router) FindActiveEndpointChannel(extension string) (string, error) {
 	default:
 		return "", fmt.Errorf("SIP %s has multiple active calls; select a call explicitly", extension)
 	}
+}
+
+// EndpointInUse reports whether Asterisk currently has any live channel for an
+// exact PJSIP endpoint, including ringing and answered calls.
+func (r *Router) EndpointInUse(extension string) (bool, error) {
+	extension = strings.TrimSpace(extension)
+	if extension == "" || strings.ContainsAny(extension, "! \t\r\n") {
+		return false, fmt.Errorf("invalid endpoint extension")
+	}
+	output, err := r.ami.RunCommand("core show channels concise")
+	if err != nil {
+		return false, err
+	}
+	return endpointHasLiveChannel(output, extension), nil
+}
+
+func endpointHasLiveChannel(output, extension string) bool {
+	prefix := "PJSIP/" + strings.TrimSpace(extension) + "-"
+	for _, line := range strings.Split(output, "\n") {
+		parts := strings.Split(strings.TrimSpace(line), "!")
+		if len(parts) < 5 || !strings.HasPrefix(normalizeChannel(parts[0]), prefix) {
+			continue
+		}
+		state := strings.ToLower(strings.TrimSpace(parts[4]))
+		if state != "" && state != "down" && state != "hungup" {
+			return true
+		}
+	}
+	return false
 }
 
 func activeEndpointChannels(output, extension string) []string {

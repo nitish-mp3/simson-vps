@@ -68,6 +68,36 @@ func TestGatewayOriginateRetryAllowed(t *testing.T) {
 	}
 }
 
+func TestSIPGatewayCallbackRetriesTransientGatewayFailure(t *testing.T) {
+	s := &Server{sipGatewayCallbacks: map[string]*sipGatewayCallback{
+		"call-a": {SourceExtension: "1027", Trunk: "7009", Stage: "gateway"},
+	}}
+	if s.handleSIPGatewayCallbackResult("call-a", false, "transport_failure") {
+		t.Fatal("transient gateway result should continue through normal retry handling")
+	}
+	if s.sipGatewayCallbacks["call-a"] == nil {
+		t.Fatal("callback state must remain until gateway retry succeeds or definitively fails")
+	}
+	if s.handleSIPGatewayCallbackResult("call-a", false, "busy") {
+		t.Fatal("definitive busy result should use normal call failure handling")
+	}
+	if s.sipGatewayCallbacks["call-a"] == nil {
+		t.Fatal("gateway reservation must remain until normal call cleanup completes")
+	}
+}
+
+func TestSIPGatewayCallbackSourceFailureClearsCallbackState(t *testing.T) {
+	s := &Server{sipGatewayCallbacks: map[string]*sipGatewayCallback{
+		"call-a": {SourceExtension: "1027", Trunk: "7009", Stage: "source"},
+	}}
+	if s.handleSIPGatewayCallbackResult("call-a", false, "17") {
+		t.Fatal("source failure should continue through normal call failure handling")
+	}
+	if s.sipGatewayCallbacks["call-a"] != nil {
+		t.Fatal("source failure must clear callback state")
+	}
+}
+
 func TestStripOutboundTrunkPrefixSupportsShortIntercomExtension(t *testing.T) {
 	got := stripOutboundTrunkPrefix("7013198", "7013")
 	if got != "198" {

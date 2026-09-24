@@ -180,6 +180,23 @@ func TestActiveEndpointChannelsReturnsStableAmbiguousSet(t *testing.T) {
 	}
 }
 
+func TestEndpointHasLiveChannelMatchesExactExtensionAndRingingState(t *testing.T) {
+	output := strings.Join([]string{
+		"PJSIP/7009-000001!from-simson-out!9123208334!1!Up!Dial!PJSIP/9123208334@7009!7009!!!1.1!1.1!bridge-a!",
+		"PJSIP/7016-000002!from-simson-out!9123208334!1!Ringing!Dial!PJSIP/9123208334@7016!7016!!!2.1!2.1!bridge-b!",
+		"PJSIP/70090-000003!from-simson-out!9123208334!1!Up!Dial!PJSIP/9123208334@70090!70090!!!3.1!3.1!bridge-c!",
+	}, "\n")
+	if !endpointHasLiveChannel(output, "7009") {
+		t.Fatal("expected exact active gateway channel to be detected")
+	}
+	if !endpointHasLiveChannel(output, "7016") {
+		t.Fatal("expected ringing gateway channel to be detected")
+	}
+	if endpointHasLiveChannel(output, "700") {
+		t.Fatal("prefix collision must not count as an active endpoint channel")
+	}
+}
+
 func TestBridgeTransferOriginateFailureDoesNotReachParentCallCallback(t *testing.T) {
 	r := newTrackingOnlyRouter()
 	r.bridgeTransfers["transfer-action"] = pendingBridgeTransfer{
