@@ -38,6 +38,26 @@ Signaling-only control plane for the Simson HAOS addon system. Routes commands b
 | `admin/` | REST API for management |
 | `deploy/` | Caddy, systemd, deploy script |
 
+### Gateway dial prefixes
+
+`asterisk.gateway_dial_prefixes` prepends a digit prefix to the preferred
+outbound number for the named gateway extension. Alternate normalized number
+forms remain available to the existing retry path. Prefixes contain digits
+only and are scoped to their gateway:
+
+```json
+"gateway_dial_prefixes": {
+  "1701": "0"
+}
+```
+
+Omit the extension or use an empty map for gateways that do not need a prefix.
+
+For gateways that register but do not answer SIP OPTIONS, add only those
+extensions to `asterisk.no_qualify_endpoints`. Asterisk then uses the
+registration lifetime instead of OPTIONS to decide whether the contact is
+dialable. Other endpoints continue to use the normal qualify checks.
+
 ## Protocol
 
 All messages are JSON envelopes:

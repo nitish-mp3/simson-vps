@@ -145,7 +145,7 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":           "ok",
-		"server_version":   "1.6.1",
+		"server_version":   "1.6.9",
 		"protocol_version": "1.0.0",
 	})
 }
@@ -1931,6 +1931,9 @@ func (a *API) reconfigureAsterisk() {
 		DefaultPSTNTrunk:        a.cfg.Asterisk.DefaultPSTNTrunk,
 		TrustedGatewayIPs:       a.cfg.Asterisk.TrustedGatewayIPs,
 		NoAuthInboundExtensions: a.cfg.Asterisk.NoAuthInboundExtensions,
+		EndpointTransports:      a.cfg.Asterisk.EndpointTransports,
+		NoQualifyEndpoints:      a.cfg.Asterisk.NoQualifyEndpoints,
+		GatewayRTPTimeouts:      a.cfg.Asterisk.GatewayRTPTimeouts,
 		WebRTCUser:              webrtcUser,
 		WebRTCPass:              webrtcPass,
 	}, defs, a.log); err != nil {

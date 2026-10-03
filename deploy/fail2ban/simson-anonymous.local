@@ -1,0 +1,12 @@
+[simson-anonymous]
+enabled = true
+filter = simson-anonymous
+logpath = /var/log/asterisk/messages
+          /var/log/asterisk/simson_security
+backend = auto
+port = 5060,15060
+protocol = all
+banaction = iptables-allports
+maxretry = 6
+findtime = 60
+bantime = 3600

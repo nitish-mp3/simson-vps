@@ -10,6 +10,19 @@ import (
 	"github.com/nitish-mp3/simson-vps/logging"
 )
 
+func TestRegisteredContactStatusTreatsContactPresenceSeparatelyFromQualify(t *testing.T) {
+	for _, status := range []string{"Avail", "Unavail", "Unknown", "Reachable", "Registered", "NonQual"} {
+		if !isRegisteredContactStatus(status) {
+			t.Errorf("isRegisteredContactStatus(%q) = false, want true", status)
+		}
+	}
+	for _, status := range []string{"", "Expired", "Removed"} {
+		if isRegisteredContactStatus(status) {
+			t.Errorf("isRegisteredContactStatus(%q) = true, want false", status)
+		}
+	}
+}
+
 func TestCallIDForChannelUsesPendingPrefix(t *testing.T) {
 	r := newTrackingOnlyRouter()
 	r.TrackPendingPrefix("call-1", "PJSIP/1027-")
@@ -234,5 +247,52 @@ func newTrackingOnlyRouter() *Router {
 		callIDToChannelPrefix: make(map[string][]string),
 		actionIDToCallID:      make(map[string]string),
 		bridgeTransfers:       make(map[string]pendingBridgeTransfer),
+	}
+}
+
+func TestMauritius6202OriginateUsesSelectedTrunkOnMockAMIOnly(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	ami := &AMIClient{conn: clientConn, connected: true, pending: make(map[string]chan map[string]string)}
+	router := newTrackingOnlyRouter()
+	router.ami = ami
+	received := make(chan string, 1)
+	go func() {
+		serverConn.SetReadDeadline(time.Now().Add(time.Second))
+		reader := bufio.NewReader(serverConn)
+		var raw strings.Builder
+		var actionID string
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				received <- raw.String()
+				return
+			}
+			raw.WriteString(line)
+			if strings.HasPrefix(line, "ActionID: ") {
+				actionID = strings.TrimSpace(strings.TrimPrefix(line, "ActionID: "))
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		ami.pendingMu.Lock()
+		response := ami.pending[actionID]
+		ami.pendingMu.Unlock()
+		if response != nil {
+			response <- map[string]string{"Response": "Success"}
+		}
+		received <- raw.String()
+	}()
+	_, err := router.OriginateToTrunk("23059330025", "6202", "from-simson-out", "from-simson-node", "bridge-mock", "100", "call-mock", "office", "", "", 30, 120)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := <-received
+	for _, expected := range []string{"Action: Originate", "Channel: Local/23059330025@from-simson-out/n", "SIMSON_TRUNK=6202", "SIMSON_CALL_ID=call-mock", "Exten: bridge-mock", "Async: true"} {
+		if !strings.Contains(raw, expected) {
+			t.Fatalf("mock AMI action missing %q: %s", expected, raw)
+		}
 	}
 }

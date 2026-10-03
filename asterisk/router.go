@@ -1263,7 +1263,7 @@ func (r *Router) ContactStatuses() map[string]ContactStatus {
 			status = "Registered"
 		}
 		statuses[aor] = ContactStatus{
-			Registered: status == "Avail" || status == "Reachable" || status == "Registered",
+			Registered: isRegisteredContactStatus(status),
 			Status:     status,
 			URI:        uri,
 			Address:    contactAddress(uri),
@@ -1271,6 +1271,15 @@ func (r *Router) ContactStatuses() map[string]ContactStatus {
 		}
 	}
 	return statuses
+}
+
+func isRegisteredContactStatus(status string) bool {
+	switch status {
+	case "Avail", "Unavail", "Unknown", "Reachable", "Registered", "NonQual":
+		return true
+	default:
+		return false
+	}
 }
 
 // ---- AMI event dispatch -----------------------------------------------------

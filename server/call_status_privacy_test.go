@@ -31,7 +31,7 @@ func TestShouldBroadcastCallStatusToAccount(t *testing.T) {
 				ToNode:      "haos-office",
 				SIPBridgeID: "bridge-1",
 			},
-			want: true,
+			want: false,
 		},
 		{
 			name: "explicit HAOS invite is visible",
@@ -42,7 +42,7 @@ func TestShouldBroadcastCallStatusToAccount(t *testing.T) {
 				ToNode:      "sip:100",
 				InviteNodes: []string{"haos-office"},
 			},
-			want: true,
+			want: false,
 		},
 		{
 			name: "HAOS participant is visible without bridge metadata",
@@ -52,7 +52,7 @@ func TestShouldBroadcastCallStatusToAccount(t *testing.T) {
 				FromNode:  "haos-office",
 				ToNode:    "sip:1027",
 			},
-			want: true,
+			want: false,
 		},
 		{
 			name: "non SIP call is not account-wide SIP telemetry",

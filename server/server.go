@@ -436,6 +436,10 @@ func (s *Server) HandleNodeDoorEvent(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func sipGatewayCallbackBridgeID(callID string) string {
+	return "bridge-" + strings.TrimPrefix(callID, "call_")
+}
+
 func (s *Server) handleNodeSIPGatewayCallback(w http.ResponseWriter, r *http.Request, node *store.Node, source, number, trunk, sourceMode, callerID string, timeout int) {
 	source = strings.TrimSpace(source)
 	number = strings.TrimSpace(number)
@@ -515,7 +519,7 @@ func (s *Server) handleNodeSIPGatewayCallback(w http.ResponseWriter, r *http.Req
 		mode = "speaker"
 	}
 	callID := "call_" + uuid.NewString()
-	bridgeID := "simson-" + strings.TrimPrefix(callID, "call_")
+	bridgeID := sipGatewayCallbackBridgeID(callID)
 	s.sipGatewayCallbackMu.Lock()
 	for activeID, pending := range s.sipGatewayCallbacks {
 		if pending != nil && (pending.Trunk == trunk || pending.SourceExtension == source) {
@@ -541,7 +545,7 @@ func (s *Server) handleNodeSIPGatewayCallback(w http.ResponseWriter, r *http.Req
 	}
 	rawDigits := digitsOnly(number)
 	preferred := normalizePSTNDigits(rawDigits, trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
-	dialCandidates := outboundGatewayDialCandidates(rawDigits, preferred, s.prefersLeadingZeroGatewayDial(node.AccountID, trunk))
+	dialCandidates := outboundGatewayDialCandidates(rawDigits, s.prependGatewayDialPrefix(node.AccountID, trunk, preferred), s.prefersLeadingZeroGatewayDial(node.AccountID, trunk))
 	s.setSIPOutboundRetry(callID, &sipOutboundRetry{
 		Numbers: dialCandidates, Trunk: trunk, BridgeID: bridgeID, CallerID: caller,
 		PostAnswerDTMF:  s.gatewayPostAnswerDTMF(node.AccountID, trunk),
@@ -550,6 +554,12 @@ func (s *Server) handleNodeSIPGatewayCallback(w http.ResponseWriter, r *http.Req
 	})
 	s.notifyCallStatus(call)
 	if _, err := s.asterisk.OriginateCallbackToBridge(source, s.cfg.Asterisk.NodeContext, bridgeID, caller, callID, mode, timeout); err != nil {
+		s.log.Error("SIP gateway callback handset originate failed", map[string]any{
+			"call_id": callID,
+			"source":  source,
+			"trunk":   trunk,
+			"err":     err.Error(),
+		})
 		s.clearSIPOutboundRetry(callID)
 		s.sipGatewayCallbackMu.Lock()
 		delete(s.sipGatewayCallbacks, callID)
@@ -1140,7 +1150,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// Send auth result.
 	authResult := protocol.NewEnvelope(protocol.TypeAuthResult, protocol.AuthResultPayload{
 		OK:              true,
-		ServerVersion:   "1.6.1",
+		ServerVersion:   "1.6.9",
 		ProtocolVersion: protocol.ProtocolVersion,
 		HeartbeatSec:    s.cfg.HeartbeatSec,
 	})
@@ -1985,16 +1995,9 @@ func (s *Server) notifyCallStatus(c *calls.Call) {
 
 // shouldBroadcastCallStatusToAccount keeps ordinary PBX extension calls out of
 // Home Assistant. Direct SIP calls are tracked for hangup, transfer, and admin
-// observability, but only calls involving a HAOS node, an explicit HAOS invite,
-// or a Simson media bridge belong on account dashboards.
+// observability, while participant nodes receive their own status messages.
 func shouldBroadcastCallStatusToAccount(c *calls.Call) bool {
-	if c == nil || c.CallType != "sip" || c.AccountID == "" {
-		return false
-	}
-	if c.SIPBridgeID != "" || len(c.InviteNodes) > 0 {
-		return true
-	}
-	return !strings.HasPrefix(c.FromNode, "sip:") || !strings.HasPrefix(c.ToNode, "sip:")
+	return false
 }
 
 func (s *Server) notifyCallStatusToNode(nodeID string, c *calls.Call, status, reason, answeredBy string) {
@@ -2110,7 +2113,7 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 		rawDigits := digitsOnly(ext)
 		rawDigits = stripOutboundTrunkPrefix(rawDigits, trunk)
 		ext = normalizePSTNDigits(rawDigits, trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
-		dialCandidates = outboundGatewayDialCandidates(rawDigits, ext, s.prefersLeadingZeroGatewayDial(sess.AccountID, trunk))
+		dialCandidates = outboundGatewayDialCandidates(rawDigits, s.prependGatewayDialPrefix(sess.AccountID, trunk, ext), s.prefersLeadingZeroGatewayDial(sess.AccountID, trunk))
 	}
 
 	c := &calls.Call{
@@ -3132,7 +3135,7 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 	// variants so redial formats can recover from gateway/operator differences.
 	number := stripOutboundTrunkPrefix(rawDigits, trunk)
 	preferred := normalizePSTNDigits(number, trunk, s.cfg.Asterisk.DefaultPSTNTrunk)
-	numbers := outboundGatewayDialCandidates(number, preferred, s.prefersLeadingZeroGatewayDial(callerEP.AccountID, trunk))
+	numbers := outboundGatewayDialCandidates(number, s.prependGatewayDialPrefix(callerEP.AccountID, trunk, preferred), s.prefersLeadingZeroGatewayDial(callerEP.AccountID, trunk))
 	if len(numbers) == 0 || !isSafeDialNumber(numbers[0]) || !isSafeAsteriskName(trunk) {
 		s.log.Warn("rejecting unsafe SIP-phone outbound gateway dial",
 			map[string]any{"extension": in.Extension, "caller_ext": callerEP.Extension, "trunk": trunk})
@@ -3253,7 +3256,7 @@ func selectOutboundGatewayEndpoint(endpoints []store.SIPEndpoint, rawDigits, def
 	// different site's telephone line or a surprising fallback gateway.
 	for _, ep := range endpoints {
 		ext := strings.TrimSpace(ep.Extension)
-		if !ep.Enabled || !isGatewayLikeTrunk(ext, defaultTrunk) || !strings.HasPrefix(digits, digitsOnly(ext)) {
+		if !ep.Enabled || !isConfiguredGatewayEndpoint(ep, defaultTrunk) || !strings.HasPrefix(digits, digitsOnly(ext)) {
 			continue
 		}
 		rest := strings.TrimPrefix(digits, digitsOnly(ext))
@@ -3271,7 +3274,7 @@ func selectOutboundGatewayEndpoint(endpoints []store.SIPEndpoint, rawDigits, def
 	var accountDefault string
 	for _, ep := range endpoints {
 		ext := strings.TrimSpace(ep.Extension)
-		if !ep.Enabled || !isGatewayLikeTrunk(ext, defaultTrunk) || !available(ext) {
+		if !ep.Enabled || (!isGatewayLikeTrunk(ext, defaultTrunk) && !ep.DefaultOutbound) || !available(ext) {
 			continue
 		}
 		if ext == defaultTrunk {
@@ -3322,7 +3325,7 @@ func (s *Server) hasExplicitGatewayTrunkPrefix(accountID, rawDigits string) bool
 	}
 	for _, ep := range endpoints {
 		ext := strings.TrimSpace(ep.Extension)
-		if !ep.Enabled || !isGatewayLikeTrunk(ext, defaultTrunk) {
+		if !ep.Enabled || !isConfiguredGatewayEndpoint(ep, defaultTrunk) {
 			continue
 		}
 		if check(ext) {
@@ -3334,15 +3337,25 @@ func (s *Server) hasExplicitGatewayTrunkPrefix(accountID, rawDigits string) bool
 
 func (s *Server) isUsableOutboundGatewayTrunk(accountID, trunk string) bool {
 	trunk = strings.TrimSpace(trunk)
+	if !s.isConfiguredOutboundGatewayTrunk(accountID, trunk) {
+		return false
+	}
+	if s.asterisk != nil && s.asterisk.Connected() && !s.asterisk.EndpointHasContacts(trunk) {
+		s.log.Warn("outbound gateway trunk has no registered contact",
+			map[string]any{"account": accountID, "trunk": trunk})
+		return false
+	}
+	return true
+}
+
+func (s *Server) isConfiguredOutboundGatewayTrunk(accountID, trunk string) bool {
+	trunk = strings.TrimSpace(trunk)
 	if trunk == "" {
 		return false
 	}
 	defaultTrunk := strings.TrimSpace(s.cfg.Asterisk.DefaultPSTNTrunk)
 	if defaultTrunk == "" {
 		defaultTrunk = "7009"
-	}
-	if !isGatewayLikeTrunk(trunk, defaultTrunk) {
-		return false
 	}
 	ep, err := s.store.GetSIPEndpointByExtension(trunk)
 	if err != nil {
@@ -3353,12 +3366,17 @@ func (s *Server) isUsableOutboundGatewayTrunk(accountID, trunk string) bool {
 	if ep == nil || ep.AccountID != accountID || !ep.Enabled {
 		return false
 	}
-	if s.asterisk != nil && s.asterisk.Connected() && !s.asterisk.EndpointHasContacts(trunk) {
-		s.log.Warn("outbound gateway trunk has no registered contact",
-			map[string]any{"account": accountID, "trunk": trunk})
-		return false
+	return isConfiguredGatewayEndpoint(*ep, defaultTrunk)
+}
+
+func isConfiguredGatewayEndpoint(ep store.SIPEndpoint, defaultTrunk string) bool {
+	if isGatewayLikeTrunk(ep.Extension, defaultTrunk) || ep.DefaultOutbound || ep.GatewayIVREnabled {
+		return true
 	}
-	return true
+	if strings.TrimSpace(ep.GatewayInboundMode) != "" || strings.TrimSpace(ep.GatewayDirectTarget) != "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(ep.Description), "gateway")
 }
 
 func (s *Server) isLandlineGatewayTrunk(accountID, trunk string) bool {
@@ -3411,6 +3429,32 @@ func (s *Server) prefersLeadingZeroGatewayDial(accountID, trunk string) bool {
 	}, " "))
 	preferLeadingZero, _ := gatewayDialProfileFromMetadata(meta)
 	return preferLeadingZero
+}
+
+func (s *Server) prependGatewayDialPrefix(accountID, trunk, number string) string {
+	if s == nil || s.cfg == nil {
+		return number
+	}
+	trunk = strings.TrimSpace(trunk)
+	if trunk == "" {
+		return number
+	}
+	ep, err := s.store.GetSIPEndpointByExtension(trunk)
+	if err != nil || ep == nil || ep.AccountID != accountID {
+		return number
+	}
+	prefix := s.cfg.Asterisk.GatewayDialPrefixes[trunk]
+	digits := digitsOnly(number)
+	if prefix == "" || digits == "" {
+		return digits
+	}
+	if len(digits) == 12 && strings.HasPrefix(digits, "91") {
+		digits = digits[2:]
+	}
+	if strings.HasPrefix(digits, prefix) {
+		return digits
+	}
+	return prefix + digits
 }
 
 func (s *Server) gatewayPostAnswerDTMF(accountID, trunk string) string {
@@ -3747,7 +3791,7 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 	if call != nil && call.State == calls.StateRinging && s.isOutboundGatewayCall(call) && strings.HasPrefix(channel, "PJSIP/") {
 		callerExt := strings.TrimPrefix(call.FromNode, "sip:")
 		trunk := extractEndpointFromChannel(channel)
-		if isGatewayLikeTrunk(trunk, s.cfg.Asterisk.DefaultPSTNTrunk) {
+		if s.isConfiguredOutboundGatewayTrunk(call.AccountID, trunk) {
 			// Let the OriginateResponse drive retry/exhaustion. A few gateways emit
 			// only this channel hangup, though; the bounded fallback below prevents
 			// that missing response from leaving the physical port in use forever.
@@ -4436,6 +4480,9 @@ func (s *Server) configureAsteriskFromStore() {
 		DefaultPSTNTrunk:        s.cfg.Asterisk.DefaultPSTNTrunk,
 		TrustedGatewayIPs:       s.cfg.Asterisk.TrustedGatewayIPs,
 		NoAuthInboundExtensions: noAuthInbound,
+		EndpointTransports:      s.cfg.Asterisk.EndpointTransports,
+		NoQualifyEndpoints:      s.cfg.Asterisk.NoQualifyEndpoints,
+		GatewayRTPTimeouts:      s.cfg.Asterisk.GatewayRTPTimeouts,
 		WebRTCUser:              webrtcUser,
 		WebRTCPass:              webrtcPass,
 	}, defs, s.log); err != nil {

@@ -1,0 +1,13 @@
+/var/log/asterisk/simson_security {
+    daily
+    size 50M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 asterisk asterisk
+    postrotate
+        /usr/sbin/asterisk -rx "logger reload" > /dev/null 2>&1 || true
+    endscript
+}

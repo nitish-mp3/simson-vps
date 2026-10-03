@@ -155,6 +155,50 @@ func TestPJSIPEndpointCarriesServerAssignedAuthorizationIdentity(t *testing.T) {
 	}
 }
 
+func TestEndpointTransportOverrideSurvivesRegenerationAndStaysScoped(t *testing.T) {
+	root := t.TempDir()
+	cfg := SetupConfig{EndpointTransports: map[string]string{"1701": "simson-udp"}}
+	endpoints := []SIPEndpointDef{
+		{Extension: "1701", Username: "1701", Enabled: true},
+		{Extension: "7009", Username: "7009", Enabled: true},
+		{Extension: "2101", Username: "2101", Enabled: true},
+	}
+	for generation := 0; generation < 2; generation++ {
+		if err := writePJSIPConf(root, cfg, endpoints); err != nil {
+			t.Fatal(err)
+		}
+		generated := readTestFile(t, filepath.Join(root, "pjsip.d", "simson.conf"))
+		gateway := section(generated, "[1701](simson-ep-tpl)", "[1701-auth]")
+		if !strings.Contains(gateway, "transport=simson-udp\n") {
+			t.Fatal("gateway lost its explicit transport")
+		}
+		for _, extension := range []string{"7009", "2101"} {
+			unchanged := section(generated, "["+extension+"](simson-ep-tpl)", "["+extension+"-auth]")
+			if strings.Contains(unchanged, "transport=") {
+				t.Fatalf("transport override leaked into endpoint %s", extension)
+			}
+		}
+	}
+}
+
+func TestNoQualifyEndpointOverrideStaysScoped(t *testing.T) {
+	root := t.TempDir()
+	endpoints := []SIPEndpointDef{
+		{Extension: "6201", Username: "6201", Password: "test-secret", Enabled: true},
+		{Extension: "6202", Username: "6202", Password: "test-secret", Enabled: true},
+	}
+	if err := writePJSIPConf(root, SetupConfig{NoQualifyEndpoints: []string{"6201"}}, endpoints); err != nil {
+		t.Fatal(err)
+	}
+	pjsip := readTestFile(t, filepath.Join(root, "pjsip.d", "simson.conf"))
+	if !strings.Contains(section(pjsip, "[6201]\ntype=aor", "[6202]"), "qualify_frequency=0\n") {
+		t.Fatal("6201 must remain dialable without OPTIONS")
+	}
+	if !strings.Contains(pjsip, "[6202](simson-aor-tpl)\n") {
+		t.Fatal("6202 must retain normal qualify checks")
+	}
+}
+
 func TestGatewayEndpointsExpireStaleMediaLegs(t *testing.T) {
 	root := t.TempDir()
 	endpoints := []SIPEndpointDef{

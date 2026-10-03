@@ -20,6 +20,25 @@ func TestOutboundGatewayDialCandidatesIncludeLandlineMobilePrefix(t *testing.T) 
 	}
 }
 
+func TestMauritius6202DialingDoesNotApplyIndianPrefixes(t *testing.T) {
+	for _, input := range []string{"59330025", "23059330025"} {
+		digits := stripOutboundTrunkPrefix(input, "6202")
+		preferred := normalizePSTNDigits(digits, "6202", "7009")
+		got := outboundGatewayDialCandidates(digits, preferred, false)
+		if !reflect.DeepEqual(got, []string{input}) {
+			t.Fatalf("Mauritius dialing %q = %#v, want unchanged number only", input, got)
+		}
+	}
+}
+
+func TestSIPGatewayCallbackBridgeIDMatchesNodeDialplan(t *testing.T) {
+	got := sipGatewayCallbackBridgeID("call_309ba4a3-bf60-48aa-b9c3-0c5ba2315b5a")
+	want := "bridge-309ba4a3-bf60-48aa-b9c3-0c5ba2315b5a"
+	if got != want {
+		t.Fatalf("sipGatewayCallbackBridgeID() = %q, want %q", got, want)
+	}
+}
+
 func TestOutboundGatewayDialCandidatesPreferLandlineMobilePrefixForFXO(t *testing.T) {
 	got := outboundGatewayDialCandidates("919123208334", "9123208334", true)
 	want := []string{"09123208334", "9123208334", "919123208334"}
@@ -200,6 +219,22 @@ func TestGatewaySelectionDoesNotLeakDefaultTrunkAcrossAccounts(t *testing.T) {
 	}
 	if got := s.selectOutboundGatewayTrunk("site-a", "919123208334"); got != "7009" {
 		t.Fatalf("selectOutboundGatewayTrunk() = %q, want 7009", got)
+	}
+}
+
+func TestConfiguredCustomGatewayCanBeSelectedExplicitly(t *testing.T) {
+	ep := store.SIPEndpoint{
+		AccountID:   "site-a",
+		Extension:   "1701",
+		Description: "Gateway",
+		Enabled:     true,
+	}
+	if !isConfiguredGatewayEndpoint(ep, "7009") {
+		t.Fatal("configured gateway with a non-70 extension should be recognized")
+	}
+	got := selectOutboundGatewayEndpoint([]store.SIPEndpoint{ep}, "17019123208334", "7009", func(string) bool { return true })
+	if got != "1701" {
+		t.Fatalf("explicit custom gateway selection = %q, want 1701", got)
 	}
 }
 

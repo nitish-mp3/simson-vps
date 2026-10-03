@@ -27,21 +27,25 @@ type SIPWebRTCConfig struct {
 
 // AsteriskConfig holds settings for the optional central VPS Asterisk integration.
 type AsteriskConfig struct {
-	Enabled                 bool            `json:"enabled"`                    // false → AMI disabled
-	Host                    string          `json:"host"`                       // AMI host (default: 127.0.0.1)
-	Port                    int             `json:"port"`                       // AMI port  (default: 5038)
-	User                    string          `json:"user"`                       // AMI user name
-	Secret                  string          `json:"secret"`                     // AMI password
-	AutoConfigure           bool            `json:"auto_configure"`             // write pjsip/manager/dialplan conf on start
-	SIPDomain               string          `json:"sip_domain"`                 // hostname phones register to
-	ExternalIP              string          `json:"external_ip"`                // VPS public IP for RTP NAT (auto-detected if empty)
-	InContext               string          `json:"in_context"`                 // incoming-SIP dialplan context
-	NodeContext             string          `json:"node_context"`               // node-callback dialplan context
-	OutContext              string          `json:"out_context"`                // outbound PSTN/trunk dialplan context
-	DefaultPSTNTrunk        string          `json:"default_pstn_trunk"`         // fallback trunk for outside numbers entered as sip:+E164
-	TrustedGatewayIPs       []string        `json:"trusted_gateway_ips"`        // trusted SIP gateway public IPs for unauthenticated inbound INVITEs
-	NoAuthInboundExtensions []string        `json:"no_auth_inbound_extensions"` // gateway extensions that cannot digest-auth inbound INVITEs
-	SIPWebRTC               SIPWebRTCConfig `json:"sip_webrtc"`                 // shared browser SIP endpoint
+	Enabled                 bool              `json:"enabled"`                    // false → AMI disabled
+	Host                    string            `json:"host"`                       // AMI host (default: 127.0.0.1)
+	Port                    int               `json:"port"`                       // AMI port  (default: 5038)
+	User                    string            `json:"user"`                       // AMI user name
+	Secret                  string            `json:"secret"`                     // AMI password
+	AutoConfigure           bool              `json:"auto_configure"`             // write pjsip/manager/dialplan conf on start
+	SIPDomain               string            `json:"sip_domain"`                 // hostname phones register to
+	ExternalIP              string            `json:"external_ip"`                // VPS public IP for RTP NAT (auto-detected if empty)
+	InContext               string            `json:"in_context"`                 // incoming-SIP dialplan context
+	NodeContext             string            `json:"node_context"`               // node-callback dialplan context
+	OutContext              string            `json:"out_context"`                // outbound PSTN/trunk dialplan context
+	DefaultPSTNTrunk        string            `json:"default_pstn_trunk"`         // fallback trunk for outside numbers entered as sip:+E164
+	TrustedGatewayIPs       []string          `json:"trusted_gateway_ips"`        // trusted SIP gateway public IPs for unauthenticated inbound INVITEs
+	NoAuthInboundExtensions []string          `json:"no_auth_inbound_extensions"` // gateway extensions that cannot digest-auth inbound INVITEs
+	EndpointTransports      map[string]string `json:"endpoint_transports,omitempty"`
+	NoQualifyEndpoints      []string          `json:"no_qualify_endpoints,omitempty"`
+	GatewayDialPrefixes     map[string]string `json:"gateway_dial_prefixes,omitempty"`
+	GatewayRTPTimeouts      map[string]int    `json:"gateway_rtp_timeouts,omitempty"`
+	SIPWebRTC               SIPWebRTCConfig   `json:"sip_webrtc"` // shared browser SIP endpoint
 }
 
 // Config holds all server configuration.
@@ -135,6 +139,54 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxPayloadBytes < 1024 {
 		return fmt.Errorf("max_payload_bytes must be >= 1024")
+	}
+	for endpoint, transport := range c.Asterisk.EndpointTransports {
+		if endpoint == "" {
+			return fmt.Errorf("endpoint_transports contains an empty endpoint")
+		}
+		for _, character := range endpoint {
+			if !((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_') {
+				return fmt.Errorf("invalid endpoint_transports endpoint %q", endpoint)
+			}
+		}
+		switch transport {
+		case "simson-udp", "simson-udp-alt", "simson-tcp":
+		default:
+			return fmt.Errorf("unsupported transport %q for endpoint %q", transport, endpoint)
+		}
+	}
+	for _, endpoint := range c.Asterisk.NoQualifyEndpoints {
+		if endpoint == "" {
+			return fmt.Errorf("no_qualify_endpoints contains an empty endpoint")
+		}
+		for _, character := range endpoint {
+			if !((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_') {
+				return fmt.Errorf("invalid no_qualify_endpoints endpoint %q", endpoint)
+			}
+		}
+	}
+	for endpoint, prefix := range c.Asterisk.GatewayDialPrefixes {
+		if endpoint == "" {
+			return fmt.Errorf("gateway_dial_prefixes contains an empty endpoint")
+		}
+		for _, character := range endpoint {
+			if !((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_') {
+				return fmt.Errorf("invalid gateway_dial_prefixes endpoint %q", endpoint)
+			}
+		}
+		if len(prefix) > 8 {
+			return fmt.Errorf("gateway dial prefix for endpoint %q exceeds 8 digits", endpoint)
+		}
+		for _, character := range prefix {
+			if character < '0' || character > '9' {
+				return fmt.Errorf("gateway dial prefix for endpoint %q must contain digits only", endpoint)
+			}
+		}
+	}
+	for endpoint, timeout := range c.Asterisk.GatewayRTPTimeouts {
+		if endpoint == "" || timeout < 30 || timeout > 3600 {
+			return fmt.Errorf("invalid gateway RTP timeout for endpoint %q", endpoint)
+		}
 	}
 	return nil
 }

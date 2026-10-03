@@ -27,6 +27,9 @@ type SetupConfig struct {
 	DefaultPSTNTrunk        string   // registered gateway endpoint for SIP-phone outside dialing
 	TrustedGatewayIPs       []string // trusted SIP gateway public IPs for inbound INVITEs that cannot digest-auth
 	NoAuthInboundExtensions []string // gateway extensions that cannot digest-auth inbound INVITEs
+	EndpointTransports      map[string]string
+	NoQualifyEndpoints      []string
+	GatewayRTPTimeouts      map[string]int
 	// Shared SIP-over-WebSocket endpoint for browser SIP.js clients.
 	// Empty Username disables the webrtc-pool endpoint.
 	WebRTCUser string
@@ -318,6 +321,7 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 	// ── Global settings ──────────────────────────────────────────────────────
 	trustedGatewayIPs := normalizeIPList(cfg.TrustedGatewayIPs)
 	noAuthInbound := stringSet(cfg.NoAuthInboundExtensions)
+	noQualify := stringSet(cfg.NoQualifyEndpoints)
 	enableAnonymousIngress := len(noAuthInbound) > 0
 
 	// Prefer username matching first so registered phones authenticate normally.
@@ -465,6 +469,14 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 		}
 
 		fmt.Fprintf(&sb, "[%s](simson-ep-tpl)\nauth=%s-auth\noutbound_auth=%s-auth\naors=%s\nset_var=SIMSON_ENDPOINT_ID=%s\n", endpointID, endpointID, endpointID, aorName, endpointID)
+		if transport := cfg.EndpointTransports[endpointID]; transport != "" {
+			switch transport {
+			case "simson-udp", "simson-udp-alt", "simson-tcp":
+				fmt.Fprintf(&sb, "transport=%s\n", transport)
+			default:
+				return fmt.Errorf("unsupported transport %q for endpoint %q", transport, endpointID)
+			}
+		}
 		if ep.VideoEnabled {
 			sb.WriteString("allow=h264\n")
 		}
@@ -480,9 +492,19 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 					"100rel=no\n",
 			)
 		}
+		if timeout := cfg.GatewayRTPTimeouts[endpointID]; timeout != 0 {
+			if timeout < 30 || timeout > 3600 {
+				return fmt.Errorf("invalid gateway RTP timeout for endpoint %q", endpointID)
+			}
+			fmt.Fprintf(&sb, "rtp_timeout=%d\nrtp_timeout_hold=%d\n", timeout, timeout*3)
+		}
 		sb.WriteString("\n")
 		fmt.Fprintf(&sb, "[%s-auth](simson-auth-tpl)\nusername=%s\npassword=%s\n\n", endpointID, ep.Username, ep.Password)
-		fmt.Fprintf(&sb, "[%s](simson-aor-tpl)\n\n", aorName)
+		if _, ok := noQualify[endpointID]; ok {
+			fmt.Fprintf(&sb, "[%s]\ntype=aor\nmax_contacts=1\nremove_existing=yes\nqualify_frequency=0\n\n", aorName)
+		} else {
+			fmt.Fprintf(&sb, "[%s](simson-aor-tpl)\n\n", aorName)
+		}
 	}
 
 	if len(trustedGatewayIPs) > 0 && !enableAnonymousIngress {
