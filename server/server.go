@@ -102,9 +102,11 @@ type sipOutboundRetry struct {
 }
 
 type sipGatewayCallback struct {
-	SourceExtension string
-	Trunk           string
-	Stage           string
+	SourceExtension  string
+	Trunk            string
+	Stage            string
+	RingDeadline     time.Time
+	PeerMissingSince time.Time
 }
 
 // New constructs a Server.
@@ -529,12 +531,13 @@ func (s *Server) handleNodeSIPGatewayCallback(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	s.sipGatewayCallbacks[callID] = &sipGatewayCallback{SourceExtension: source, Trunk: trunk, Stage: "source"}
+	s.sipGatewayCallbacks[callID] = &sipGatewayCallback{SourceExtension: source, Trunk: trunk, Stage: "source", RingDeadline: time.Now().Add(time.Duration(timeout) * time.Second)}
 	s.sipGatewayCallbackMu.Unlock()
 	caller := firstNonBlank(callerID, sourceEP.Description, source)
 	call := &calls.Call{
 		ID: callID, FromNode: "sip:" + source, ToNode: "sip:" + number,
 		AccountID: node.AccountID, CallType: "sip", SIPBridgeID: bridgeID, CallerID: caller,
+		ControlNodeID: node.ID, SourceExtension: source, GatewayTrunk: trunk,
 	}
 	if !s.calls.Create(call) {
 		s.sipGatewayCallbackMu.Lock()
@@ -1150,7 +1153,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// Send auth result.
 	authResult := protocol.NewEnvelope(protocol.TypeAuthResult, protocol.AuthResultPayload{
 		OK:              true,
-		ServerVersion:   "1.6.9",
+		ServerVersion:   "1.6.10",
 		ProtocolVersion: protocol.ProtocolVersion,
 		HeartbeatSec:    s.cfg.HeartbeatSec,
 	})
@@ -1567,7 +1570,8 @@ func (s *Server) handleCallEnd(sess *hub.Session, env *protocol.Envelope) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeNotFound, "call not found")
 		return
 	}
-	if sess.NodeID != existing.FromNode && sess.NodeID != existing.ToNode && !existing.CanNodeAnswer(sess.NodeID) {
+	if sess.NodeID != existing.FromNode && sess.NodeID != existing.ToNode && !existing.CanNodeAnswer(sess.NodeID) &&
+		!(existing.ControlNodeID == sess.NodeID && existing.AccountID == sess.AccountID) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "not a participant")
 		return
 	}
@@ -1957,14 +1961,17 @@ func (s *Server) handleUsersQuery(sess *hub.Session, env *protocol.Envelope) {
 // notifyCallStatus sends a call.status to both participants.
 func (s *Server) notifyCallStatus(c *calls.Call) {
 	status := protocol.NewEnvelope(protocol.TypeCallStatus, protocol.CallStatusPayload{
-		CallID:      c.ID,
-		Status:      string(c.State),
-		Reason:      c.EndReason,
-		SIPBridgeID: c.SIPBridgeID,
-		FromNodeID:  c.FromNode,
-		ToNodeID:    c.ToNode,
-		CallerID:    c.CallerID,
-		CallType:    c.CallType,
+		CallID:          c.ID,
+		Status:          string(c.State),
+		Reason:          c.EndReason,
+		SIPBridgeID:     c.SIPBridgeID,
+		FromNodeID:      c.FromNode,
+		ToNodeID:        c.ToNode,
+		CallerID:        c.CallerID,
+		CallType:        c.CallType,
+		ControlNodeID:   c.ControlNodeID,
+		SourceExtension: c.SourceExtension,
+		Trunk:           c.GatewayTrunk,
 	})
 	data, _ := status.Encode()
 
@@ -1973,6 +1980,11 @@ func (s *Server) notifyCallStatus(c *calls.Call) {
 	}
 	if toSess := s.hub.Get(c.ToNode); toSess != nil {
 		toSess.Send(data)
+	}
+	if c.ControlNodeID != "" && c.ControlNodeID != c.FromNode && c.ControlNodeID != c.ToNode {
+		if controller := s.hub.Get(c.ControlNodeID); controller != nil && canSendCallbackTelemetry(c, controller.NodeID, controller.AccountID, controller.AddonVersion) {
+			controller.Send(data)
+		}
 	}
 	for _, nodeID := range c.InviteNodes {
 		if nodeID == "" || nodeID == c.FromNode || nodeID == c.ToNode {
@@ -3612,8 +3624,11 @@ func (s *Server) trySIPPhoneOutboundGateway(callID string) bool {
 		if c2, ended := s.calls.End(callID, "originate_failed"); ended {
 			s.notifyCallStatus(c2)
 		}
-		_ = s.asterisk.HangupCall(callID)
-		s.asterisk.UntrackCall(callID)
+		if cleanupErr := s.asterisk.HangupCall(callID); cleanupErr != nil {
+			s.log.Warn("gateway failure cleanup needs reconciliation", map[string]any{"call_id": callID, "err": cleanupErr.Error()})
+		} else {
+			s.asterisk.UntrackCall(callID)
+		}
 		return false
 	}
 
@@ -4599,6 +4614,13 @@ func (s *Server) StartBackgroundTasks() {
 	if s.asterisk != nil {
 		s.configureAsteriskFromStore()
 		go s.asteriskConnectLoop()
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				s.reconcileSIPGatewayCallbacks()
+			}
+		}()
 	}
 
 	// Heartbeat sweep.

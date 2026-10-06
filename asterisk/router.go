@@ -814,31 +814,11 @@ func (r *Router) CleanupOrphanSimsonChannels() (int, error) {
 
 func (r *Router) hangupCall(callID, exceptChannel string) error {
 	exceptChannel = normalizeChannel(exceptChannel)
-	channels := r.ChannelsForCall(callID)
-	for _, ch := range r.channelsWithCallID(callID) {
-		found := false
-		for _, existing := range channels {
-			if existing == ch {
-				found = true
-				break
-			}
-		}
-		if !found {
-			channels = append(channels, ch)
-		}
+	output, err := r.ami.RunCommand("core show channels concise")
+	if err != nil {
+		return err
 	}
-	for _, ch := range r.channelsWithPendingPrefixes(callID) {
-		found := false
-		for _, existing := range channels {
-			if existing == ch {
-				found = true
-				break
-			}
-		}
-		if !found {
-			channels = append(channels, ch)
-		}
-	}
+	channels := callCleanupChannels(output, callID, r.ChannelsForCall(callID), r.PendingPrefixesForCall(callID))
 	if len(channels) == 0 {
 		return nil
 	}
@@ -949,7 +929,7 @@ func (r *Router) channelsInBridge(bridgeID string) []string {
 		if len(parts) == 0 {
 			continue
 		}
-		ch := normalizeChannel(parts[0])
+		ch := strings.TrimSpace(parts[0])
 		if ch == "" {
 			continue
 		}
@@ -1082,20 +1062,14 @@ func activeEndpointChannels(output, extension string) []string {
 type conciseChannel struct {
 	name     string
 	base     string
-	linkedID string
 	bridgeID string
 }
 
-// endpointCleanupChannels returns the complete Asterisk call family rooted at
-// one PJSIP endpoint. core show channels concise fields 11 and 12 are the
-// Linkedid and BridgeId on supported Asterisk versions. Clearing only the
-// PJSIP leg can leave its Local/ConfBridge sibling alive and keep an analog
-// gateway off-hook indefinitely.
 func endpointCleanupChannels(output, extension string) []string {
 	extension = strings.TrimSpace(extension)
 	prefix := "PJSIP/" + extension + "-"
 	rows := make([]conciseChannel, 0)
-	linkedIDs := map[string]struct{}{}
+	families := map[string]struct{}{}
 	bridgeIDs := map[string]struct{}{}
 	selected := map[string]struct{}{}
 
@@ -1108,43 +1082,34 @@ func endpointCleanupChannels(output, extension string) []string {
 		if row.name == "" || row.base == "" {
 			continue
 		}
-		if len(parts) > 11 {
-			row.linkedID = strings.TrimSpace(parts[11])
-		}
 		if len(parts) > 12 {
 			row.bridgeID = strings.TrimSpace(parts[12])
 		}
 		rows = append(rows, row)
 		if strings.HasPrefix(row.base, prefix) {
 			selected[row.name] = struct{}{}
-			if row.linkedID != "" && row.linkedID != "0" {
-				linkedIDs[row.linkedID] = struct{}{}
-			}
+			families[row.base] = struct{}{}
 			if row.bridgeID != "" && row.bridgeID != "0" {
 				bridgeIDs[row.bridgeID] = struct{}{}
 			}
 		}
 	}
 
-	// Repeat because a linked Local channel may reveal a bridge shared with
-	// another leg that was not present on the original PJSIP row.
 	for changed := true; changed; {
 		changed = false
 		for _, row := range rows {
-			_, sameLinked := linkedIDs[row.linkedID]
+			_, sameFamily := families[row.base]
 			_, sameBridge := bridgeIDs[row.bridgeID]
-			if !sameLinked && !sameBridge {
+			if !sameFamily && !sameBridge {
 				continue
 			}
 			if _, exists := selected[row.name]; !exists {
 				selected[row.name] = struct{}{}
 				changed = true
 			}
-			if row.linkedID != "" && row.linkedID != "0" {
-				if _, exists := linkedIDs[row.linkedID]; !exists {
-					linkedIDs[row.linkedID] = struct{}{}
-					changed = true
-				}
+			if _, exists := families[row.base]; !exists {
+				families[row.base] = struct{}{}
+				changed = true
 			}
 			if row.bridgeID != "" && row.bridgeID != "0" {
 				if _, exists := bridgeIDs[row.bridgeID]; !exists {
@@ -1550,7 +1515,7 @@ func (r *Router) handleOriginateResponse(ev Event) {
 	})
 
 	if r.OnOriginateResult != nil {
-		r.OnOriginateResult(callID, ok, reason)
+		go r.OnOriginateResult(callID, ok, reason)
 	}
 }
 

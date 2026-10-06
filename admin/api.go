@@ -145,7 +145,7 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":           "ok",
-		"server_version":   "1.6.9",
+		"server_version":   "1.6.10",
 		"protocol_version": "1.0.0",
 	})
 }
@@ -1155,7 +1155,8 @@ func (a *API) handleDeleteSIPEndpoint(w http.ResponseWriter, r *http.Request) {
 // handleClearStuckSIPEndpoint is a guarded recovery action for a gateway or
 // SIP endpoint that remains marked in use after its call has ended.
 func (a *API) handleClearStuckSIPEndpoint(w http.ResponseWriter, r *http.Request) {
-	ep, err := a.store.GetSIPEndpoint(r.PathValue("id"))
+	accountID := strings.TrimSpace(r.PathValue("accountId"))
+	ep, err := a.resolveRecoveryEndpoint(accountID, r.PathValue("id"))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
@@ -1164,7 +1165,7 @@ func (a *API) handleClearStuckSIPEndpoint(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "SIP endpoint not found"})
 		return
 	}
-	if accountID := strings.TrimSpace(r.PathValue("accountId")); accountID != "" && ep.AccountID != accountID {
+	if accountID != "" && ep.AccountID != accountID {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "SIP endpoint not found"})
 		return
 	}
@@ -1181,8 +1182,27 @@ func (a *API) handleClearStuckSIPEndpoint(w http.ResponseWriter, r *http.Request
 	a.log.Info("cleared stuck SIP endpoint channels", map[string]any{"endpoint": ep.Extension, "cleared": cleared})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "extension": ep.Extension, "cleared": cleared,
-		"hardware_action_required": cleared == 0,
+		"already_clear":            cleared == 0,
+		"hardware_action_required": false,
 	})
+}
+
+func (a *API) resolveRecoveryEndpoint(accountID, identifier string) (*store.SIPEndpoint, error) {
+	identifier = strings.TrimSpace(identifier)
+	ep, err := a.store.GetSIPEndpoint(identifier)
+	if err != nil {
+		return nil, err
+	}
+	if ep != nil {
+		if accountID != "" && ep.AccountID != accountID {
+			return nil, nil
+		}
+		return ep, nil
+	}
+	if accountID != "" {
+		return a.store.GetSIPEndpointByAccountAndExtension(accountID, identifier)
+	}
+	return a.store.GetSIPEndpointByExtension(identifier)
 }
 
 // handleActiveCallInvite gives an authorised site operator a reliable control

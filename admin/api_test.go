@@ -25,6 +25,33 @@ func TestSafeSIPUsernameRejectsBrokenAORNames(t *testing.T) {
 	}
 }
 
+func TestRecoveryEndpointAcceptsIDsAndExtensionsWithoutCrossingAccounts(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "recovery.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, account := range []string{"site-a", "site-b"} {
+		if err := st.CreateAccount(account, account, 10, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.CreateSIPEndpoint(store.SIPEndpoint{ID: "endpoint-uuid", AccountID: "site-a", Extension: "3101", Username: "3101", Password: "test-password", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	api := &API{store: st}
+	for _, identifier := range []string{"endpoint-uuid", "3101"} {
+		ep, err := api.resolveRecoveryEndpoint("site-a", identifier)
+		if err != nil || ep == nil || ep.Extension != "3101" {
+			t.Fatalf("could not resolve %s: %v", identifier, err)
+		}
+		ep, err = api.resolveRecoveryEndpoint("site-b", identifier)
+		if err != nil || ep != nil {
+			t.Fatalf("cross-account recovery resolved %s", identifier)
+		}
+	}
+}
+
 func TestGatewayDirectRouteTargetsStayAccountScoped(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "gateway-targets.db"))
 	if err != nil {

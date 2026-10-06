@@ -18,19 +18,22 @@ const (
 
 // Call tracks a single in-flight call.
 type Call struct {
-	ID          string
-	FromNode    string
-	ToNode      string
-	InviteNodes []string
-	AccountID   string
-	CallType    string
-	SIPBridgeID string
-	CallerID    string
-	State       State
-	CreatedAt   time.Time
-	AnsweredAt  time.Time
-	EndedAt     time.Time
-	EndReason   string
+	ID              string
+	FromNode        string
+	ToNode          string
+	InviteNodes     []string
+	AccountID       string
+	CallType        string
+	SIPBridgeID     string
+	ControlNodeID   string
+	SourceExtension string
+	GatewayTrunk    string
+	CallerID        string
+	State           State
+	CreatedAt       time.Time
+	AnsweredAt      time.Time
+	EndedAt         time.Time
+	EndReason       string
 }
 
 // Manager tracks active calls in memory.
@@ -213,6 +216,22 @@ func (m *Manager) End(callID, reason string) (*Call, bool) {
 	return c, true
 }
 
+func (m *Manager) EndIfState(callID string, expected State, reason string) (*Call, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	call := m.calls[callID]
+	if call == nil || call.State != expected || (expected != StateRinging && expected != StateActive) {
+		return nil, false
+	}
+	call.State = StateEnded
+	if reason == "timeout" {
+		call.State = StateFailed
+	}
+	call.EndedAt = time.Now().UTC()
+	call.EndReason = reason
+	return call, true
+}
+
 // Get returns a call by ID.
 func (m *Manager) Get(callID string) *Call {
 	m.mu.RLock()
@@ -303,6 +322,18 @@ func (m *Manager) ListAll() []*Call {
 	out := make([]*Call, 0, len(m.calls))
 	for _, c := range m.calls {
 		out = append(out, c)
+	}
+	return out
+}
+
+func (m *Manager) Snapshots() []*Call {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Call, 0, len(m.calls))
+	for _, call := range m.calls {
+		copy := *call
+		copy.InviteNodes = append([]string(nil), call.InviteNodes...)
+		out = append(out, &copy)
 	}
 	return out
 }

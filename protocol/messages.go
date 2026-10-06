@@ -104,6 +104,9 @@ type CallStatusPayload struct {
 	ToNodeID         string `json:"to_node_id,omitempty"`
 	CallerID         string `json:"caller_id,omitempty"`
 	CallType         string `json:"call_type,omitempty"`
+	ControlNodeID    string `json:"control_node_id,omitempty"`
+	SourceExtension  string `json:"source_extension,omitempty"`
+	Trunk            string `json:"trunk,omitempty"`
 }
 
 // --- Error ---
