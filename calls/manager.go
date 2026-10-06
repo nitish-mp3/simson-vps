@@ -184,7 +184,7 @@ func (m *Manager) DeclineByNode(callID, nodeID, reason string) (*Call, bool, boo
 	}
 
 	switch reason {
-	case "error", "timeout", "phone_unavailable", "gateway_unavailable", "originate_failed":
+	case "error", "timeout", "phone_unavailable", "gateway_unavailable", "gateway_busy", "gateway_rejected", "originate_failed":
 		c.State = StateFailed
 	default:
 		c.State = StateEnded
@@ -206,7 +206,7 @@ func (m *Manager) End(callID, reason string) (*Call, bool) {
 		return c, false
 	}
 	switch reason {
-	case "error", "timeout", "phone_unavailable", "gateway_unavailable", "originate_failed":
+	case "error", "timeout", "phone_unavailable", "gateway_unavailable", "gateway_busy", "gateway_rejected", "originate_failed":
 		c.State = StateFailed
 	default:
 		c.State = StateEnded

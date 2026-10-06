@@ -145,7 +145,7 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":           "ok",
-		"server_version":   "1.6.10",
+		"server_version":   "1.6.11",
 		"protocol_version": "1.0.0",
 	})
 }
@@ -1184,6 +1184,8 @@ func (a *API) handleClearStuckSIPEndpoint(w http.ResponseWriter, r *http.Request
 		"ok": true, "extension": ep.Extension, "cleared": cleared,
 		"already_clear":            cleared == 0,
 		"hardware_action_required": false,
+		"hardware_checked":         false,
+		"message":                  "Server SIP channels checked/released. Physical gateway line status has not been checked or reset.",
 	})
 }
 

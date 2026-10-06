@@ -51,6 +51,7 @@ type Server struct {
 	// seized indefinitely while still allowing normal retry handling to win.
 	gatewayHangupFallbackMu sync.Mutex
 	gatewayHangupFallback   map[string]time.Time
+	gatewayFailures         map[string]gatewayFailure
 
 	// gatewayTransfer* handles account feature codes on SIP-to-gateway calls.
 	// Those calls use ConfBridge, so Asterisk's Dial()-only blind transfer hook
@@ -1153,7 +1154,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// Send auth result.
 	authResult := protocol.NewEnvelope(protocol.TypeAuthResult, protocol.AuthResultPayload{
 		OK:              true,
-		ServerVersion:   "1.6.10",
+		ServerVersion:   "1.6.11",
 		ProtocolVersion: protocol.ProtocolVersion,
 		HeartbeatSec:    s.cfg.HeartbeatSec,
 	})
@@ -3807,6 +3808,7 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 		callerExt := strings.TrimPrefix(call.FromNode, "sip:")
 		trunk := extractEndpointFromChannel(channel)
 		if s.isConfiguredOutboundGatewayTrunk(call.AccountID, trunk) {
+			s.recordGatewayFailure(callID, info.Cause)
 			// Let the OriginateResponse drive retry/exhaustion. A few gateways emit
 			// only this channel hangup, though; the bounded fallback below prevents
 			// that missing response from leaving the physical port in use forever.
@@ -3916,6 +3918,14 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 			s.log.Info("SIP outbound call answered", map[string]any{"call_id": callID})
 		}
 	} else {
+		if call := s.calls.Get(callID); s.isOutboundGatewayCall(call) && call.State == calls.StateRinging {
+			if reason == "0" || reason == "" {
+				time.Sleep(200 * time.Millisecond)
+			}
+			if failure := s.consumeGatewayFailure(callID); failure != "" {
+				reason = failure
+			}
+		}
 		// Map Asterisk reason code to a descriptive end reason.
 		endReason := "no_answer"
 		if c := s.calls.Get(callID); c != nil {
@@ -3949,6 +3959,8 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 			}
 		}
 		switch reason {
+		case "gateway_busy", "gateway_rejected":
+			endReason = reason
 		case "4", "17":
 			endReason = "busy"
 		case "0", "":
@@ -4023,7 +4035,7 @@ func (s *Server) handleSIPGatewayCallbackResult(callID string, ok bool, reason s
 
 func gatewayOriginateRetryAllowed(reason string) bool {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
-	case "", "0", "4", "16", "17", "busy", "user busy", "normal clearing", "gateway_channel_hangup_timeout":
+	case "", "0", "4", "16", "17", "21", "busy", "gateway_busy", "gateway_rejected", "user busy", "normal clearing", "gateway_channel_hangup_timeout":
 		return false
 	default:
 		return true
