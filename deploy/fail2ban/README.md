@@ -1,5 +1,15 @@
 # Anonymous SIP scan protection
 
+Named-extension `ChallengeResponseFailed` events are also matched using the real transport remote address. `ChallengeSent` and `SuccessfulAuth` are explicitly excluded. Six rejected attempts in five minutes ban the source for one hour; this covers slower scanners, not just bursts. Wrong saved credentials can still ban a site's public IP: investigate authentication failures before unbanning rather than disabling the protection. Never add permanent broad exemptions for dynamic client addresses.
+
+## Phone-side ghost calls
+
+A public SIP scanner may ring an exposed handset directly without contacting Asterisk. No VPS firewall can filter packets sent straight to the handset's LTE/WAN address. On Yealink phones enable **Features → General Information → Accept SIP Trust Server Only** (`sip.trust_ctrl = 1`). If direct IP calling is not needed, disable **Allow IP Call** (`features.direct_ip_call_enable = 0`). Keep the configured SIP server/outbound proxy correct; do not change passwords, transport or registration ports blindly. Apply this to phones at every site, not just extension 1024.
+
+Official references: [Yealink SIP trust](https://support.yealink.com/docs/sip-t73u/accept-the-sip-trust-server-only/21f6d35f4e3e4a05a6a9d9e2c590314e), [direct IP calls](https://support.yealink.com/docs/cp935w-base/ip-address-call/0d2e10b2557b45c9a2951e3325e126ed).
+
+VPS 1.6.12 requires an authenticated same-account PJSIP source for native direct SIP phone and callback-feature routes. Caller-ID text is never the authorization identity. Internal `Local` channels remain available for server-controlled callbacks/transfers; external SIP packets cannot create this channel type. Normal registered same-site gateways are included in the allowed source set. Direct call lifecycle auditing records source endpoint separately from the claimed caller ID, so subsequent ringing can be traced without full packet logging.
+
 Install `simson-anonymous.conf` in `/etc/fail2ban/filter.d/` and `simson-anonymous.local` in `/etc/fail2ban/jail.d/`. Validate with `fail2ban-client -t` and `fail2ban-regex` against representative rejected PJSIP messages before reload.
 
 This filter recognizes UDP/TCP source prefixes and file-log authentication failures which the installed legacy filter misses. It matches anonymous calls rejected by the locked-down anonymous context and failed PJSIP authentication, not successful registrations or permitted gateway ingress. Six such failures in a minute ban the source for one hour across protocols. Repeatedly incorrect credentials can therefore block a legitimate device's public IP too; correct its credentials before unbanning. Do not remove authentication or weaken the anonymous dialplan to quiet scanners.

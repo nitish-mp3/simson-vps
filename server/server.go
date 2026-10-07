@@ -172,6 +172,11 @@ func (s *Server) handleDirectSIPCall(event asterisk.DirectSIPCallEvent) {
 	if event.AccountID == "" || event.CallID == "" {
 		return
 	}
+	s.log.Info("direct SIP call lifecycle", map[string]any{
+		"call_id": event.CallID, "account_id": event.AccountID, "phase": event.Phase,
+		"source_endpoint": event.SourceEndpoint, "caller_id": event.Source,
+		"target": event.Target, "channel": event.Channel, "dial_status": event.DialStatus,
+	})
 	switch event.Phase {
 	case "ringing":
 		call := &calls.Call{
@@ -265,20 +270,7 @@ func (s *Server) HandleNodeWebRTCConfig(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	_ = node
-
-	iceServers := []map[string]any{}
-	for _, stun := range s.cfg.ICE.STUNServers {
-		iceServers = append(iceServers, map[string]any{"urls": stun})
-	}
-	if s.cfg.ICE.TURNEnabled && len(s.cfg.ICE.TURNURLs) > 0 {
-		entry := map[string]any{
-			"urls":       s.cfg.ICE.TURNURLs,
-			"username":   s.cfg.ICE.TURNUsername,
-			"credential": s.cfg.ICE.TURNSecret,
-		}
-		iceServers = append(iceServers, entry)
-	}
+	iceServers := s.cfg.ICE.Servers(node.ID, time.Now())
 
 	wsPath := s.cfg.Asterisk.SIPWebRTC.WSPath
 	if wsPath == "" {
@@ -1154,7 +1146,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// Send auth result.
 	authResult := protocol.NewEnvelope(protocol.TypeAuthResult, protocol.AuthResultPayload{
 		OK:              true,
-		ServerVersion:   "1.6.11",
+		ServerVersion:   "1.6.13",
 		ProtocolVersion: protocol.ProtocolVersion,
 		HeartbeatSec:    s.cfg.HeartbeatSec,
 	})

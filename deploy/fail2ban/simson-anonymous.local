@@ -8,5 +8,5 @@ port = 5060,15060
 protocol = all
 banaction = iptables-allports
 maxretry = 6
-findtime = 60
+findtime = 300
 bantime = 3600

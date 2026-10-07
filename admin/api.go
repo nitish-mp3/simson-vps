@@ -145,7 +145,7 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":           "ok",
-		"server_version":   "1.6.11",
+		"server_version":   "1.6.13",
 		"protocol_version": "1.0.0",
 	})
 }
@@ -1787,18 +1787,7 @@ func (a *API) handleAsteriskReloadDialplan(w http.ResponseWriter, r *http.Reques
 // that browser clients (cards) need to establish audio connections.
 func (a *API) handleGetWebRTCConfig(w http.ResponseWriter, r *http.Request) {
 	// Build ICE server list.
-	iceServers := []map[string]any{}
-	for _, s := range a.cfg.ICE.STUNServers {
-		iceServers = append(iceServers, map[string]any{"urls": s})
-	}
-	if a.cfg.ICE.TURNEnabled && len(a.cfg.ICE.TURNURLs) > 0 {
-		entry := map[string]any{
-			"urls":       a.cfg.ICE.TURNURLs,
-			"username":   a.cfg.ICE.TURNUsername,
-			"credential": a.cfg.ICE.TURNSecret,
-		}
-		iceServers = append(iceServers, entry)
-	}
+	iceServers := a.cfg.ICE.Servers("admin", time.Now())
 
 	// Build SIP config.
 	sipConfig := map[string]any{

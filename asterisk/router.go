@@ -39,13 +39,14 @@ type IntercomCallbackRequest struct {
 // These calls deliberately stay in Asterisk's native bridge; the event exists
 // only so site addons can display an accurate live-call roster.
 type DirectSIPCallEvent struct {
-	Phase      string
-	CallID     string
-	AccountID  string
-	Source     string
-	Target     string
-	Channel    string
-	DialStatus string
+	Phase          string
+	CallID         string
+	AccountID      string
+	Source         string
+	SourceEndpoint string
+	Target         string
+	Channel        string
+	DialStatus     string
 }
 
 // ContactStatus describes the live PJSIP registration/contact state for an AoR.
@@ -425,7 +426,7 @@ func (r *Router) OriginateToExtension(extension, context, bridgeExt, callerID, c
 		"__SIMSON_FROM_NODE":  fromNode,
 		"SIMSON_WAIT_TIMEOUT": fmt.Sprintf("%d", timeoutSec),
 	}
-	_, err := r.ami.OriginateWithVars(channel, context, bridgeExt, callerID, timeoutSec*1000, actionID, vars)
+	_, err := r.ami.OriginateWithVarsAndCodecs(channel, context, bridgeExt, callerID, timeoutSec*1000, actionID, vars, "ulaw,alaw,h264")
 	if err != nil {
 		r.originateMu.Lock()
 		delete(r.actionIDToCallID, actionID)
@@ -1293,13 +1294,14 @@ func (r *Router) onEvent(ev Event) {
 
 func (r *Router) handleSimsonDirectCall(ev Event) {
 	event := DirectSIPCallEvent{
-		Phase:      strings.ToLower(strings.TrimSpace(ev.Fields["Phase"])),
-		CallID:     strings.TrimSpace(ev.Fields["CallID"]),
-		AccountID:  strings.TrimSpace(ev.Fields["AccountID"]),
-		Source:     strings.TrimSpace(ev.Fields["Source"]),
-		Target:     strings.TrimSpace(ev.Fields["Target"]),
-		Channel:    normalizeChannel(ev.Fields["Channel"]),
-		DialStatus: strings.TrimSpace(ev.Fields["DialStatus"]),
+		Phase:          strings.ToLower(strings.TrimSpace(ev.Fields["Phase"])),
+		CallID:         strings.TrimSpace(ev.Fields["CallID"]),
+		AccountID:      strings.TrimSpace(ev.Fields["AccountID"]),
+		Source:         strings.TrimSpace(ev.Fields["Source"]),
+		SourceEndpoint: strings.TrimSpace(ev.Fields["SourceEndpoint"]),
+		Target:         strings.TrimSpace(ev.Fields["Target"]),
+		Channel:        normalizeChannel(ev.Fields["Channel"]),
+		DialStatus:     strings.TrimSpace(ev.Fields["DialStatus"]),
 	}
 	if event.CallID == "" || event.AccountID == "" || event.Source == "" || event.Target == "" {
 		r.log.Warn("SimsonDirectCall event missing required fields", map[string]any{"fields": ev.Fields})

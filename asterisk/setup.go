@@ -409,7 +409,7 @@ func writePJSIPConf(root string, cfg SetupConfig, endpoints []SIPEndpointDef) er
 			"transport=simson-ws\n" +
 			"context=from-simson-node\n" +
 			"disallow=all\n" +
-			"allow=ulaw\nallow=alaw\n" +
+			"allow=ulaw\nallow=alaw\nallow=h264\n" +
 			"direct_media=no\n" +
 			"rtp_symmetric=yes\n" +
 			"rtp_keepalive=2\n" +
@@ -573,7 +573,7 @@ func writeConfBridgeConf(root string) error {
 type=bridge
 max_members=10
 record_conference=no
-video_mode=none
+video_mode=follow_talker
 internal_sample_rate=8000
 mixing_interval=20
 
@@ -1230,6 +1230,7 @@ func buildSIPPhoneOutboundDialplan(defaultTrunk string) string {
 }
 
 func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
+	accountSources := endpointAccountSources(endpoints)
 	seen := map[string]struct{}{}
 	autoAnswer := map[string]SIPEndpointDef{}
 	for _, ep := range endpoints {
@@ -1255,9 +1256,10 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		}
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson direct SIP endpoint ${CALLERID(num)} -> ${EXTEN})\n", ext)
+		appendEndpointAccountGuard(&sb, accountSources[ep.AccountID])
 		sb.WriteString(" same  => n,Set(SIMSON_CALL_ID=direct-${UNIQUEID})\n")
 		sb.WriteString(" same  => n,Set(__SIMSON_CALL_ID=${SIMSON_CALL_ID})\n")
-		fmt.Fprintf(&sb, " same  => n,UserEvent(SimsonDirectCall,Phase: ringing,CallID: ${SIMSON_CALL_ID},AccountID: %s,Source: ${CALLERID(num)},Target: ${EXTEN},Channel: ${CHANNEL})\n", sanitizeID(ep.AccountID))
+		fmt.Fprintf(&sb, " same  => n,UserEvent(SimsonDirectCall,Phase: ringing,CallID: ${SIMSON_CALL_ID},AccountID: %s,Source: ${CALLERID(num)},SourceEndpoint: ${CHANNEL(pjsip,endpoint)},Target: ${EXTEN},Channel: ${CHANNEL})\n", sanitizeID(ep.AccountID))
 		sb.WriteString(" same  => n,Set(JITTERBUFFER(adaptive)=default)\n")
 		appendAccountTransferChannelVars(&sb, ep)
 		appendCallerPreRingAnnouncement(&sb, ep.PreRingAnnouncement)
@@ -1288,6 +1290,7 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		sb.WriteString(" same  => n,Hangup()\n")
 		if ep.CallbackBridge {
 			fmt.Fprintf(&sb, "exten => *%s,1,NoOp(Simson callback feature code ${CALLERID(num)} -> %s)\n", ext, ext)
+			appendEndpointAccountGuard(&sb, accountSources[ep.AccountID])
 			if aa, ok := autoAnswer[ext]; ok {
 				appendConditionalAutoAnswerMode(&sb, aa.AutoAnswerCallers, aa.AutoSpeaker, aa.AutoSpeakerCallers)
 			} else {

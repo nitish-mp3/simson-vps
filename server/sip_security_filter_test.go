@@ -43,3 +43,35 @@ func TestAnonymousRegisterSecurityFilterDoesNotMatchLegitimateAuthentication(t *
 		}
 	}
 }
+
+func TestNamedEndpointFailedChallengeFilterUsesRealRemoteAddress(t *testing.T) {
+	content, err := os.ReadFile("../deploy/fail2ban/simson-anonymous.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pattern string
+	for _, line := range strings.Split(string(content), "\n") {
+		if strings.Contains(line, `SecurityEvent="ChallengeResponseFailed"`) {
+			pattern = strings.TrimSpace(line)
+		}
+	}
+	matcher, err := regexp.Compile(strings.ReplaceAll(pattern, "<HOST>", `(?P<host>[0-9a-fA-F:.]+)`))
+	if err != nil || pattern == "" {
+		t.Fatalf("missing or invalid challenge failure pattern: %v", err)
+	}
+	base := `[Oct  6 12:00:00] SECURITY[100] res_security_log.c: SecurityEvent="ChallengeResponseFailed",EventTV="2026-10-06T12:00:00.000+0000",Severity="Error",Service="PJSIP",EventVersion="1",AccountID="1024",SessionID="test",LocalAddress="IPV4/UDP/10.0.0.83/5060",RemoteAddress="IPV4/UDP/203.0.113.99/5066",Challenge="test",Response="wrong",ExpectedResponse="expected"`
+	for _, line := range []string{base, strings.Replace(base, "IPV4/UDP/203.0.113.99/5066", "IPV6/TCP/2001:db8::99/5066", 1)} {
+		if !matcher.MatchString(line) {
+			t.Fatal("confirmed named-endpoint password failure not matched")
+		}
+	}
+	for _, line := range []string{
+		strings.Replace(base, "ChallengeResponseFailed", "SuccessfulAuth", 1),
+		strings.Replace(base, "ChallengeResponseFailed", "ChallengeSent", 1),
+		strings.Replace(base, `SessionID="test"`, `SessionID="spoof",RemoteAddress="IPV4/UDP/192.0.2.10/5066"`, 1),
+	} {
+		if matcher.MatchString(line) {
+			t.Fatal("successful auth, normal challenge or injected field matched")
+		}
+	}
+}

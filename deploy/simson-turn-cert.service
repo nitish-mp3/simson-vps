@@ -1,0 +1,6 @@
+[Unit]
+Description=Refresh Simson TURN TLS certificate from Caddy
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/simson-turn-renew simson-vps.vipsy.in

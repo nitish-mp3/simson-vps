@@ -9,11 +9,12 @@ import (
 
 // ICEConfig holds WebRTC ICE server settings published to clients via the API.
 type ICEConfig struct {
-	STUNServers  []string `json:"stun_servers"` // public STUN URIs (no auth)
-	TURNEnabled  bool     `json:"turn_enabled"`
-	TURNURLs     []string `json:"turn_urls"` // e.g. ["turn:vps.example.com:3478"]
-	TURNUsername string   `json:"turn_username"`
-	TURNSecret   string   `json:"turn_secret"` // static TURN credential (rotate periodically)
+	STUNServers    []string `json:"stun_servers"` // public STUN URIs (no auth)
+	TURNEnabled    bool     `json:"turn_enabled"`
+	TURNURLs       []string `json:"turn_urls"` // e.g. ["turn:vps.example.com:3478"]
+	TURNUsername   string   `json:"turn_username"`
+	TURNSecret     string   `json:"turn_secret"` // static TURN credential (rotate periodically)
+	TURNAuthSecret string   `json:"turn_auth_secret,omitempty"`
 }
 
 // SIPWebRTCConfig holds the shared SIP-over-WebSocket credentials used by browser clients.
