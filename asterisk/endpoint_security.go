@@ -33,7 +33,7 @@ func endpointAccountSources(endpoints []SIPEndpointDef) map[string]string {
 		sort.Strings(names)
 		clauses := make([]string, 0, len(names))
 		for _, identity := range names {
-			clauses = append(clauses, fmt.Sprintf("\"${CHANNEL(pjsip,endpoint)}\" = \"%s\"", identity))
+			clauses = append(clauses, fmt.Sprintf("\"${CHANNEL(endpoint)}\" = \"%s\"", identity))
 		}
 		result[account] = strings.Join(clauses, " | ")
 	}
@@ -46,7 +46,7 @@ func appendEndpointAccountGuard(builder *strings.Builder, allowed string) {
 	}
 	builder.WriteString(" same  => n,GotoIf($[\"${CHANNEL(channeltype)}\" = \"Local\"]?simson-source-ok)\n")
 	fmt.Fprintf(builder, " same  => n,GotoIf($[%s]?simson-source-ok)\n", allowed)
-	builder.WriteString(" same  => n,Log(WARNING,Simson denied SIP endpoint ${CHANNEL(pjsip,endpoint)} calling ${EXTEN} outside its account)\n")
+	builder.WriteString(" same  => n,Log(WARNING,Simson denied SIP endpoint ${CHANNEL(endpoint)} calling ${EXTEN} outside its account)\n")
 	builder.WriteString(" same  => n,Hangup(21)\n")
 	builder.WriteString(" same  => n(simson-source-ok),NoOp(Simson source authorized)\n")
 }

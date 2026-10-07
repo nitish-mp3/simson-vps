@@ -715,7 +715,7 @@ func writeDialplanConf(root, inCtx, nodeCtx, outCtx, defaultPSTNTrunk string, no
 exten => *100,1,NoOp(Simson: explicit HAOS card bypass from ${CALLERID(num)})
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
  same  => n,Set(JITTERBUFFER(adaptive)=default)
- same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
+ same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
  same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
  same  => n,Hangup()
 
@@ -726,14 +726,14 @@ exten => *100,1,NoOp(Simson: explicit HAOS card bypass from ${CALLERID(num)})
 exten => _+X.,1,NoOp(Simson: incoming E.164 SIP call to ${EXTEN} from ${CALLERID(num)})
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
  same  => n,Set(JITTERBUFFER(adaptive)=default)
- same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
+ same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
  same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
  same  => n,Hangup()
 
 exten => _X.,1,NoOp(Simson: incoming call to ${EXTEN} from ${CALLERID(num)})
  same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})
  same  => n,Set(JITTERBUFFER(adaptive)=default)
- same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
+ same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})
  same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_user)
  same  => n,Hangup()
 
@@ -1136,7 +1136,7 @@ func buildAnonymousInboundDialplan(extensions []string, endpoints []SIPEndpointD
 		seen[ext] = struct{}{}
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson anonymous gateway call to ${EXTEN} from ${CALLERID(num)})\n", ext)
 		sb.WriteString(" same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})\n")
-		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},GatewaySource: ${EXTEN},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
+		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(endpoint)},GatewaySource: ${EXTEN},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
 		if sound, ok := ivrByExt[ext]; ok {
 			fmt.Fprintf(&sb, " same  => n,Gosub(simson-gateway-announcement,s,1(%s))\n", sound)
 		}
@@ -1172,7 +1172,7 @@ func buildAdvancedIngressDialplan(endpoints []SIPEndpointDef) string {
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson advanced landing call ${CALLERID(num)} -> ${EXTEN})\n", ext)
 		sb.WriteString(" same  => n,Set(SIMSON_BRIDGE_ID=bridge-${UNIQUEID})\n")
 		sb.WriteString(" same  => n,Set(JITTERBUFFER(adaptive)=default)\n")
-		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(pjsip,endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
+		sb.WriteString(" same  => n,UserEvent(SimsonRoute,Extension: ${EXTEN},Caller: ${CALLERID(num)},CallerEndpoint: ${CHANNEL(endpoint)},UniqueID: ${UNIQUEID},Bridge: ${SIMSON_BRIDGE_ID},Channel: ${CHANNEL})\n")
 		sb.WriteString(" same  => n,ConfBridge(${SIMSON_BRIDGE_ID},simson_bridge,simson_waiting_user)\n")
 		sb.WriteString(" same  => n,Hangup()\n")
 	}
@@ -1259,7 +1259,7 @@ func buildDirectEndpointDialplan(endpoints []SIPEndpointDef) string {
 		appendEndpointAccountGuard(&sb, accountSources[ep.AccountID])
 		sb.WriteString(" same  => n,Set(SIMSON_CALL_ID=direct-${UNIQUEID})\n")
 		sb.WriteString(" same  => n,Set(__SIMSON_CALL_ID=${SIMSON_CALL_ID})\n")
-		fmt.Fprintf(&sb, " same  => n,UserEvent(SimsonDirectCall,Phase: ringing,CallID: ${SIMSON_CALL_ID},AccountID: %s,Source: ${CALLERID(num)},SourceEndpoint: ${CHANNEL(pjsip,endpoint)},Target: ${EXTEN},Channel: ${CHANNEL})\n", sanitizeID(ep.AccountID))
+		fmt.Fprintf(&sb, " same  => n,UserEvent(SimsonDirectCall,Phase: ringing,CallID: ${SIMSON_CALL_ID},AccountID: %s,Source: ${CALLERID(num)},SourceEndpoint: ${CHANNEL(endpoint)},Target: ${EXTEN},Channel: ${CHANNEL})\n", sanitizeID(ep.AccountID))
 		sb.WriteString(" same  => n,Set(JITTERBUFFER(adaptive)=default)\n")
 		appendAccountTransferChannelVars(&sb, ep)
 		appendCallerPreRingAnnouncement(&sb, ep.PreRingAnnouncement)
@@ -1482,7 +1482,7 @@ func appendAccountConferenceRoutes(sb *strings.Builder, endpoints []SIPEndpointD
 		for _, source := range accountMembers {
 			endpointName := sanitizeID(strings.TrimSpace(source.Username))
 			if endpointName != "" {
-				allowed = append(allowed, fmt.Sprintf("\"${CHANNEL(pjsip,endpoint)}\" = \"%s\"", endpointName))
+				allowed = append(allowed, fmt.Sprintf("\"${CHANNEL(endpoint)}\" = \"%s\"", endpointName))
 			}
 		}
 		if len(allowed) == 0 {
@@ -1658,7 +1658,7 @@ func buildSupervisionDialplan(endpoints []SIPEndpointDef) string {
 	for _, dialed := range keys {
 		fmt.Fprintf(&sb, "exten => %s,1,NoOp(Simson authorized call supervision dialed %s)\n", dialed, dialed)
 		sb.WriteString(" same  => n,Set(SIMSON_SUPERVISOR=${SIMSON_ENDPOINT_ID})\n")
-		sb.WriteString(" same  => n,ExecIf($[\"${SIMSON_SUPERVISOR}\" = \"\"]?Set(SIMSON_SUPERVISOR=${CHANNEL(pjsip,endpoint)}))\n")
+		sb.WriteString(" same  => n,ExecIf($[\"${SIMSON_SUPERVISOR}\" = \"\"]?Set(SIMSON_SUPERVISOR=${CHANNEL(endpoint)}))\n")
 		sb.WriteString(" same  => n,Set(SIMSON_CHANNEL_NAME=${CHANNEL(name)})\n")
 		sb.WriteString(" same  => n,Set(SIMSON_CHANNEL_RESOURCE=${CUT(SIMSON_CHANNEL_NAME,/,2)})\n")
 		sb.WriteString(" same  => n,Set(SIMSON_CHANNEL_ENDPOINT=${CUT(SIMSON_CHANNEL_RESOURCE,-,1)})\n")
@@ -1790,7 +1790,7 @@ func appendConditionalAutoAnswerMode(sb *strings.Builder, callers string, speake
 }
 
 func appendCallerIdentityVars(sb *strings.Builder) {
-	sb.WriteString(" same  => n,Set(SIMSON_CALLER_ENDPOINT=${CHANNEL(pjsip,endpoint)})\n")
+	sb.WriteString(" same  => n,Set(SIMSON_CALLER_ENDPOINT=${CHANNEL(endpoint)})\n")
 	sb.WriteString(" same  => n,Set(SIMSON_SOURCE_EXTENSION=${IF($[\"${SIMSON_SOURCE_EXTENSION}\" = \"\"]?${CALLERID(num)}:${SIMSON_SOURCE_EXTENSION})})\n")
 }
 

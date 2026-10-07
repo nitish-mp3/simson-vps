@@ -15,7 +15,7 @@ func TestDirectSIPEndpointsRequireAuthenticatedSameAccountSource(t *testing.T) {
 	}
 	allowed := endpointAccountSources(endpoints)["site-a"]
 	for _, identity := range []string{"1024", "1026", "1701"} {
-		if !strings.Contains(allowed, `"${CHANNEL(pjsip,endpoint)}" = "`+identity+`"`) {
+		if !strings.Contains(allowed, `"${CHANNEL(endpoint)}" = "`+identity+`"`) {
 			t.Fatalf("same-account endpoint %s missing", identity)
 		}
 	}
@@ -36,5 +36,19 @@ func TestDirectSIPEndpointsRequireAuthenticatedSameAccountSource(t *testing.T) {
 				t.Fatal("phone rang/callback emitted before source authorization")
 			}
 		}
+	}
+}
+
+func TestEndpointIdentityUsesAsteriskCompatibleChannelFunction(t *testing.T) {
+	endpoints := []SIPEndpointDef{
+		{Extension: "1024", AccountID: "site-a", Enabled: true, CallbackBridge: true, AdvancedIngress: true},
+		{Extension: "1603", AccountID: "site-a", Enabled: true},
+	}
+	generated := buildDirectEndpointDialplan(endpoints) + buildAdvancedIngressDialplan(endpoints) + buildAnonymousInboundDialplan([]string{"1701"}, endpoints)
+	if strings.Contains(generated, "CHANNEL(pjsip,endpoint)") {
+		t.Fatal("unsupported endpoint identity accessor would deny legitimate SIP calls")
+	}
+	if !strings.Contains(generated, "SourceEndpoint: ${CHANNEL(endpoint)}") || !strings.Contains(generated, "CallerEndpoint: ${CHANNEL(endpoint)}") {
+		t.Fatal("authenticated endpoint identity is missing from SIP lifecycle events")
 	}
 }
