@@ -1146,7 +1146,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// Send auth result.
 	authResult := protocol.NewEnvelope(protocol.TypeAuthResult, protocol.AuthResultPayload{
 		OK:              true,
-		ServerVersion:   "1.6.13",
+		ServerVersion:   "1.6.14",
 		ProtocolVersion: protocol.ProtocolVersion,
 		HeartbeatSec:    s.cfg.HeartbeatSec,
 	})

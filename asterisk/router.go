@@ -426,7 +426,7 @@ func (r *Router) OriginateToExtension(extension, context, bridgeExt, callerID, c
 		"__SIMSON_FROM_NODE":  fromNode,
 		"SIMSON_WAIT_TIMEOUT": fmt.Sprintf("%d", timeoutSec),
 	}
-	_, err := r.ami.OriginateWithVarsAndCodecs(channel, context, bridgeExt, callerID, timeoutSec*1000, actionID, vars, "ulaw,alaw,h264")
+	_, err := r.ami.OriginateWithVars(channel, context, bridgeExt, callerID, timeoutSec*1000, actionID, vars)
 	if err != nil {
 		r.originateMu.Lock()
 		delete(r.actionIDToCallID, actionID)
