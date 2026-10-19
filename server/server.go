@@ -41,10 +41,11 @@ type Server struct {
 	recentSIPInvitesMu sync.Mutex
 	recentSIPInvites   map[string]time.Time
 
-	sipOutboundMu        sync.Mutex
-	sipOutboundRetries   map[string]*sipOutboundRetry
-	sipGatewayCallbackMu sync.Mutex
-	sipGatewayCallbacks  map[string]*sipGatewayCallback
+	sipOutboundMu         sync.Mutex
+	sipOutboundRetries    map[string]*sipOutboundRetry
+	sipGatewayCallbackMu  sync.Mutex
+	sipGatewayCallbacks   map[string]*sipGatewayCallback
+	sipGatewayPeerMissing map[string]time.Time
 
 	// Some gateway channel hangups arrive without a matching OriginateResponse.
 	// Keep a bounded per-channel fallback so a physical FXO/GSM port cannot stay
@@ -103,11 +104,10 @@ type sipOutboundRetry struct {
 }
 
 type sipGatewayCallback struct {
-	SourceExtension  string
-	Trunk            string
-	Stage            string
-	RingDeadline     time.Time
-	PeerMissingSince time.Time
+	SourceExtension string
+	Trunk           string
+	Stage           string
+	RingDeadline    time.Time
 }
 
 // New constructs a Server.
@@ -1146,7 +1146,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// Send auth result.
 	authResult := protocol.NewEnvelope(protocol.TypeAuthResult, protocol.AuthResultPayload{
 		OK:              true,
-		ServerVersion:   "1.6.15",
+		ServerVersion:   "1.6.17",
 		ProtocolVersion: protocol.ProtocolVersion,
 		HeartbeatSec:    s.cfg.HeartbeatSec,
 	})
@@ -2122,12 +2122,13 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 	}
 
 	c := &calls.Call{
-		ID:          callID,
-		FromNode:    sess.NodeID,
-		ToNode:      "sip:" + ext, // virtual node ID for the SIP side
-		AccountID:   sess.AccountID,
-		CallType:    "sip",
-		SIPBridgeID: bridgeID,
+		ID:           callID,
+		FromNode:     sess.NodeID,
+		ToNode:       "sip:" + ext, // virtual node ID for the SIP side
+		AccountID:    sess.AccountID,
+		CallType:     "sip",
+		SIPBridgeID:  bridgeID,
+		GatewayTrunk: trunk,
 	}
 	if !s.calls.Create(c) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeBadRequest, "duplicate call ID")
@@ -2205,6 +2206,8 @@ func (s *Server) handleSIPCallRequest(sess *hub.Session, env *protocol.Envelope,
 			s.sendErrorSafe(sess, env.ID, protocol.ErrCodeInternal, "AMI originate failed")
 			return
 		}
+	} else if nativeVideoEndpoint(ep) {
+		_, err = s.asterisk.OriginateVideoToExtension(ext, bridgeID, callerID, callID, sess.NodeID, s.cfg.CallTimeoutSec)
 	} else {
 		_, err = s.asterisk.OriginateToExtension(
 			ext,
@@ -3166,12 +3169,14 @@ func (s *Server) handleSIPPhoneOutboundGateway(in asterisk.IncomingSIPCall, call
 
 	callID := "call_" + uuid.NewString()
 	c := &calls.Call{
-		ID:          callID,
-		FromNode:    "sip:" + callerEP.Extension,
-		ToNode:      "sip:" + number,
-		AccountID:   callerEP.AccountID,
-		CallType:    "sip",
-		SIPBridgeID: in.BridgeID,
+		ID:              callID,
+		FromNode:        "sip:" + callerEP.Extension,
+		ToNode:          "sip:" + number,
+		AccountID:       callerEP.AccountID,
+		CallType:        "sip",
+		SIPBridgeID:     in.BridgeID,
+		SourceExtension: callerEP.Extension,
+		GatewayTrunk:    trunk,
 	}
 	if !s.calls.Create(c) {
 		s.hangupAsteriskChannelAsync(in.Channel, "duplicate SIP-phone outbound gateway call")
@@ -3765,7 +3770,10 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 	}
 	call := s.calls.Get(callID)
 	if call != nil && strings.HasPrefix(channel, "Local/") && (call.State == calls.StateRinging || call.State == calls.StateActive) {
-		if s.isDirectGatewaySIPRoute(call) {
+		primary, _ := s.asterisk.ChannelForCall(callID)
+		if activeOutboundLocalHangup(call, channel, primary, s.cfg.Asterisk.OutContext) {
+			s.log.Info("answered outbound Local leg ended; releasing remaining participants", map[string]any{"call_id": callID, "channel": channel})
+		} else if s.isDirectGatewaySIPRoute(call) {
 			// Direct gateway routes use a Local channel as the target SIP bridge leg.
 			// If it hangs up, the original FXO/GSM caller must be cleared too.
 			s.log.Info("direct gateway SIP local bridge leg hung up; ending incoming bridge",
@@ -3830,29 +3838,34 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 	s.notifyCallStatus(c)
 
 	exceptChannel := channel
-	if s.isDirectGatewaySIPRoute(c) {
+	if s.isDirectGatewaySIPRoute(c) || s.isOutboundGatewayCall(c) || c.GatewayTrunk != "" {
 		// FXO/GSM gateways can keep the physical line seized if we exclude the
 		// channel that emitted Hangup while Asterisk is still unwinding Local/
 		// PJSIP bridge legs. For direct gateway routes, any side hanging up is
 		// final, so aggressively clear every tracked/bridged leg.
 		exceptChannel = ""
 	}
-	cleanupSIPBridge := func(attempt int) {
+	cleanupSIPBridge := func(attempt int) bool {
+		clean := true
 		if exceptChannel == "" {
 			if err := s.asterisk.HangupCall(callID); err != nil {
+				clean = false
 				s.log.Warn("failed to force hang up SIP bridge legs",
 					map[string]any{"call_id": callID, "attempt": attempt, "err": err.Error()})
 			}
 		} else if err := s.asterisk.HangupCallExcept(callID, exceptChannel); err != nil {
+			clean = false
 			s.log.Warn("failed to hang up remaining SIP bridge legs",
 				map[string]any{"call_id": callID, "channel": channel, "attempt": attempt, "err": err.Error()})
 		}
 		if c.SIPBridgeID != "" {
 			if err := s.asterisk.HangupBridge(c.SIPBridgeID, exceptChannel); err != nil {
+				clean = false
 				s.log.Warn("failed to hang up remaining ConfBridge legs",
 					map[string]any{"call_id": callID, "bridge": c.SIPBridgeID, "channel": channel, "attempt": attempt, "err": err.Error()})
 			}
 		}
+		return clean
 	}
 	if exceptChannel == "" {
 		// This runs on Asterisk's AMI event reader. Never call a synchronous AMI
@@ -3874,13 +3887,16 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 			startAttempt = 1
 			endAttempt = 3
 		}
+		clean := false
 		for attempt := startAttempt; attempt <= endAttempt; attempt++ {
 			if attempt > 1 {
 				time.Sleep(650 * time.Millisecond)
 			}
-			cleanupSIPBridge(attempt)
+			clean = cleanupSIPBridge(attempt)
 		}
-		s.asterisk.UntrackCall(callID)
+		if clean {
+			s.asterisk.UntrackCall(callID)
+		}
 	}()
 	s.log.Info("SIP call ended by channel hangup", map[string]any{
 		"call_id":    callID,
@@ -3908,6 +3924,8 @@ func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string)
 		if accepted {
 			s.notifyCallStatus(c)
 			s.log.Info("SIP outbound call answered", map[string]any{"call_id": callID})
+		} else {
+			s.releaseEndedSIPOriginate(callID)
 		}
 	} else {
 		if call := s.calls.Get(callID); s.isOutboundGatewayCall(call) && call.State == calls.StateRinging {
@@ -4622,7 +4640,7 @@ func (s *Server) StartBackgroundTasks() {
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
 			for range ticker.C {
-				s.reconcileSIPGatewayCallbacks()
+				s.reconcileOutboundGatewayCalls()
 			}
 		}()
 	}

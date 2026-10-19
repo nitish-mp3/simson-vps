@@ -46,6 +46,7 @@ type AsteriskConfig struct {
 	NoQualifyEndpoints      []string          `json:"no_qualify_endpoints,omitempty"`
 	GatewayDialPrefixes     map[string]string `json:"gateway_dial_prefixes,omitempty"`
 	GatewayRTPTimeouts      map[string]int    `json:"gateway_rtp_timeouts,omitempty"`
+	GatewayPeerGraceSec     int               `json:"gateway_peer_grace_sec"`
 	SIPWebRTC               SIPWebRTCConfig   `json:"sip_webrtc"` // shared browser SIP endpoint
 }
 
@@ -82,13 +83,14 @@ func DefaultConfig() *Config {
 		MaxPayloadBytes:    65536,
 		AdminToken:         "",
 		Asterisk: AsteriskConfig{
-			Enabled:          false,
-			Host:             "127.0.0.1",
-			Port:             5038,
-			InContext:        "from-simson-sip",
-			NodeContext:      "from-simson-node",
-			OutContext:       "from-simson-out",
-			DefaultPSTNTrunk: "7009",
+			Enabled:             false,
+			Host:                "127.0.0.1",
+			Port:                5038,
+			InContext:           "from-simson-sip",
+			NodeContext:         "from-simson-node",
+			OutContext:          "from-simson-out",
+			DefaultPSTNTrunk:    "7009",
+			GatewayPeerGraceSec: 20,
 			SIPWebRTC: SIPWebRTCConfig{
 				Enabled:  false,
 				Username: "webrtc-pool",
@@ -132,6 +134,9 @@ func (c *Config) finalise() {
 
 // Validate performs basic sanity checks.
 func (c *Config) Validate() error {
+	if c.Asterisk.GatewayPeerGraceSec < 5 || c.Asterisk.GatewayPeerGraceSec > 300 {
+		return fmt.Errorf("gateway_peer_grace_sec must be between 5 and 300")
+	}
 	if c.AdminToken == "" {
 		return fmt.Errorf("admin_token must be set")
 	}

@@ -27,30 +27,6 @@ func canSendCallbackTelemetry(call *calls.Call, nodeID, accountID, version strin
 	return values[0] > 5 || values[0] == 5 && (values[1] > 1 || values[1] == 1 && values[2] >= 8)
 }
 
-func callbackRecoveryReason(call *calls.Call, callback *sipGatewayCallback, participants int, now time.Time) string {
-	if call == nil || callback == nil {
-		return ""
-	}
-	if call.State == calls.StateRinging && !callback.RingDeadline.IsZero() && !now.Before(callback.RingDeadline) {
-		return "timeout"
-	}
-	if call.State != calls.StateActive || callback.Stage != "gateway" {
-		return ""
-	}
-	if participants >= 2 {
-		callback.PeerMissingSince = time.Time{}
-		return ""
-	}
-	if callback.PeerMissingSince.IsZero() {
-		callback.PeerMissingSince = now
-		return ""
-	}
-	if now.Sub(callback.PeerMissingSince) >= 20*time.Second {
-		return "callback_peer_missing"
-	}
-	return ""
-}
-
 func callbackBridgeParticipants(output, bridgeID string) (int, bool) {
 	participants := 0
 	callbackSource := false
@@ -70,26 +46,61 @@ func callbackBridgeParticipants(output, bridgeID string) (int, bool) {
 	return participants, callbackSource
 }
 
-func (s *Server) reconcileSIPGatewayCallbacks() {
+func (s *Server) reconcileOutboundGatewayCalls() {
 	if s.asterisk == nil || !s.asterisk.Connected() {
+		s.resetGatewayPeerObservations()
 		return
 	}
 	output, err := s.asterisk.RunCommand("core show channels concise")
 	if err != nil {
-		s.log.Warn("callback reconciliation could not inspect Asterisk", map[string]any{"err": err.Error()})
+		s.resetGatewayPeerObservations()
+		s.log.Warn("gateway reconciliation could not inspect Asterisk", map[string]any{"err": err.Error()})
 		return
 	}
+	if !validGatewaySnapshot(output) {
+		s.resetGatewayPeerObservations()
+		s.log.Warn("gateway reconciliation skipped an incomplete channel snapshot", nil)
+		return
+	}
+	grace := 20 * time.Second
+	if s.cfg != nil && s.cfg.Asterisk.GatewayPeerGraceSec >= 5 {
+		grace = time.Duration(s.cfg.Asterisk.GatewayPeerGraceSec) * time.Second
+	}
+	observed := make(map[string]bool)
 	for _, call := range s.calls.Snapshots() {
 		if call.CallType != "sip" || call.SIPBridgeID == "" {
 			continue
 		}
-		participants, hasSource := callbackBridgeParticipants(output, call.SIPBridgeID)
+		participants, _ := callbackBridgeParticipants(output, call.SIPBridgeID)
 		s.sipGatewayCallbackMu.Lock()
-		callback := s.sipGatewayCallbacks[call.ID]
-		reason := callbackRecoveryReason(call, callback, participants, time.Now())
+		var callback *sipGatewayCallback
+		if current := s.sipGatewayCallbacks[call.ID]; current != nil {
+			copy := *current
+			callback = &copy
+		}
 		s.sipGatewayCallbackMu.Unlock()
+		if callback == nil && call.GatewayTrunk == "" && !s.isOutboundGatewayCall(call) {
+			continue
+		}
+		s.gatewayTransferMu.Lock()
+		transferring := s.gatewayTransferPending[call.ID] != nil
+		s.gatewayTransferMu.Unlock()
+		if transferring {
+			continue
+		}
+		channels := s.asterisk.CallChannelsFromSnapshot(output, call.ID, call.SIPBridgeID)
+		healthy := gatewayPeerHealthy(output, channels, call.GatewayTrunk, participants)
+		s.sipGatewayCallbackMu.Lock()
+		if s.sipGatewayPeerMissing == nil {
+			s.sipGatewayPeerMissing = make(map[string]time.Time)
+		}
+		missingSince := s.sipGatewayPeerMissing[call.ID]
+		reason := gatewayRecoveryReason(call, callback, healthy, &missingSince, time.Now(), grace)
+		s.sipGatewayPeerMissing[call.ID] = missingSince
+		s.sipGatewayCallbackMu.Unlock()
+		observed[call.ID] = call.State == calls.StateActive
 		terminal := call.State == calls.StateEnded || call.State == calls.StateFailed
-		if reason == "" && !(terminal && hasSource) {
+		if reason == "" && !(terminal && len(channels) > 0) {
 			continue
 		}
 		if reason != "" {
@@ -98,16 +109,29 @@ func (s *Server) reconcileSIPGatewayCallbacks() {
 				continue
 			}
 			s.notifyCallStatus(ended)
+			s.finishSIPIntercomCallback(call.ID, "", false)
+			s.releaseSIPBridgeTransferForCall(ended)
 		}
 		s.clearSIPOutboundRetry(call.ID)
 		s.sipGatewayCallbackMu.Lock()
 		delete(s.sipGatewayCallbacks, call.ID)
 		s.sipGatewayCallbackMu.Unlock()
 		if err := s.asterisk.HangupCall(call.ID); err != nil {
-			s.log.Warn("callback reconciliation cleanup failed", map[string]any{"call_id": call.ID, "err": err.Error()})
+			s.log.Warn("gateway reconciliation cleanup failed", map[string]any{"call_id": call.ID, "err": err.Error()})
+			continue
+		}
+		if err := s.asterisk.HangupBridge(call.SIPBridgeID, ""); err != nil {
+			s.log.Warn("gateway reconciliation bridge cleanup failed", map[string]any{"call_id": call.ID, "err": err.Error()})
 			continue
 		}
 		s.asterisk.UntrackCall(call.ID)
-		s.log.Info("callback channels automatically released", map[string]any{"call_id": call.ID, "reason": reason})
+		s.log.Info("gateway call channels automatically released", map[string]any{"call_id": call.ID, "reason": reason})
 	}
+	s.sipGatewayCallbackMu.Lock()
+	for callID := range s.sipGatewayPeerMissing {
+		if !observed[callID] {
+			delete(s.sipGatewayPeerMissing, callID)
+		}
+	}
+	s.sipGatewayCallbackMu.Unlock()
 }

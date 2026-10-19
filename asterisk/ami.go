@@ -321,7 +321,18 @@ func (a *AMIClient) RunCommand(cmd string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return resp["Output"] + resp["Message"], nil
+	if resp["Response"] == "Error" {
+		return "", fmt.Errorf("AMI command failed: %s", resp["Message"])
+	}
+	_, hasOutput := resp["Output"]
+	if resp["Response"] == "Follows" || hasOutput || resp["Message"] == "Command output follows" {
+		output := resp["Output"]
+		if !strings.Contains(output, "--END COMMAND--") {
+			output += "\n--END COMMAND--"
+		}
+		return output, nil
+	}
+	return resp["Message"], nil
 }
 
 // ---- internal ---------------------------------------------------------------
@@ -436,6 +447,13 @@ func (a *AMIClient) readBlock() (map[string]string, error) {
 			if len(block) > 0 {
 				return block, nil
 			}
+			continue
+		}
+		if line == "--END COMMAND--" {
+			if block["Output"] != "" {
+				block["Output"] += "\n"
+			}
+			block["Output"] += line
 			continue
 		}
 		idx := strings.IndexByte(line, ':')

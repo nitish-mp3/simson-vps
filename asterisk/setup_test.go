@@ -47,6 +47,17 @@ func TestDoorStationVideoIsOptInAndDialplanExists(t *testing.T) {
 	}
 
 	dialplan := readTestFile(t, filepath.Join(root, "extensions.d", "simson.conf"))
+	if !strings.Contains(dialplan, "ConfBridge(${EXTEN},simson_video_bridge,simson_video_source)") {
+		t.Fatal("native video source must enter its own marked-source conference profile")
+	}
+	if err := writeConfBridgeConf(root); err != nil {
+		t.Fatal(err)
+	}
+	conference := readTestFile(t, filepath.Join(root, "confbridge.conf.d", "simson.conf"))
+	if !strings.Contains(section(conference, "[simson_video_bridge]", "[simson_video_source]"), "video_mode=first_marked") ||
+		!strings.Contains(section(conference, "[simson_video_source]", "[simson_user]"), "marked=yes") {
+		t.Fatal("native camera video must stay selected while the browser user speaks")
+	}
 	if !strings.Contains(dialplan, "[from-simson-door]") || !strings.Contains(dialplan, "Dial(PJSIP/${EXTEN}") {
 		t.Fatal("native door station bridge dialplan missing")
 	}

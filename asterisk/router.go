@@ -124,6 +124,7 @@ type Router struct {
 	chanToCallID          map[string]string   // asterisk channel → simson call ID
 	callIDToChan          map[string]string   // simson call ID  → asterisk channel
 	callIDToChannelPrefix map[string][]string // simson call ID → probable ringing channel prefixes
+	boundCalls            map[string]bool
 
 	// async originate tracking
 	originateMu      sync.Mutex
@@ -320,6 +321,10 @@ func (r *Router) TrackCall(callID, channel string) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.boundCalls == nil {
+		r.boundCalls = make(map[string]bool)
+	}
+	r.boundCalls[callID] = true
 	r.chanToCallID[channel] = callID
 	r.callIDToChan[callID] = channel
 }
@@ -351,6 +356,7 @@ func (r *Router) UntrackCall(callID string) {
 	}
 	delete(r.callIDToChan, callID)
 	delete(r.callIDToChannelPrefix, callID)
+	delete(r.boundCalls, callID)
 }
 
 // ChannelForCall returns the Asterisk channel for a Simson call ID.
@@ -708,6 +714,9 @@ func (r *Router) HangupCallExcept(callID, exceptChannel string) error {
 // inside one of those callbacks deadlocks the reader until its timeout expires.
 func (r *Router) HangupTrackedCallNoWait(callID, exceptChannel string) error {
 	exceptChannel = normalizeChannel(exceptChannel)
+	r.mu.Lock()
+	delete(r.callIDToChannelPrefix, callID)
+	r.mu.Unlock()
 	channels := r.ChannelsForCall(callID)
 	if len(channels) == 0 {
 		return nil
@@ -724,8 +733,14 @@ func (r *Router) HangupTrackedCallNoWait(callID, exceptChannel string) error {
 			continue
 		}
 		seen[ch] = struct{}{}
-		if err := r.ami.HangupChannelNoWait(ch); err != nil && firstErr == nil {
-			firstErr = err
+		targets := []string{ch}
+		if strings.HasPrefix(ch, "Local/") {
+			targets = []string{ch + ";1", ch + ";2"}
+		}
+		for _, target := range targets {
+			if err := r.ami.HangupChannelNoWait(target); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr
@@ -819,7 +834,7 @@ func (r *Router) hangupCall(callID, exceptChannel string) error {
 	if err != nil {
 		return err
 	}
-	channels := callCleanupChannels(output, callID, r.ChannelsForCall(callID), r.PendingPrefixesForCall(callID))
+	channels := r.CallCleanupChannelsFromSnapshot(output, callID)
 	if len(channels) == 0 {
 		return nil
 	}
@@ -840,6 +855,28 @@ func (r *Router) hangupCall(callID, exceptChannel string) error {
 		}
 	}
 	return firstErr
+}
+
+func (r *Router) CallCleanupChannelsFromSnapshot(output, callID string) []string {
+	r.mu.RLock()
+	bound := r.boundCalls[callID]
+	r.mu.RUnlock()
+	var prefixes []string
+	if !bound {
+		prefixes = r.PendingPrefixesForCall(callID)
+	}
+	return callCleanupChannels(output, callID, r.ChannelsForCall(callID), prefixes)
+}
+
+func (r *Router) CallChannelsFromSnapshot(output, callID, bridgeID string) []string {
+	known := r.ChannelsForCall(callID)
+	for _, line := range strings.Split(output, "\n") {
+		parts := strings.Split(strings.TrimSpace(line), "!")
+		if len(parts) >= 7 && parts[5] == "ConfBridge" && bridgeID != "" && strings.Split(parts[6], ",")[0] == bridgeID {
+			known = append(known, parts[0])
+		}
+	}
+	return callCleanupChannels(output, callID, known, nil)
 }
 
 func (r *Router) channelsWithCallID(callID string) []string {

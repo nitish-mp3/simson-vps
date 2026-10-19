@@ -577,6 +577,23 @@ video_mode=follow_talker
 internal_sample_rate=8000
 mixing_interval=20
 
+[simson_video_bridge]
+type=bridge
+max_members=10
+record_conference=no
+video_mode=first_marked
+internal_sample_rate=8000
+mixing_interval=20
+
+[simson_video_source]
+type=user
+quiet=yes
+marked=yes
+announce_join_leave=no
+announce_only_user=no
+wait_marked=no
+end_marked=no
+
 ; User profile — applied to every participant in a Simson ConfBridge.
 ; RTP NAT bindings are maintained by the endpoint-level rtp_keepalive setting.
 ; Do not add another jitter buffer here: every real media channel receives one
@@ -754,6 +771,12 @@ exten => s,1,NoOp(Simson originate leg)
  same  => n,Answer()
  same  => n,Set(JITTERBUFFER(adaptive)=default)
  same  => n,Wait(${SIMSON_WAIT_TIMEOUT:=120})
+ same  => n,Hangup()
+
+[from-simson-video-source]
+exten => _bridge-.,1,Answer()
+ same  => n,Set(JITTERBUFFER(adaptive)=default)
+ same  => n,ConfBridge(${EXTEN},simson_video_bridge,simson_video_source)
  same  => n,Hangup()
 
 [from-simson-extension]

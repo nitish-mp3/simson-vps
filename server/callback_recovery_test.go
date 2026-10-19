@@ -12,24 +12,25 @@ func TestCallbackWatchdogKeepsHealthyCallsAndRecoversMissingPeer(t *testing.T) {
 	now := time.Now()
 	call := &calls.Call{State: calls.StateActive}
 	callback := &sipGatewayCallback{Stage: "gateway", RingDeadline: now.Add(-time.Hour)}
-	if reason := callbackRecoveryReason(call, callback, 2, now); reason != "" {
+	var missingSince time.Time
+	if reason := gatewayRecoveryReason(call, callback, true, &missingSince, now, 20*time.Second); reason != "" {
 		t.Fatalf("healthy call was expired: %s", reason)
 	}
-	if reason := callbackRecoveryReason(call, callback, 1, now); reason != "" {
+	if reason := gatewayRecoveryReason(call, callback, false, &missingSince, now, 20*time.Second); reason != "" {
 		t.Fatal("missing peer must have a grace period")
 	}
-	if reason := callbackRecoveryReason(call, callback, 1, now.Add(19*time.Second)); reason != "" {
+	if reason := gatewayRecoveryReason(call, callback, false, &missingSince, now.Add(19*time.Second), 20*time.Second); reason != "" {
 		t.Fatal("peer recovery ended the call prematurely")
 	}
-	if reason := callbackRecoveryReason(call, callback, 1, now.Add(20*time.Second)); reason != "callback_peer_missing" {
+	if reason := gatewayRecoveryReason(call, callback, false, &missingSince, now.Add(20*time.Second), 20*time.Second); reason != "gateway_peer_missing" {
 		t.Fatalf("orphan call was not recovered: %s", reason)
 	}
-	callbackRecoveryReason(call, callback, 2, now.Add(21*time.Second))
-	if !callback.PeerMissingSince.IsZero() {
+	gatewayRecoveryReason(call, callback, true, &missingSince, now.Add(21*time.Second), 20*time.Second)
+	if !missingSince.IsZero() {
 		t.Fatal("restored peer did not reset the watchdog")
 	}
 	call.State = calls.StateRinging
-	if reason := callbackRecoveryReason(call, callback, 1, now); reason != "timeout" {
+	if reason := gatewayRecoveryReason(call, callback, false, &missingSince, now, 20*time.Second); reason != "timeout" {
 		t.Fatalf("ring deadline ignored: %s", reason)
 	}
 }
