@@ -82,6 +82,8 @@ type Server struct {
 
 	doorEventMu   sync.Mutex
 	doorEventLast map[string]time.Time
+	roomCallsMu   sync.Mutex
+	roomRequests  map[string]*calls.Call
 
 	advancedRoutesMu sync.Mutex
 	advancedRoutes   map[string]*advancedRouteRun
@@ -1376,6 +1378,10 @@ func (s *Server) handleCallAccept(sess *hub.Session, env *protocol.Envelope) {
 	}
 	if !existing.CanNodeAnswer(sess.NodeID) {
 		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "not the call target")
+		return
+	}
+	if existing.RoomSessionID != "" && (existing.AccountID != sess.AccountID || payload.AnsweredByUserID != existing.TargetUserID) {
+		s.sendErrorSafe(sess, env.ID, protocol.ErrCodeForbidden, "not the selected room caregiver")
 		return
 	}
 	invitedNodes := s.calls.Invitees(payload.CallID)
@@ -3911,6 +3917,16 @@ func (s *Server) handleSIPChannelHangup(info asterisk.ChannelHangup) {
 // handleSIPOriginateResult is the AMI callback when an async Originate
 // (outbound call to an IP phone) either connects or fails.
 func (s *Server) handleSIPOriginateResult(callID string, ok bool, reason string) {
+	if call := s.calls.Get(callID); call != nil && call.RoomSessionID != "" {
+		if ok {
+			if call.State == calls.StateEnded || call.State == calls.StateFailed {
+				s.releaseEndedSIPOriginate(callID)
+			}
+		} else {
+			s.endRoomSIPCall(callID, "phone_unavailable")
+		}
+		return
+	}
 	if s.handleSIPGatewayCallbackResult(callID, ok, reason) {
 		return
 	}

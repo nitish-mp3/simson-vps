@@ -29,6 +29,13 @@ type Call struct {
 	SourceExtension string
 	GatewayTrunk    string
 	CallerID        string
+	RoomID          string
+	RoomSessionID   string
+	RoomRequestID   string
+	RoomAutoMode    string
+	RoomTimeout     int
+	CallerUserID    string
+	TargetUserID    string
 	State           State
 	CreatedAt       time.Time
 	AnsweredAt      time.Time

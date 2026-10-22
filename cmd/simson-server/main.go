@@ -150,6 +150,7 @@ func main() {
 	mux.HandleFunc("/node/webrtc-config", srv.HandleNodeWebRTCConfig)
 	mux.HandleFunc("/node/door-events", srv.HandleNodeDoorEvent)
 	mux.HandleFunc("/node/door-node-events", srv.HandleNodeDoorNodeEvent)
+	mux.HandleFunc("/node/room-calls", srv.HandleNodeRoomCall)
 	mux.HandleFunc("/node/sip-intercom", srv.HandleNodeSIPIntercom)
 
 	// Admin endpoints.
